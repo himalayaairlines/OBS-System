@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "Himalaya OBS",
+    "slug": "himalaya-obs",
+    "version": "5.0.0",
+    "orientation": "default",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "assetBundlePatterns": ["**/*"],
+    "ios": { "supportsTablet": true },
+    "android": { "package": "com.himalaya.obs" },
+    "web": { "bundler": "metro" }
+  }
+}
