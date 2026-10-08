@@ -1,8 +1,8 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
 
-export const API_BASE =
-  process.env.EXPO_PUBLIC_API_BASE || 'http://192.168.88.99:8000';
+ const API_BASE =
+  process.env.EXPO_PUBLIC_API_BASE || 'http://43.245.85.147:8005';
 
 // The oldest backend this app can talk to. Bump both this and API_VERSION in
 // backend/main.py whenever endpoints are added.

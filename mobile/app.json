@@ -1,14 +1,39 @@
+
 {
   "expo": {
     "name": "Himalaya OBS",
     "slug": "himalaya-obs",
+    "owner": "lokey6475",
     "version": "5.0.0",
     "orientation": "default",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
-    "assetBundlePatterns": ["**/*"],
-    "ios": { "supportsTablet": true },
-    "android": { "package": "com.himalaya.obs" },
-    "web": { "bundler": "metro" }
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.himalaya.obs"
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "1c6e4466-a818-401a-9023-a3dffaad1564"
+      }
+    },
+    "plugins": [
+      "expo-sharing",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ]
   }
 }

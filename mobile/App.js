@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Modal, Platform, Pressable, SafeAreaView, ScrollView, StatusBar, Text, View,
+  Modal, Platform, Pressable, ScrollView, StatusBar, Text, View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import NetInfo from '@react-native-community/netinfo';
 
 import {
@@ -40,6 +41,15 @@ const NAV = [
 ];
 
 export default function App() {
+  return (
+    <SafeAreaProvider>
+      <AppContent />
+    </SafeAreaProvider>
+  );
+}
+
+function AppContent() {
+  const insets = useSafeAreaInsets();
   const [user, setUser] = useState(null);
   const [booting, setBooting] = useState(true);
   const [page, setPage] = useState('crew');
@@ -203,10 +213,14 @@ export default function App() {
   const screenProps = { user, online, onQueueChange: refreshQueue, goToReports };
 
   return (
-    <SafeAreaView style={styles.screen}>
-      <StatusBar barStyle="light-content" backgroundColor={COLORS.primaryDark} />
+    <SafeAreaView style={styles.screen} edges={['left', 'right', 'bottom']}>
+      <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
 
-      <View style={{ backgroundColor: COLORS.primary, paddingHorizontal: 16, paddingVertical: 12 }}>
+      {/* Blue header runs under the status bar; its content starts below it. */}
+      <View style={{
+        backgroundColor: COLORS.primary, paddingHorizontal: 16,
+        paddingTop: insets.top + 12, paddingBottom: 12,
+      }}>
         <View style={styles.rowBetween}>
           <View style={styles.flex1}>
             <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: '800' }}>
@@ -373,8 +387,9 @@ function LoginScreen({ onLogin }) {
   }
 
   return (
-    <SafeAreaView style={styles.screen}>
-      <ScrollView contentContainerStyle={{ padding: 22, paddingTop: 60 }}>
+    <SafeAreaView style={styles.screen} edges={['top', 'left', 'right', 'bottom']}>
+      <StatusBar barStyle="dark-content" backgroundColor="transparent" translucent />
+      <ScrollView contentContainerStyle={{ padding: 22, paddingTop: 40 }}>
         <Text style={{ fontSize: 25, fontWeight: '800', color: COLORS.primary }}>
           Himalaya Airlines
         </Text>
