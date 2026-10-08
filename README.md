@@ -25,6 +25,7 @@ python -m venv .venv
 # macOS/Linux:  source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
+external api -- http://43.245.85.147:8005/
 ```
 
 Open <http://localhost:8000/docs> for the interactive API.
