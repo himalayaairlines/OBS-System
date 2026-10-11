@@ -4,3 +4,6 @@ node_modules
 
 # Encryption key for stored secrets (SMTP password)
 backend/.obs_secret.key
+
+# Database backups made by backup.bat
+backups/

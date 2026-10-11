@@ -69,6 +69,10 @@ The repository has two parts:
     └── COMMUNICATION.md     stock alerts, SMTP, worker, permissions
 ```
 
+## Quick start with Docker
+
+With Docker Desktop running, double-click **`start.bat`** (Windows) or run **`./start.sh`** (macOS / Linux). It builds and starts the API and the web app and opens `http://localhost:8080`. **`stop.bat`** stops it, and data is kept. See [`docs/DOCKER.md`](docs/DOCKER.md) for ports, backups and moving an existing database.
+
 ## Getting started
 
 ### Prerequisites

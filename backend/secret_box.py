@@ -16,7 +16,9 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-KEY_FILE = Path(__file__).resolve().parent / ".obs_secret.key"
+# OBS_SECRET_KEY_FILE moves the generated key next to the database (the Docker
+# image keeps both on the /data volume so they survive container rebuilds).
+KEY_FILE = Path(os.getenv("OBS_SECRET_KEY_FILE") or Path(__file__).resolve().parent / ".obs_secret.key")
 logger = logging.getLogger("obs")
 _fernet = None
 

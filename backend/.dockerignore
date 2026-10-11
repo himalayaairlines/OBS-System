@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+tests/
+*.db
+*.db-wal
+*.db-shm
+*.db.*
+*archive*
+.obs_secret.key
+.env
+.fuse_hidden*

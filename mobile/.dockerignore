@@ -1,0 +1,8 @@
+node_modules/
+dist/
+web-build/
+.expo/
+.env
+*.bak*
+App.js.bak-safearea
+package.json.sdk54.bak
