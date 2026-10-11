@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Modal, Platform, Pressable, ScrollView, StatusBar, Text, View,
+  Image, Modal, Platform, Pressable, ScrollView, StatusBar, Text, View,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -259,6 +259,18 @@ function AppContent() {
         paddingTop: insets.top + 10, paddingBottom: 10,
       }}>
         <View style={[styles.rowBetween, { width: '100%', maxWidth: CONTENT_MAX_WIDTH, alignSelf: 'center' }]}>
+          <View style={[styles.flex1, { flexDirection: 'row', alignItems: 'center' }]}>
+          <View style={{
+            width: 38, height: 38, borderRadius: 10, backgroundColor: '#FFFFFF', marginRight: 10,
+            alignItems: 'center', justifyContent: 'center',
+          }}>
+            <Image
+              source={require('./assets/himalaya-logo.png')}
+              style={{ width: 30, height: 30 }}
+              resizeMode="contain"
+              accessibilityLabel="Himalaya Airlines logo"
+            />
+          </View>
           <View style={styles.flex1}>
             <Text style={{ color: '#FFFFFF', fontSize: 16, fontWeight: '600' }} numberOfLines={1}>
               Himalaya Airlines OBS
@@ -266,6 +278,7 @@ function AppContent() {
             <Text style={{ color: '#D7E5F3', fontSize: 12, marginTop: 1 }} numberOfLines={1}>
               {user.name} · {ROLE_LABELS[user.role] || user.role}
             </Text>
+          </View>
           </View>
           <View style={[styles.row, styles.gap8]}>
             {queueCount > 0 && <Pill label={`${queueCount} to upload`} tone="warning" />}
