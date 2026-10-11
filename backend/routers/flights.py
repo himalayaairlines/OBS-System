@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from database import (
     AIRCRAFT_TYPES, DUTY_GROUP_AMEND_LIMIT, DUTY_GROUP_SIZE, get_connection,
 )
+from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from security import (
     current_user, log_action, now_iso, permissions_for, requires, today_iso, validate_date,
 )
@@ -671,18 +672,26 @@ def _trip_rows(connection, where="", params=()):
 
 
 @router.get("/trips")
-def list_trips(user: dict = Depends(current_user)):
+def list_trips(page: int | None = PageParam, page_size: int = PageSizeParam,
+               status: str | None = None, user: dict = Depends(current_user)):
     connection = get_connection()
     try:
+        # Trips are assembled from legs in Python, so they are paged after grouping.
         if user["role"] == "crew_supervisor":
-            return _trip_rows(
+            trips = _trip_rows(
                 connection,
                 """WHERE a.crew_account=?
                      AND f.status IN ('OPEN','FLOWN')
                      AND f.flight_date >= date('now','-3 day')""",
                 (user["employee_id"],),
             )
-        return _trip_rows(connection)
+        else:
+            trips = _trip_rows(connection)
+        if status:
+            trips = [t for t in trips if t["status"] == status.strip().upper()]
+        if page:
+            return paginate_list(trips, page, page_size)
+        return trips
     finally:
         connection.close()
 

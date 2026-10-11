@@ -6,7 +6,7 @@ import { Platform } from 'react-native';
 
 // The oldest backend this app can talk to. Bump both this and API_VERSION in
 // backend/main.py whenever endpoints are added.
-export const REQUIRED_API_VERSION = '7.2';
+export const REQUIRED_API_VERSION = '7.3';
 
 export const KEYS = {
   session: 'obs.session',

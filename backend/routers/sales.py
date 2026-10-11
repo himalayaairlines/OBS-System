@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from database import AIRCRAFT_TYPES, COMMISSION_RATE, get_connection
+from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from security import (
     current_user, log_action, now_iso, permissions_for, rate_for, requires, trip_root,
     validate_date,
@@ -366,6 +367,7 @@ LEFT JOIN crew_members cm ON cm.id = s.sold_by_crew_member_id
 def list_sales(flight_id: int | None = None, date: str | None = None,
                duty_group_id: int | None = None, crew_member_id: int | None = None,
                limit: int = 500,
+               page: int | None = PageParam, page_size: int = PageSizeParam,
                # Transaction-level detail is an oversight function, not a
                # reporting one, so finance's dashboard access does not grant
                # it. The inventory supervisor needs it to reconcile what was
@@ -387,6 +389,8 @@ def list_sales(flight_id: int | None = None, date: str | None = None,
             conditions.append("s.sold_by_crew_member_id=?")
             params.append(crew_member_id)
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        if page:
+            return paginate_sql(connection, f"{SALE_SELECT} {where} ORDER BY s.id DESC", params, page, page_size)
         rows = connection.execute(
             f"{SALE_SELECT} {where} ORDER BY s.id DESC LIMIT ?", [*params, min(limit, 2000)]
         ).fetchall()
@@ -397,6 +401,7 @@ def list_sales(flight_id: int | None = None, date: str | None = None,
 
 @router.get("/my-sales")
 def my_sales(date: str | None = None, flight_id: int | None = None,
+             page: int | None = PageParam, page_size: int = PageSizeParam,
              user: dict = Depends(requires("sync"))):
     """A cabin iPad sees only its own flights; management sees everything.
 
@@ -420,6 +425,8 @@ def my_sales(date: str | None = None, flight_id: int | None = None,
             conditions.append("s.flight_id=?")
             params.append(flight_id)
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        if page:
+            return paginate_sql(connection, f"{SALE_SELECT} {where} ORDER BY s.id DESC", params, page, page_size)
         rows = connection.execute(
             f"{SALE_SELECT} {where} ORDER BY s.id DESC LIMIT 1000", params
         ).fetchall()

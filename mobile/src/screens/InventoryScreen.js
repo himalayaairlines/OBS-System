@@ -5,11 +5,12 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 
 import { api, downloadReport, uploadFile } from '../api';
+import { usePaged } from '../paging';
 import { confirm } from '../dialog';
 import { COLORS, npr, styles, todayString } from '../theme';
 import {
   Banner, Button, CalendarModal, Card, Chip, Field, KeyValue, OptionModal,
-  FrozenTable, PageHeader, Pill, SearchBar, SectionTitle, Select,
+  FrozenTable, PageHeader, Pagination, Pill, SearchBar, SectionTitle, Select,
 } from '../ui';
 
 const TABS = [
@@ -53,22 +54,16 @@ export default function InventoryScreen({ user }) {
 
 /* ------------------------------- flights ------------------------------- */
 function FlightsTab({ notify }) {
-  const [trips, setTrips] = useState([]);
+  // Trips accumulate every day, so the list is paged on the server.
+  const [tripStatus, setTripStatus] = useState('');
+  const trips = usePaged(`/trips${tripStatus ? `?status=${tripStatus}` : ''}`);
   const [form, setForm] = useState({
     flight_number: '', flight_date: todayString(), origin: '', destination: '',
     trip_type: 'ONE_WAY', return_flight_number: '', return_flight_date: '',
   });
   const [calendar, setCalendar] = useState(null);
 
-  const load = useCallback(async () => {
-    try {
-      setTrips(await api('/trips'));
-    } catch (error) {
-      notify({ tone: 'danger', text: error.message });
-    }
-  }, [notify]);
-
-  useEffect(() => { load(); }, [load]);
+  const load = trips.reload;
 
   async function create() {
     try {
@@ -156,7 +151,7 @@ function FlightsTab({ notify }) {
         )}
 
         <Button
-          title="CREATE FLIGHT"
+          title="Create flight"
           onPress={create}
           disabled={!form.flight_number || !form.origin || !form.destination}
         />
@@ -167,10 +162,16 @@ function FlightsTab({ notify }) {
           title="Scheduled trips"
           description="A round trip is one trip with two legs, loaded once and reconciled once."
         />
-        {trips.map((trip) => (
+        <View style={[styles.wrap, { marginBottom: 8 }]}>
+          {[['', 'All'], ['OPEN', 'Open'], ['FLOWN', 'Flown'], ['CLOSED', 'Closed']].map(([value, label]) => (
+            <Chip key={label} label={label} active={tripStatus === value} onPress={() => setTripStatus(value)} />
+          ))}
+        </View>
+        {!!trips.error && <Banner tone="danger" message={trips.error} />}
+        {trips.items.map((trip) => (
           <View key={trip.root_id} style={styles.listRow}>
             <View style={styles.rowBetween}>
-              <Text style={{ fontSize: 14.5, fontWeight: '700' }}>{trip.route}</Text>
+              <Text style={{ fontSize: 14, fontWeight: '600' }}>{trip.route}</Text>
               <View style={[styles.row, styles.gap8]}>
                 {trip.round_trip && <Pill label="ROUND TRIP" tone="info" />}
                 <Pill
@@ -190,7 +191,8 @@ function FlightsTab({ notify }) {
             ))}
           </View>
         ))}
-        {!trips.length && <Text style={styles.empty}>No trips yet.</Text>}
+        {!trips.items.length && !trips.loading && <Text style={styles.empty}>No trips yet.</Text>}
+        <Pagination pager={trips} label="trips" />
       </Card>
 
       <CalendarModal
@@ -293,7 +295,7 @@ function LoadTab({ notify }) {
           return (
             <View key={item.product_id} style={styles.listRow}>
               <View style={styles.rowBetween}>
-                <Text style={{ fontSize: 13.5, fontWeight: '600', flex: 1 }}>{item.product_name}</Text>
+                <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>{item.product_name}</Text>
                 <TextInput
                   value={String(value)}
                   onChangeText={(text) =>
@@ -307,7 +309,7 @@ function LoadTab({ notify }) {
                 {onBoard ? ` · sold ${onBoard.sold_quantity}` : ''}
               </Text>
               {delta !== 0 && (
-                <Text style={{ fontSize: 11.5, color: delta > 0 ? COLORS.warning : COLORS.info, marginTop: 2 }}>
+                <Text style={{ fontSize: 12, color: delta > 0 ? COLORS.warning : COLORS.info, marginTop: 2 }}>
                   {delta > 0 ? `Will take ${delta} from the warehouse` : `Will return ${-delta} to the warehouse`}
                   {delta > item.quantity ? ' — not enough stock' : ''}
                 </Text>
@@ -318,7 +320,7 @@ function LoadTab({ notify }) {
         {!stock.filter((i) => i.product_name.toLowerCase().includes(search.trim().toLowerCase())).length && (
           <Text style={styles.empty}>No product matches “{search}”.</Text>
         )}
-        <Button title="SAVE LOAD" style={{ marginTop: 12 }} onPress={save} disabled={!flightId} />
+        <Button title="Save load" style={{ marginTop: 12 }} onPress={save} disabled={!flightId} />
       </Card>
 
       <OptionModal
@@ -399,7 +401,7 @@ function GroupsTab({ notify, user }) {
         {assignTrip && (
           <>
             <View style={[styles.listRow, { paddingVertical: 10 }]}>
-              <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text }}>
+              <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }}>
                 {assignTrip.route}
               </Text>
               <Text style={styles.mono}>{assignTrip.flight_date} · {assignTrip.flight_numbers}</Text>
@@ -415,7 +417,7 @@ function GroupsTab({ notify, user }) {
             />
 
             <Button
-              title="ASSIGN DEVICE TO TRIP"
+              title="Assign device to trip"
               onPress={saveAssignment}
               disabled={!assign.crew_account}
             />
@@ -435,7 +437,7 @@ function GroupsTab({ notify, user }) {
         {dutyGroups.map((group) => (
           <View key={group.id} style={[styles.listRow, { paddingVertical: 10 }]}>
             <View style={styles.rowBetween}>
-              <Text style={{ fontSize: 13.5, fontWeight: '700', color: COLORS.text }}>
+              <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }}>
                 {group.label}
               </Text>
               <Pill
@@ -626,7 +628,7 @@ function BundlesTab({ notify, user }) {
           const product = products.find((p) => p.id === Number(id));
           return (
             <View key={id} style={[styles.rowBetween, styles.listRow]}>
-              <Text style={{ flex: 1, fontSize: 13.5 }}>{product?.product_name}</Text>
+              <Text style={{ flex: 1, fontSize: 14 }}>{product?.product_name}</Text>
               <TextInput
                 value={String(quantity)}
                 onChangeText={(text) =>
@@ -654,7 +656,7 @@ function BundlesTab({ notify, user }) {
         )}
 
         <Button
-          title={editingId ? 'SAVE BUNDLE' : 'CREATE BUNDLE'}
+          title={editingId ? 'Save bundle' : 'Create bundle'}
           style={{ marginTop: 12 }}
           onPress={save}
           disabled={!form.bundle_code || !form.bundle_name || !price || !selected.length}
@@ -671,7 +673,7 @@ function BundlesTab({ notify, user }) {
         {bundles.map((bundle) => (
           <View key={bundle.id} style={styles.listRow}>
             <View style={styles.rowBetween}>
-              <Text style={{ fontSize: 14, fontWeight: '700', flex: 1 }}>
+              <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>
                 {bundle.bundle_name} <Text style={styles.mono}>({bundle.bundle_code})</Text>
               </Text>
               <View style={[styles.row, styles.gap8]}>
@@ -788,7 +790,7 @@ function ProductsTab({ notify }) {
         {shown.map((product) => (
           <View key={product.product_id} style={styles.listRow}>
             <View style={styles.rowBetween}>
-              <Text style={{ fontSize: 13.5, fontWeight: '600', flex: 1 }}>{product.product_name}</Text>
+              <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>{product.product_name}</Text>
               <Pill
                 label={product.quantity === 0 ? 'OUT' : product.low_stock ? 'LOW' : `${product.quantity}`}
                 tone={product.quantity === 0 ? 'danger' : product.low_stock ? 'warning' : 'success'}
@@ -999,7 +1001,7 @@ function RegisterTab({ notify, user }) {
         <SearchBar value={search} onChangeText={setSearch} placeholder="Search product…" />
         <View style={[styles.row, styles.gap8]}>
           <Button
-            title={exporting ? 'Preparing…' : 'DOWNLOAD (EXCEL)'}
+            title={exporting ? 'Preparing…' : 'Download (Excel)'}
             tone="secondary"
             style={styles.flex1}
             onPress={exportRegister}
@@ -1007,7 +1009,7 @@ function RegisterTab({ notify, user }) {
           />
           {canEdit && (
             <Button
-              title={importing ? 'Importing…' : 'IMPORT PREVIOUS DATA'}
+              title={importing ? 'Importing…' : 'Import previous data'}
               tone="secondary"
               style={styles.flex1}
               onPress={pickFile}
@@ -1096,7 +1098,7 @@ function RegisterTab({ notify, user }) {
             placeholder="Why does this differ from the system figure?"
           />
           <View style={[styles.row, styles.gap8]}>
-            <Button title="SAVE" style={styles.flex1} onPress={saveEdit} disabled={!edit.remarks.trim()} />
+            <Button title="Save" style={styles.flex1} onPress={saveEdit} disabled={!edit.remarks.trim()} />
             {editing.cell.adjusted && (
               <Button title="Revert" tone="warning" style={styles.flex1} onPress={revert} />
             )}

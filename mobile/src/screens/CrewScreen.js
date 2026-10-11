@@ -597,7 +597,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports })
                   : 'Entered once by crew, then locked.'
               }
             />
-            {(flight.aircraft_locked || flight.pax_locked) && (
+            {!!(flight.aircraft_locked || flight.pax_locked) && (
               <Field
                 label="Correction remarks (mandatory)"
                 value={lockRemarks}
@@ -629,7 +629,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports })
               <>
                 <View style={styles.divider} />
                 <Button
-                  title="FINISH THIS FLIGHT"
+                  title="Finish this flight"
                   tone="warning"
                   onPress={finishFlight}
                   disabled={!online}
@@ -675,7 +675,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports })
 
           {!dutyGroup && (
             <Button
-              title={`ENTER THE ${DUTY_GROUP_SIZE} CREW WORKING THIS SECTOR`}
+              title={`Enter the ${DUTY_GROUP_SIZE} crew working this sector`}
               tone="primary"
               onPress={() => { setDutyDraft([]); setDutyMode('create'); setDutyPicker(true); }}
               disabled={busy || !roster.length}
@@ -700,7 +700,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports })
               />
             ) : (
               <Button
-                title="CORRECT THE CREW LIST"
+                title="Correct the crew list"
                 tone="ghost"
                 small
                 style={{ marginTop: 8 }}
@@ -742,13 +742,13 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports })
               />
               <View style={[styles.row, styles.gap8]}>
                 <Button
-                  title="CANCEL"
+                  title="Cancel"
                   tone="ghost"
                   style={styles.flex1}
                   onPress={() => { setAmending(false); setDutyRemarks(''); }}
                 />
                 <Button
-                  title={busy ? 'Saving…' : 'SAVE CORRECTION'}
+                  title={busy ? 'Saving…' : 'Save correction'}
                   tone="warning"
                   style={styles.flex1}
                   onPress={amendDutyGroup}
@@ -851,7 +851,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports })
             </View>
 
             <Button
-              title={busy ? 'Recording…' : online ? 'RECORD SALE' : 'RECORD SALE (will queue)'}
+              title={busy ? 'Recording…' : online ? 'Record sale' : 'Record sale (will queue)'}
               onPress={recordSale}
               disabled={busy || (!Object.values(cart).some((q) => q > 0)) || !seat || !sellerId}
               tone={online ? 'primary' : 'warning'}
@@ -984,13 +984,13 @@ function Tile({ title, subtitle, price, remaining, quantity, onAdd, onRemove, ba
           <Pill label={badge} tone="success" />
         </View>
       )}
-      <Text style={{ fontSize: 13.5, fontWeight: '700', color: COLORS.text }} numberOfLines={2}>
+      <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }} numberOfLines={2}>
         {title}
       </Text>
       <Text style={[styles.mono, { marginTop: 2, minHeight: 26 }]} numberOfLines={2}>
         {subtitle}
       </Text>
-      <Text style={{ fontSize: 14, fontWeight: '800', color: COLORS.primary, marginTop: 4 }}>
+      <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.primary, marginTop: 4 }}>
         {price}
       </Text>
       <Text style={{ fontSize: 11, color: low ? COLORS.warning : COLORS.success, marginTop: 2 }}>
@@ -999,7 +999,7 @@ function Tile({ title, subtitle, price, remaining, quantity, onAdd, onRemove, ba
 
       <View style={[styles.rowBetween, { marginTop: 8 }]}>
         <Stepper label="−" onPress={onRemove} disabled={quantity <= 0} />
-        <Text style={{ fontSize: 16, fontWeight: '800', color: COLORS.text }}>{quantity}</Text>
+        <Text style={{ fontSize: 16, fontWeight: '700', color: COLORS.text }}>{quantity}</Text>
         <Stepper label="+" onPress={onAdd} disabled={remaining - quantity <= 0} />
       </View>
     </View>
@@ -1018,7 +1018,7 @@ function Stepper({ label, onPress, disabled }) {
         opacity: disabled ? 0.45 : 1,
       }}
     >
-      <Text style={{ fontSize: 18, color: COLORS.primary, fontWeight: '700' }}>{label}</Text>
+      <Text style={{ fontSize: 18, color: COLORS.primary, fontWeight: '600' }}>{label}</Text>
     </Pressable>
   );
 }

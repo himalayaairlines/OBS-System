@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from database import get_connection
+from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from routers.warehouse import move_stock
 from security import (
     current_user, log_action, now_iso, permissions_for, requires,
@@ -294,7 +295,9 @@ def _recon(connection, recon_id=None, flight_id=None):
 
 
 @router.get("/reconciliations")
-def list_reconciliations(status: str | None = None, user: dict = Depends(requires("sync"))):
+def list_reconciliations(status: str | None = None,
+                         page: int | None = PageParam, page_size: int = PageSizeParam,
+                         user: dict = Depends(requires("sync"))):
     connection = get_connection()
     try:
         sql = "SELECT r.id FROM reconciliations r"
@@ -310,6 +313,9 @@ def list_reconciliations(status: str | None = None, user: dict = Depends(require
             params.append(user["employee_id"])
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
+        if page:
+            return paginate_sql(connection, sql + " ORDER BY r.id DESC", params, page, page_size,
+                                mapper=lambda r: _recon(connection, recon_id=r["id"]))
         sql += " ORDER BY r.id DESC LIMIT 200"
         return [_recon(connection, recon_id=r["id"])
                 for r in connection.execute(sql, params).fetchall()]

@@ -1,3 +1,6 @@
 node_modules
 .env
 *.csv
+
+# Encryption key for stored secrets (SMTP password)
+backend/.obs_secret.key

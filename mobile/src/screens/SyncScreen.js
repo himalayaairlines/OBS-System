@@ -6,10 +6,11 @@ import {
   writeQueue, writeReconQueue, writeRejected,
 } from '../api';
 import { confirm } from '../dialog';
+import { usePaged } from '../paging';
 import { COLORS, npr, styles, todayString } from '../theme';
 import {
   Banner, Button, CalendarModal, Card, Field, KeyValue, Metric,
-  PageHeader, Pill, SectionTitle, Select,
+  PageHeader, Pagination, Pill, SectionTitle, Select,
 } from '../ui';
 
 export default function SyncScreen({ user, online, onQueueChange, goToReports }) {
@@ -35,7 +36,9 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
   const [countRemarks, setCountRemarks] = useState({});
   const [adjusting, setAdjusting] = useState(null);
   const [pendingError, setPendingError] = useState(null);
-  const [returns, setReturns] = useState([]);
+  // Every return ever submitted: paged on the server, newest first.
+  const returns = usePaged('/reconciliations', { enabled: isInventory && online });
+  const reloadReturns = returns.reload;
 
   const refreshLocal = useCallback(async () => {
     setQueue(await readQueue());
@@ -45,11 +48,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
 
   const refreshRemote = useCallback(async () => {
     if (isInventory) {
-      try {
-        setReturns(await api('/reconciliations'));
-      } catch (error) {
-        setMessage({ tone: 'warning', text: `Stock returns unavailable: ${error.message}` });
-      }
+      reloadReturns();
       return;
     }
     try {
@@ -62,7 +61,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
     } catch (error) {
       setMessage({ tone: 'warning', text: `Live totals unavailable: ${error.message}` });
     }
-  }, [date, isInventory]);
+  }, [date, isInventory, reloadReturns]);
 
   async function saveAdjustment() {
     try {
@@ -298,10 +297,11 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
             title="Crew stock returns"
             description="What each crew declared as remaining at the end of the flight, newest first."
           />
-          {returns.map((entry) => (
+          {!!returns.error && <Banner tone="warning" message={`Stock returns unavailable: ${returns.error}`} />}
+          {returns.items.map((entry) => (
             <View key={entry.id} style={[styles.listRow, { paddingVertical: 12 }]}>
               <View style={styles.rowBetween}>
-                <Text style={{ fontSize: 14, fontWeight: '700', flex: 1 }}>
+                <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>
                   {entry.flight_number} · {entry.origin}→{entry.destination}
                 </Text>
                 <Pill
@@ -325,20 +325,20 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
               {entry.items.map((item) => (
                 <View key={item.product_id}>
                   <View style={[styles.rowBetween, { paddingVertical: 3 }]}>
-                    <Text style={{ flex: 2, fontSize: 12.5 }} numberOfLines={1}>{item.product_name}</Text>
-                    <Text style={{ width: 52, fontSize: 12.5, textAlign: 'right' }}>{item.loaded_quantity}</Text>
-                    <Text style={{ width: 44, fontSize: 12.5, textAlign: 'right' }}>{item.sold_quantity}</Text>
-                    <Text style={{ width: 52, fontSize: 12.5, textAlign: 'right' }}>
+                    <Text style={{ flex: 2, fontSize: 13 }} numberOfLines={1}>{item.product_name}</Text>
+                    <Text style={{ width: 52, fontSize: 13, textAlign: 'right' }}>{item.loaded_quantity}</Text>
+                    <Text style={{ width: 44, fontSize: 13, textAlign: 'right' }}>{item.sold_quantity}</Text>
+                    <Text style={{ width: 52, fontSize: 13, textAlign: 'right' }}>
                       {item.expected_remaining}
                     </Text>
                     <Text style={{
-                      width: 52, fontSize: 12.5, textAlign: 'right', fontWeight: '700',
+                      width: 52, fontSize: 13, textAlign: 'right', fontWeight: '600',
                       color: item.overridden ? COLORS.warning : COLORS.text,
                     }}>
                       {item.declared_remaining}
                     </Text>
                   </View>
-                  {item.overridden && (
+                  {!!item.overridden && (
                     <Text style={{ fontSize: 11, color: COLORS.warning }}>
                       Corrected by {item.override_by}: {item.override_remarks}
                     </Text>
@@ -374,7 +374,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
                         multiline
                         placeholder="One bottle damaged in the galley"
                       />
-                      <Button title="SAVE CORRECTION" small onPress={saveAdjustment}
+                      <Button title="Save correction" small onPress={saveAdjustment}
                         disabled={!adjusting.remarks.trim()} />
                     </View>
                   )}
@@ -401,7 +401,8 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
               )}
             </View>
           ))}
-          {!returns.length && <Text style={styles.empty}>No stock returns submitted yet.</Text>}
+          {!returns.items.length && !returns.loading && <Text style={styles.empty}>No stock returns submitted yet.</Text>}
+          <Pagination pager={returns} label="returns" />
         </Card>
       ) : (
       <Card>
@@ -427,7 +428,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
             {(summary.crew || []).map((member) => (
               <View key={member.crew_member_id} style={[styles.rowBetween, { paddingVertical: 7 }]}>
                 <View style={{ flex: 1 }}>
-                  <Text style={{ fontSize: 13.5, fontWeight: '600', color: COLORS.text }}>
+                  <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }}>
                     {member.name}
                   </Text>
                   <Text style={styles.mono}>
@@ -453,7 +454,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
                 {summary.sectors.map((sector) => (
                   <View key={sector.flight_id} style={[styles.listRow, { paddingVertical: 10 }]}>
                     <View style={styles.rowBetween}>
-                      <Text style={{ fontSize: 13.5, fontWeight: '700', color: COLORS.text }}>
+                      <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }}>
                         {sector.duty_group_label}
                       </Text>
                       <Pill label={`${sector.member_count} crew`} tone="muted" />
@@ -466,7 +467,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
                     />
                     {sector.sellers.map((seller) => (
                       <View key={seller.crew_member_id} style={[styles.rowBetween, { paddingVertical: 2 }]}>
-                        <Text style={{ fontSize: 12.5, flex: 1 }}>{seller.name}</Text>
+                        <Text style={{ fontSize: 13, flex: 1 }}>{seller.name}</Text>
                         <Text style={[styles.mono, { fontSize: 11 }]}>{npr(seller.sales_npr)}</Text>
                       </View>
                     ))}
@@ -492,7 +493,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
               right={<Pill label={trip.round_trip ? 'ROUND TRIP' : 'ONE WAY'} tone="muted" />}
             />
 
-            <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text }}>
+            <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }}>
               {trip.flight_number}
             </Text>
             <Text style={[styles.mono, { marginBottom: 10 }]}>
@@ -515,9 +516,9 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
               const diff = Number(value || 0) - item.expected_remaining;
               return (
                 <View key={item.product_id} style={[styles.rowBetween, { paddingVertical: 4 }]}>
-                  <Text style={{ flex: 2, fontSize: 12.5 }} numberOfLines={1}>{item.product_name}</Text>
-                  <Text style={{ width: 48, fontSize: 12.5, textAlign: 'right' }}>{item.sold_quantity}</Text>
-                  <Text style={{ width: 58, fontSize: 12.5, textAlign: 'right' }}>{item.expected_remaining}</Text>
+                  <Text style={{ flex: 2, fontSize: 13 }} numberOfLines={1}>{item.product_name}</Text>
+                  <Text style={{ width: 48, fontSize: 13, textAlign: 'right' }}>{item.sold_quantity}</Text>
+                  <Text style={{ width: 58, fontSize: 13, textAlign: 'right' }}>{item.expected_remaining}</Text>
                   <TextInput
                     value={value}
                     onChangeText={(text) => setCounts((current) => ({
@@ -558,7 +559,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
             ) : null}
 
             <Button
-              title={online ? 'SUBMIT STOCK RETURN' : 'SUBMIT (will upload on Wi-Fi)'}
+              title={online ? 'Submit stock return' : 'SUBMIT (will upload on Wi-Fi)'}
               tone={online ? 'primary' : 'warning'}
               style={{ marginTop: 10 }}
               onPress={() => confirmReturn(trip)}

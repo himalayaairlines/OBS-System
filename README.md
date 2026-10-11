@@ -1,22 +1,83 @@
-# Himalaya Airlines — OBS Revenue Management System (v5)
+# Himalaya Airlines OBS Revenue Management System
 
-Onboard sales, warehouse inventory, crew groups and commission, and reporting.
+![API version](https://img.shields.io/badge/API-v7.3-0B4F8A)
+![Backend](https://img.shields.io/badge/backend-FastAPI%20%2B%20SQLite-009688)
+![Mobile](https://img.shields.io/badge/mobile-Expo%2057%20%2F%20React%20Native-000020)
+![Platforms](https://img.shields.io/badge/runs%20on-iPad%20%7C%20Android%20%7C%20web-lightgrey)
+![License](https://img.shields.io/badge/license-proprietary-red)
 
+This system handles onboard sales (OBS) for Himalaya Airlines. The crew sell from an iPad in the cabin, even with no connection. The ground teams use the same app to manage the trolley stock, warehouse, purchase orders, crew commission, exchange rates and Excel reports.
+
+The repository has two parts:
+
+- **`backend/`**: a FastAPI service on SQLite.
+- **`mobile/`**: an Expo / React Native app that runs on iPad, Android and the web.
+
+## Table of contents
+
+- [Features](#features)
+- [Project structure](#project-structure)
+- [Getting started](#getting-started)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Building the app](#building-the-app)
+- [Getting help](#getting-help)
+- [Maintainers and contributing](#maintainers-and-contributing)
+- [License](#license)
+
+## Features
+
+- **Offline-first selling.** Flights, products, bundles and rates are cached on the device. When the iPad is offline, sales are queued and stock is held as it goes into the cart. The queue uploads by itself when the connection comes back.
+- **Atomic transactions.** All the lines of one payment share an `order_ref` and are recorded together. Stock is checked and taken off in a single conditional `UPDATE`, so two devices can't oversell the same item.
+- **Round trips handled as one trip.** Each leg has its own crew group and its own commission pool. The trip has one trolley load and one stock return.
+- **Seat maps by aircraft type.** The A320 has 30 rows and the A319 has 24, and a sale to a seat that doesn't exist on the aircraft is rejected.
+- **Calculated stock returns.** The system works out the leftover stock, and both iPads must confirm it before the Inventory Supervisor can approve it.
+- **Warehouse and purchase orders.** Every stock change goes through a movement ledger. Purchase orders are approved and received as separate steps, and partial deliveries are supported.
+- **Registers that match the paper sheets.** The OBS daily stock register and the PO register follow the airline's existing workbooks. Both can be imported and exported as Excel.
+- **Commission.** 10% of a leg's normal sales goes to the group that worked it and is split equally among its members. A ranking screen shows the results.
+- **Cabin report forms.** After each sector the crew file the security checklist, cabin safety report, voyage report and lost & found. Each form follows the airline's paper form ([`backend/report_forms.py`](backend/report_forms.py)).
+- **Stock alerts (Communication Manager).** Each rule names its own products, threshold, recipients, channels (in-app and email), frequency and escalation. Products with no rule never send email. Delivery goes through a durable SMTP queue. See [`docs/COMMUNICATION.md`](docs/COMMUNICATION.md).
+- **Role-based access, enforced by the API.** There are permission sets for crew, inventory, management, finance and admin users. Passwords are hashed with PBKDF2 and the API uses bearer-token sessions.
+- **Multi-currency.** Exchange rates are stored as dated bands, with quotation units (for example, INR is quoted per 100).
+
+## Project structure
+
+```text
+.
+├── backend/                 FastAPI + SQLite API
+│   ├── main.py              app entry point, CORS, /health
+│   ├── database.py          schema, migrations, roles, seed data
+│   ├── security.py          password hashing, sessions, permission guards
+│   ├── crew_seed.py         cabin crew roster seed
+│   ├── report_forms.py      cabin report form definitions
+│   ├── requirements.txt
+│   └── routers/             auth, admin, flights, catalog, warehouse, obs,
+│                            register, sales, rates, analytics, reports,
+│                            flight_reports
+├── mobile/                  Expo / React Native client
+│   ├── App.js               app shell, login, navigation
+│   ├── app.json · eas.json  Expo and EAS build config
+│   └── src/
+│       ├── api.js           API client, offline cache and sync queue
+│       ├── ui.js · theme.js shared components and styles
+│       ├── charts.js        SVG charts
+│       └── screens/         Crew, Sync, Inventory, Warehouse, Dashboard,
+│                            Logs, Finance, Reports, Admin
+└── docs/
+    ├── HANDBOOK.md          operations handbook (workflow, registers,
+    │                        troubleshooting)
+    └── COMMUNICATION.md     stock alerts, SMTP, worker, permissions
 ```
-himalaya-obs/
-├── backend/          FastAPI + SQLite
-│   ├── main.py       app entry point
-│   ├── database.py   schema, migrations, seed data
-│   ├── security.py   password hashing, session tokens, permission guards
-│   ├── crew_seed.py  cabin crew roster loaded from the master name list
-│   └── routers/      auth, admin, flights, catalog, warehouse, obs, register,
-│                     sales, rates, analytics, reports
-└── mobile/           Expo / React Native (runs on iPad, Android and web)
-    ├── App.js        shell, login, navigation
-    └── src/          api client, theme, components, charts, screens
-```
 
-## 1. Run the backend
+## Getting started
+
+### Prerequisites
+
+- Python 3.10 or newer
+- Node.js 20 LTS or newer, with npm
+- To run the app on a phone: the [Expo Go](https://expo.dev/go) app, or a development build
+
+### 1. Start the backend
 
 ```bash
 cd backend
@@ -28,390 +89,131 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 external api -- http://43.245.85.147:8005/
 ```
 
-Open <http://localhost:8000/docs> for the interactive API.
+On first start, the server creates `backend/obs.db` and fills it with demo data. It then prints a banner showing the API version, the folder it's serving from and the database path. To check that it's running:
 
-The database (`backend/obs.db`) is created and seeded on first start. **If you
-are upgrading from v4, delete the old `obs.db` first** — the migration path is
-best-effort and a clean file is far less trouble.
+```bash
+curl http://localhost:8000/health
+# {"status":"online","version":"7.3","routes":...}
+```
 
-`--host 0.0.0.0` matters: without it the server only listens on localhost and a
-phone on the same Wi-Fi cannot reach it.
+Open <http://localhost:8000/docs> for the interactive API reference.
 
-## 2. Run the mobile app
+> `--host 0.0.0.0` is required if you want a phone or tablet on the same network to reach the API.
+
+### 2. Start the mobile app
 
 ```bash
 cd mobile
 npm install
-npx expo start
+cp .env.example .env        # Windows: copy .env.example .env
 ```
 
-Press `w` for the browser, or scan the QR code with Expo Go.
+In `.env`, set the API address to your computer's LAN IP. A phone can't use `localhost`, because on the phone that means the phone itself:
 
-Point the app at your computer, not at localhost — a phone's localhost is the
-phone itself. Copy `.env.example` to `.env` and set your LAN IP:
-
-```
+```dotenv
 EXPO_PUBLIC_API_BASE=http://192.168.1.50:8000
 ```
 
-Find the IP with `ipconfig` (Windows) or `ifconfig` / `ip addr` (macOS, Linux).
-Restart `expo start` after changing it.
+Then start the app:
 
-## 3. Demo accounts
+```bash
+npx expo start
+```
 
-All passwords are `1234`. Change them from the profile menu.
+Press `w` to open the app in a browser, or scan the QR code with Expo Go. Restart `expo start` after any change to `.env`.
 
-| Employee ID | Role | Sees |
+### 3. Sign in
+
+The seed data creates one demo account for each role. Every password is `1234`; change it from the profile menu.
+
+| Employee ID | Account | Role |
 |---|---|---|
-| `CREW001` | Crew | Sales, Sync |
-| `CSUP001` | Crew Supervisor | Sales, Sync, plus PAX/aircraft corrections |
-| `INV001` | Inventory | Flights, trolley loading, crew groups, warehouse |
-| `ISUP001` | Inventory Supervisor | The above plus bundles and all approvals |
-| `MGT001` | Management | Oversight, corrections, dashboard, logs (no selling screen) |
-| `FIN001` | Finance | Exchange rates and the dashboard only |
-| `ADMIN001` | Administrator | Crew roster and login accounts |
+| `CREW001` | OBS iPad 01 | Crew Supervisor |
+| `CSUP001` | OBS iPad 02 | Crew Supervisor |
+| `INV001` | Inventory Officer | Inventory |
+| `ISUP001` | Inventory Supervisor | Inventory Supervisor |
+| `MGT001` | Management User | Management |
+| `FIN001` | Finance Officer | Finance |
+| `ADMIN001` | Administrator | Admin |
 
-## 4. The workflow end to end
+Each role sees only the screens its permissions allow. The permission sets are defined in `ROLE_PERMISSIONS` in [`backend/database.py`](backend/database.py), and the API serves them at `GET /permissions`.
 
-1. **Admin** maintains the crew name roster. It ships preloaded with all 86
-   cabin crew from the master name list — 25 Pursers, 21 Senior Cabin Crew and
-   40 Cabin Crew — each with their staff code. Resigned crew are not included.
-2. **Inventory** creates a flight: number, date, origin, destination, and one-way
-   or round trip. A round trip is stored as two linked legs with the route
-   reversed, so a different group can work the way back.
-3. **Inventory** builds groups of up to four crew from the roster, then assigns
-   the trip: the group going out, the group coming back, and the two iPad
-   accounts that stay on board for both legs.
-4. **Inventory** loads the trolley. Quantities are drawn out of main inventory
-   automatically; reducing a load puts them back.
-5. **Crew** enter the aircraft registration and PAX load. Both lock after the
-   first entry. A Crew Supervisor can correct them on the same day, but only
-   with mandatory remarks.
-6. **Crew** sell products and bundles. Without a connection, sales queue on the
-   device and upload by themselves once it reconnects — there is nothing to press.
-7. **Crew** press **Finish this flight** when the leg is over. Selling stops on
-   that leg. On a round trip the return leg then opens for the next group, which
-   is what keeps each group's commission tied to its own sales even though both
-   legs use the same iPad login.
-8. **Crew** submit the leftover stock count after the flight — **from both
-   iPads**. Each device counts its own trolley; the server adds them together.
-9. **Inventory Supervisor** approves it. Approved leftovers return to main
-   inventory automatically and the flight closes.
-10. **Inventory** raises order requests when stock runs low; the **Inventory
-    Supervisor** approves them and receives the goods, which posts to stock.
-11. **Finance** sets exchange rates as dated bands, including future ones, and
-    reads the dashboard. They see no sales, commission or sync.
-12. **Management** watches the dashboard, corrects mis-keyed sales with remarks,
-    reviews the commission ranking, and exports any view to Excel.
+## Configuration
 
-### Who can do what
+| Variable | Where | Purpose |
+|---|---|---|
+| `EXPO_PUBLIC_API_BASE` | `mobile/.env` | Base URL of the API. If it isn't set, the build falls back to a default address hard-coded in `src/api.js`. |
+| `OBS_ALLOWED_ORIGINS` | backend environment | Comma-separated CORS origins. If it isn't set, any origin is allowed, which is only suitable for development. |
+| `OBS_ADMIN_RECOVERY_CODE` | backend environment | Recovery code for the administrator account. Set this in any real deployment. |
+| `OBS_SECRET_KEY` | backend environment | Fernet key that encrypts the stored SMTP password. Set this in production. |
+| `OBS_EMBEDDED_WORKER` | backend environment | `1` (default) runs the alert/email worker inside the API; set `0` when running `python worker.py` separately. |
 
-Inventory build crew groups, load trolleys and raise orders. The Inventory
-Supervisor additionally **deletes** groups, **creates, edits and deletes**
-bundles, **adds stock** directly to the warehouse, **approves and receives**
-orders, and **edits** the daily register. That split is enforced in the API, not
-just hidden in the app.
+**Version check:** at login the app compares its `REQUIRED_API_VERSION` (in `mobile/src/api.js`) with the version the API reports (`API_VERSION` in `backend/main.py`). If they don't match, the app shows a warning banner. Change both values together.
 
-## 5. Commission
+## Usage
 
-Each flight pays 10% of its normal sales into a pool belonging to the crew group
-that worked the leg. The pool is split equally among the group's members, so an
-individual's earnings are the sum of their shares across flights. The ranking
-screen filters by date and destination and draws a bar chart.
+A typical sector, end to end:
 
-Group membership is read as it stands today. If you reshuffle a group, past
-commission is recalculated against the new membership — tell me if you would
-rather freeze membership at the time of the flight, which needs a snapshot on
-the assignment record.
+1. **Inventory** creates the flight (one way or round trip) and loads the trolley. The loaded stock is taken out of main inventory.
+2. **The crew** sign in on the OBS iPad, form the duty group, and enter the aircraft type and PAX load. Both lock after the first entry, and a correction needs written remarks.
+3. **The crew** sell products and bundles. Offline sales are queued and upload by themselves later.
+4. **The crew** press **Finish this flight**. Selling stops on that leg. On a round trip, the return leg then opens for the next group.
+5. **Each iPad confirms the stock return**. The **Inventory Supervisor** then approves it, and the leftover stock goes back to the warehouse.
+6. **Management and Finance** use the dashboards, the commission ranking and the Excel exports.
 
-## 6. The two register sheets
+For the full workflow, register formats, commission rules and troubleshooting, see [`docs/HANDBOOK.md`](docs/HANDBOOK.md).
 
-**OBS stock register** (Inventory → Daily register) reproduces your monthly
-sheet as a scrolling grid: the product column stays fixed while the days scroll
-sideways, one row per product, an opening balance, then Received / Sales /
-Closing for every day, where `closing = opening + received − sales` and each
-closing carries into the next day. Tap any figure to correct it. Set the month's
-opening balances once and the rest follows.
+Reports can also be pulled straight from the API with a bearer token:
 
-Received is dated to the **flight**, not to the moment the clerk saved the load,
-so a trolley loaded on the 18th for a flight on the 16th appears against the
-16th and the running balance never dips below zero. Received and Sales are derived from real trolley
-loads and real sales, so the sheet cannot drift away from the rest of the
-system. An Inventory Supervisor can override a day's figures, but only with
-mandatory remarks; the computed value is kept alongside the override and both
-appear in the export, on a "Manual Edits" sheet. Download it from the same tab.
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/login \
+  -H 'Content-Type: application/json' \
+  -d '{"employee_id":"MGT001","password":"1234"}' | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
 
-**PO register** (Warehouse → PO register) reproduces your PO workbook column for
-column in the same scrolling table, with the PO number frozen on the left: PO code, PO Number, FY, PO No., Purchase Items, QTY, order placement and
-delivery dates, Order Received QTY / Date / Location, Inflight-or-OBS and
-Remarks. Two differences from the spreadsheet, both deliberate:
-
-- **Quantities are in pieces, not "03 cases".** That is what lets a receipt post
-  straight into warehouse stock. Set the case size in the product record and
-  order in pieces.
-- **Receiving is a separate step from approving.** Stock moves when the goods
-  actually arrive, not when the order is signed off, so a partly delivered order
-  shows as PARTIAL with the outstanding balance visible. Receiving more than was
-  ordered is rejected.
-
-Only an Inventory Supervisor can edit a PO or record a receipt, and an edit
-needs remarks. The FY label (`8384`) is derived from the placement date on the
-Nepali fiscal year, and the PO number increments per code per year, so
-`ANC/001`, `ANC/002` and so on.
-
-## 7. What changed from v4
-
-**Fixed**
-
-- Sales were split into one row per product with no link between them, so a
-  single passenger payment could land half on the server and half in the queue.
-  A transaction now has one `order_ref` covering all its lines and is recorded
-  atomically.
-- The offline queue stopped at the first failure and retried it forever, so one
-  permanently rejectable sale blocked every sale behind it. `POST /sales/sync`
-  now answers per transaction and flags permanent rejections, which the app
-  moves to a review list with Retry and Discard.
-- Nothing but pending sales was cached, so the app was unusable offline from a
-  cold start. Flights, products, bundles and rates are cached and the crew
-  screen falls back to them with a warning banner.
-- Local stock never decremented offline, so crew could oversell and every
-  oversold row was rejected later. The cart now reserves stock as it is added.
-- The stock check and the decrement were separate statements, so two devices
-  could both pass the check. They are now one conditional `UPDATE`.
-- Cancellations consumed stock. They no longer do; complementary items still do.
-- The dashboard dropped zero-sale products when a filter was applied, and
-  double-counted passengers on routes with several sale lines.
-- Excel would not download on web. An `<a href>` cannot carry an auth header, so
-  the app now fetches to a blob; the endpoint also accepts `?token=`.
-- Passwords were plaintext and `X-Employee-Id` was trusted as-is, so editing the
-  stored session on a device granted any role. Passwords are hashed with PBKDF2
-  and `/login` issues a bearer token.
-- `allow_origins=["*"]` with `allow_credentials=True`. Origins are now set with
-  `OBS_ALLOWED_ORIGINS`, and auth is bearer tokens rather than cookies.
-- The seat pattern was hardcoded to rows 1–24, letters A–F. It now accepts rows
-  1–99 and letters A–K.
-
-## Trips, not legs
-
-A round trip is one **trip** everywhere it is shown: the route reads
-`KTM-DXB-KTM`, not two separate flights. Inventory assigns crew to the trip in
-one action, choosing the **going group** and the **return group**. Both legs use
-the same two iPad accounts, because the same devices stay on board; only the
-crew group changes at the turnaround. A round trip cannot be assigned without a
-group for the return leg.
-
-## One trip, one trolley, one stock return
-
-A round trip is loaded **once**, before the outbound leg. Both legs sell from
-the same rows, so the return leg opens with whatever the outbound left, and the
-leftover count at the end covers the whole trip rather than each leg separately.
-Loading, selling and the stock return all resolve to the outbound leg, which
-owns the trip's stock.
-
-### Finishing a leg
-
-**Finish this flight** asks for confirmation first. Confirming is final: the leg
-disappears from the crew's flight picker and no further sale can be recorded
-against it. Its commission is locked to the group that worked it.
-
-On a round trip the app then moves to the return leg, where the returning group
-enters its own aircraft type and PAX load. When the last leg is finished the
-crew are told to go to the Sync page.
-
-### The stock return
-
-Both iPads are offline in the air and reach Wi-Fi at different moments. That is
-the whole difficulty, and it is why the return works the way it does:
-
-- **The figures are calculated, not counted.** Loaded for the trip, minus
-  everything sold on either leg, minus wastage. There is no flight to pick and
-  nothing to type.
-- **Each iPad confirms.** The point of requiring both is not to add two counts
-  together — it is to be sure every sale has arrived before the remainder is
-  trusted. Until both have confirmed, the trip sits at **WAITING FOR 2ND IPAD**
-  and the API refuses to approve it.
-- **The confirmation queues offline** and uploads *after* the sales queue, never
-  before, so the remainder is never computed against partial sales.
-- **Only the Inventory Supervisor can change a figure**, and only with a written
-  reason. The system's own number is kept beside the correction rather than
-  overwritten, and both appear in the export.
-- **Approved leftovers post to the warehouse** through the movement ledger, so
-  every returned unit is traceable with the trip reference against it.
-
-## Commission on a round trip
-
-Each leg's 10% pool is calculated on that leg's own sales and divided among that
-group's four members only. The two groups are never pooled, even though both
-legs are worked from the same two iPad logins.
-
-**Added in the latest pass**
-
-- Queued sales upload themselves: on reconnect, and on a 12-second timer while
-  online. The manual sync button is gone; the page reports state instead.
-- A round trip is loaded once and reconciled once, across both legs.
-- The leftover figures are calculated by the system; the crew confirm rather
-  than count, and there is no flight to select.
-- Only the Inventory Supervisor can correct a figure, with mandatory remarks.
-- Finishing a leg asks for confirmation and is final; the leg cannot be selected
-  again.
-- Returned stock is recorded in the warehouse movement ledger with the trip
-  reference.
-- The profile dialog is a fixed box that does not scroll.
-- **Finish this flight** closes selling on a leg. On a round trip the outbound
-  group hands over to the return group, and each is paid on its own sales even
-  though both use the same iPad login. A finished leg rejects further sales.
-- Deleting a crew group and deleting a bundle are Inventory Supervisor actions,
-  as is adding stock directly to the warehouse. A group with recorded sales is
-  deactivated rather than deleted, so commission history survives.
-- Every management log view exports to Excel: crew ranking (with a by-group
-  sheet), top products, the audit log, and sales detail (with a separate
-  corrections sheet). Each export carries the filters shown on screen.
-- The profile dialog is a modest centred box rather than a near-full-height
-  sheet.
-
-- The daily register imports your existing workbook: pick the file and it fills
-  opening balances and every day's received and sales figures. Products are
-  matched by name and anything unmatched is reported rather than guessed at.
-  Imported figures are stored as manual entries, so live totals underneath are
-  never lost.
-- Purchase orders filter by delivery date, and receiving now records the actual
-  delivery date alongside the promised one, so the register shows both.
-- Order requests take either an existing product or a new one. A new product is
-  only created in the catalogue once the Inventory Supervisor approves the
-  order, so unapproved requests never pollute the product list. Receiving is
-  blocked until approval.
-- Products are no longer created from the Inventory screen; that tab is a
-  read-only view of the warehouse catalogue.
-- Crew see products as tiles with a search box, and anything sold out is hidden
-  rather than shown greyed out.
-- A crew stock return can be submitted once by the crew. Changing one that has
-  already been submitted is a Crew Supervisor action and needs written remarks,
-  which are recorded in the audit log. Approved returns are closed.
-- Management no longer have a selling screen; Finance see only rates and the
-  dashboard.
-- The dashboard adds target analysis: actual and target RPP, the per-passenger
-  difference, revenue at target, total shortfall or surplus, and how many legs
-  cleared the target.
-- Exchange rates carry a quotation unit, so INR per 100 and JPY per 10 convert
-  correctly.
-
-- OBS daily stock register and PO register, both matching the source workbooks
-  and both exportable to Excel.
-- Products can be created and edited in the app, and stock can be added to the
-  warehouse directly or through a purchase order receipt.
-- Aircraft is now a choice of A320 or A319 rather than free text, and the seat
-  map is drawn from it: 30 rows for the A320, 24 for the A319, three seats either
-  side of the aisle. A seat that does not exist on the aircraft is rejected, and
-  the type cannot be changed once sales exist against its seat numbers.
-- Crew and supervisor iPad accounts are picked from existing logins instead of
-  being typed in.
-- Search boxes on the trolley load list, the crew group list, the product
-  catalogue, the warehouse stock list, the daily register and the crew roster;
-  any picker with more than a dozen entries filters as you type.
-- The cabin crew roster is preloaded from the master name list with staff codes
-  and positions. Position shows on the group builder, the ranking table, the
-  sync page and the Commission sheet of the export, and the roster can be
-  filtered by it. The group builder warns when a group has no Purser.
-- The inventory Sync page shows crew stock returns instead of commission, which
-  is not their concern.
-- Revenue by product on the dashboard toggles between the chart and a ranked
-  list.
-
-**Added earlier**
-
-Finance role; crew roster and groups; flight assignment per leg; round trips;
-bundles with revenue allocated across components so product reporting stays
-accurate; main inventory with a full movement ledger; order requests and
-approvals; post-flight reconciliation; management sale corrections with remarks
-that flow into the Excel; commission ranking with charts; an inventory dashboard
-with low-stock alerts; and a calendar date picker built without adding a
-dependency.
-
-## 8. Troubleshooting
-
-**A red banner saying the API is an older build, or 404s on `/aircraft-types`,
-`/obs-register`, `/crew-accounts`, `/main-inventory/receive`,
-`/orders/{id}/receive`, `/reports/po-register.xlsx`**
-
-All of these are the same thing: port 8000 is being served by an older copy of
-the backend. `uvicorn --reload` only watches the folder it was started in, so
-extracting a new copy somewhere else leaves the old one running.
-
-**The quickest check of all:** when the current build starts, it prints a banner
-naming the folder it is serving from:
-
-```
-================================================================
-  Himalaya OBS API  v5.2
-  Serving from : C:\Users\you\himalaya-obs\backend
-  Database     : C:\Users\you\himalaya-obs\backend\obs.db
-  Routes       : 83
-================================================================
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/me
+curl -H "Authorization: Bearer $TOKEN" -o sales.xlsx http://localhost:8000/reports/sales.xlsx
 ```
 
-No banner means an older build. The "Serving from" line tells you exactly which
-copy is running, which is the usual cause: two folders with the same name.
+To see every route and its request schema, open `/docs` on a running server.
 
-1. Go to the terminal window running uvicorn and press **Ctrl-C**.
-2. `cd` into the `backend` folder you just extracted.
-3. Check you are in the right one — this build has files the old one does not:
+**Pagination.** Lists that grow over time (audit log, sales, purchase orders, stock movements, stock returns, filed reports, trips, alerts, deliveries, notifications) accept `?page=1&page_size=25` (max 200) and then return `{items, total, page, page_size, pages, has_prev, has_next}`. Without `page` they return their original response, so existing clients keep working.
 
-   ```
-   dir crew_seed.py routers\register.py        (Windows)
-   ls  crew_seed.py routers/register.py         (macOS, Linux)
-   ```
+## Building the app
 
-   If either is "not found", you are in the old folder.
-4. Start it again: `uvicorn main:app --reload --host 0.0.0.0 --port 8000`
-5. Reload the app page.
+Android and iOS builds use [EAS Build](https://docs.expo.dev/build/introduction/). The profiles are in [`mobile/eas.json`](mobile/eas.json):
 
-If step 4 reports that the port is already in use, an old server is still alive.
-Find and stop it:
-
-```
-netstat -ano | findstr :8000        (Windows, then: taskkill /PID <pid> /F)
-lsof -ti:8000 | xargs kill          (macOS, Linux)
+```bash
+cd mobile
+npx eas-cli build --profile preview --platform android   # installable APK
+npx eas-cli build --profile production --platform all
 ```
 
-To confirm which build is answering, open `http://<your-ip>:8000/health`. The
-current build reports `"version": "5.2"`; an older one returns only
-`{"status": "online"}`, which is what produces the banner. `/docs` lists every
-route the running server actually has.
+Before building, point `EXPO_PUBLIC_API_BASE` at the deployed API. You can set it in `.env` or in the EAS environment for that profile.
 
-**Blank screens or stale data after upgrading** — the app caches reference data
-for offline use. Sign out and back in to refresh it.
+## Getting help
 
-**`sqlite3.OperationalError: no such column`** — the database predates a schema
-change. Delete `backend/obs.db` and restart; it reseeds.
+- **API reference:** `/docs` (Swagger UI) or `/redoc` on a running backend.
+- **Operations handbook:** [`docs/HANDBOOK.md`](docs/HANDBOOK.md) covers the workflow, registers, exchange rates and common problems.
+- **Project scope:** `Himalaya Airlines - OBS Revenue Management System - Final Project Scope.docx`, in the repository root.
+- **Problems with the code:** open an issue in this repository, or contact H9 IT at <it@himalaya-airlines.com>.
 
-## 9. Exchange rates
+**Two common problems:**
 
-Rates are quoted per **unit** of foreign currency, as your rate sheet does:
+- **"API is an older build" banner, or 404 errors:** an old copy of the backend is still serving the port. Stop uvicorn and restart it from this repository's `backend/` folder.
+- **`sqlite3.OperationalError: no such column`:** the database is older than the current schema. Delete `backend/obs.db` and restart the backend; it creates and seeds a fresh one.
 
-| | Currency | Unit | NPR |
-|---|---|---|---|
-| 1 | INR (Indian Rupee) | 100 | 160.00 |
-| 2 | USD (U.S. Dollar) | 1 | 151.00 |
-| 3 | EUR (European Euro) | 1 | 174.00 |
-| 4 | GBP (UK Pound Sterling) | 1 | 204.00 |
-| 5 | AUD (Australian Dollar) | 1 | 106.00 |
-| 6 | SGD (Singapore Dollar) | 1 | 117.00 |
-| 7 | JPY (Japanese Yen) | 10 | 9.40 |
-| 8 | CNY (Chinese Yuan) | 1 | 22.40 |
-| 9 | SAR (Saudi Arabian Riyal) | 1 | 40.00 |
-| 10 | QAR (Qatari Riyal) | 1 | 41.00 |
-| 11 | AED (UAE Dirham) | 1 | 40.90 |
-| 12 | MYR (Malaysian Ringgit) | 1 | 36.80 |
-| 13 | KWD (Kuwait Dinar) | 1 | 490.00 |
+### Known limits
 
-The unit matters: 5,000 INR converts at 160 per 100, giving NPR 8,000, not NPR
-800,000. Finance pick the currency and the unit defaults correctly, but it can
-be overridden if the quotation convention changes.
+- Sessions are held in memory, so restarting `uvicorn` signs everyone out.
+- SQLite allows only one writer at a time. That works for a few devices, but a full fleet needs PostgreSQL.
+- The API serves plain HTTP. Put it behind TLS before exposing it outside the internal network.
 
-## 10. Known limits
+## Maintainers and contributing
 
-- Sessions live in the API process, so restarting `uvicorn` logs everyone out.
-  Fine for a prototype; move them to the database before production.
-- SQLite is single-writer. It will hold up for a few iPads; a busy fleet wants
-  PostgreSQL.
-- The API speaks HTTP. Put it behind TLS before it leaves your network.
+The **Himalaya Airlines IT Department (H9 IT)** maintains this project. Contact <it@himalaya-airlines.com>.
+
+Contributions from H9 IT staff and approved partners are welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a pull request.
+
+## License
+
+This is proprietary software, © Himalaya Airlines. It is for internal use only, and you may not redistribute it without written permission from Himalaya Airlines.

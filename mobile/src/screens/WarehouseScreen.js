@@ -5,11 +5,12 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 
 import { api, downloadReport } from '../api';
+import { usePaged } from '../paging';
 import { BarChart } from '../charts';
 import { COLORS, compact, npr, styles, todayString } from '../theme';
 import {
-  Banner, Button, CalendarModal, Card, Chip, Field, FrozenTable, Metric,
-  OptionModal, PageHeader, Pill, SearchBar, SectionTitle, Select,
+  Banner, Button, CalendarModal, Card, Chip, DataTable, Field, FrozenTable, Metric,
+  OptionModal, PageHeader, Pagination, Pill, SearchBar, SectionTitle, Select, StockPill,
 } from '../ui';
 
 export default function WarehouseScreen({ user }) {
@@ -51,14 +52,19 @@ export default function WarehouseScreen({ user }) {
   const [receiveCalendar, setReceiveCalendar] = useState(false);
   const [exporting, setExporting] = useState(false);
 
+  // The PO register and the movement ledger grow for ever, so they are paged
+  // on the server with every filter applied there, not on the device.
+  const poQuery = ['status', 'supply_type', 'delivery_from', 'delivery_to']
+    .filter((key) => poFilter[key]).map((key) => `${key}=${encodeURIComponent(poFilter[key])}`).join('&');
+  const po = usePaged(`/orders${poQuery ? `?${poQuery}` : ''}`, { enabled: tab === 'po' });
+  const moves = usePaged('/main-inventory/movements', { enabled: tab === 'ledger' });
+
   const load = useCallback(async () => {
     try {
-      const query = [];
-      if (poFilter.delivery_from) query.push(`delivery_from=${poFilter.delivery_from}`);
-      if (poFilter.delivery_to) query.push(`delivery_to=${poFilter.delivery_to}`);
       const [d, o] = await Promise.all([
         api('/warehouse/dashboard'),
-        api(`/orders${query.length ? `?${query.join('&')}` : ''}`),
+        // Only pending requests are acted on in Approvals; that list stays short.
+        api('/orders?status=PENDING'),
       ]);
       setDashboard(d);
       setOrders(o);
@@ -66,9 +72,12 @@ export default function WarehouseScreen({ user }) {
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
-  }, [canApprove, poFilter.delivery_from, poFilter.delivery_to]);
+  }, [canApprove]);
 
   useEffect(() => { load(); }, [load]);
+
+  // After any change: summary, pending lists and whichever paged list is open.
+  const refresh = () => { load(); po.reload(); moves.reload(); };
 
   async function addStock() {
     try {
@@ -82,7 +91,7 @@ export default function WarehouseScreen({ user }) {
       });
       setMessage({ tone: 'success', text: 'Stock added to main inventory.' });
       setReceipt({ product_id: null, quantity: '', remarks: '' });
-      load();
+      refresh();
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -122,7 +131,7 @@ export default function WarehouseScreen({ user }) {
         text: `${updated.order_no} marked ${updated.status.toLowerCase()}. Received pieces have been added to the warehouse.`,
       });
       setReceiveFor(null);
-      load();
+      refresh();
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -179,7 +188,7 @@ export default function WarehouseScreen({ user }) {
             : ''),
       });
       setRequest({}); setRemarks(''); setNewLines([]);
-      load();
+      refresh();
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -197,7 +206,7 @@ export default function WarehouseScreen({ user }) {
           ? `Order ${order.order_no} approved and added to main inventory.`
           : `Order ${order.order_no} rejected.`,
       });
-      load();
+      refresh();
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -215,7 +224,7 @@ export default function WarehouseScreen({ user }) {
           ? 'Approved — leftover stock has returned to main inventory and the flight is closed.'
           : 'Sent back to the crew for a recount.',
       });
-      load();
+      refresh();
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -233,7 +242,7 @@ export default function WarehouseScreen({ user }) {
       });
       setMessage({ tone: 'success', text: 'Stock adjusted.' });
       setAdjust({ product_id: null, quantity: '', remarks: '' });
-      load();
+      refresh();
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -249,9 +258,7 @@ export default function WarehouseScreen({ user }) {
     );
   }
 
-  const filteredOrders = orders.filter((o) =>
-    (!poFilter.status || o.status === poFilter.status)
-    && (!poFilter.supply_type || o.supply_type === poFilter.supply_type));
+  const filteredOrders = po.items;
 
   const tabs = [
     { key: 'stock', label: 'Stock' },
@@ -312,22 +319,29 @@ export default function WarehouseScreen({ user }) {
               format={compact}
             />
             <SearchBar value={stockSearch} onChangeText={setStockSearch} placeholder="Search product…" />
-            {dashboard.items
-              .filter((i) => i.product_name.toLowerCase().includes(stockSearch.trim().toLowerCase()))
-              .map((item) => (
-              <View key={item.product_id} style={styles.listRow}>
-                <View style={styles.rowBetween}>
-                  <Text style={{ fontSize: 13.5, fontWeight: '600', flex: 1 }}>{item.product_name}</Text>
-                  <Pill
-                    label={item.quantity === 0 ? 'OUT' : item.low_stock ? 'LOW' : 'OK'}
-                    tone={item.quantity === 0 ? 'danger' : item.low_stock ? 'warning' : 'success'}
-                  />
-                </View>
-                <Text style={styles.mono}>
-                  {item.quantity} {item.unit} in warehouse · {item.on_aircraft} on aircraft · reorder at {item.reorder_level}
-                </Text>
-              </View>
-            ))}
+            <DataTable
+              rows={dashboard.items.filter((i) => i.product_name.toLowerCase().includes(stockSearch.trim().toLowerCase()))}
+              rowKey={(item) => item.product_id}
+              emptyText={stockSearch ? `No product matches “${stockSearch}”.` : 'No products yet.'}
+              columns={[
+                { key: 'product_name', label: 'Product', flex: 2.4 },
+                { key: 'quantity', label: 'In warehouse', align: 'right', render: (i) => `${i.quantity} ${i.unit}` },
+                { key: 'on_aircraft', label: 'On aircraft', align: 'right', render: (i) => String(i.on_aircraft) },
+                { key: 'reorder_level', label: 'Reorder at', align: 'right', render: (i) => String(i.reorder_level) },
+                { key: 'status', label: 'Status', flex: 1.2, align: 'right', render: (i) => <StockPill quantity={i.quantity} low={i.low_stock} /> },
+              ]}
+              renderStacked={(item) => (
+                <>
+                  <View style={styles.rowBetween}>
+                    <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>{item.product_name}</Text>
+                    <StockPill quantity={item.quantity} low={item.low_stock} />
+                  </View>
+                  <Text style={[styles.mono, styles.numeric]}>
+                    {item.quantity} {item.unit} in warehouse · {item.on_aircraft} on aircraft · reorder at {item.reorder_level}
+                  </Text>
+                </>
+              )}
+            />
           </Card>
 
           {canApprove && (
@@ -356,7 +370,7 @@ export default function WarehouseScreen({ user }) {
                 placeholder="Damaged in transit"
               />
               <Button
-                title="APPLY ADJUSTMENT"
+                title="Apply adjustment"
                 onPress={submitAdjust}
                 disabled={!adjust.product_id || !adjust.quantity || !adjust.remarks}
               />
@@ -395,7 +409,7 @@ export default function WarehouseScreen({ user }) {
             placeholder="Delivery received at SGG"
           />
           <Button
-            title="ADD TO WAREHOUSE"
+            title="Add to warehouse"
             onPress={addStock}
             disabled={!receipt.product_id || !receipt.quantity || !receipt.remarks.trim()}
           />
@@ -507,7 +521,7 @@ export default function WarehouseScreen({ user }) {
                   style={{ flex: 1 }}
                 />
               </View>
-              <Button title="ADD THIS LINE" tone="secondary" small onPress={addNewLine} />
+              <Button title="Add this line" tone="secondary" small onPress={addNewLine} />
             </View>
           )}
           <View style={{ height: 12 }} />
@@ -516,7 +530,7 @@ export default function WarehouseScreen({ user }) {
             <View key={`${line.new_product_code}-${index}`} style={[styles.rowBetween, styles.listRow]}>
               <View style={styles.flex1}>
                 <View style={[styles.row, styles.gap8]}>
-                  <Text style={{ fontSize: 13.5, fontWeight: '600' }}>{line.new_product_name}</Text>
+                  <Text style={{ fontSize: 14, fontWeight: '600' }}>{line.new_product_name}</Text>
                   <Pill label="NEW" tone="warning" />
                 </View>
                 <Text style={styles.mono}>
@@ -536,7 +550,7 @@ export default function WarehouseScreen({ user }) {
             return (
               <View key={id} style={[styles.rowBetween, styles.listRow]}>
                 <View style={styles.flex1}>
-                  <Text style={{ fontSize: 13.5, fontWeight: '600' }}>{item?.product_name}</Text>
+                  <Text style={{ fontSize: 14, fontWeight: '600' }}>{item?.product_name}</Text>
                   <Text style={styles.mono}>Currently {item?.quantity} in warehouse</Text>
                 </View>
                 <TextInput
@@ -557,7 +571,7 @@ export default function WarehouseScreen({ user }) {
             placeholder="Stock running low before the festival season"
             style={{ marginTop: 12 }}
           />
-          <Button title="SUBMIT ORDER REQUEST" onPress={submitOrder} />
+          <Button title="Submit order request" onPress={submitOrder} />
         </Card>
       )}
 
@@ -597,7 +611,7 @@ export default function WarehouseScreen({ user }) {
               />
             </View>
             <Button
-              title={exporting ? 'Preparing…' : 'DOWNLOAD PO REGISTER (EXCEL)'}
+              title={exporting ? 'Preparing…' : 'Download PO register (Excel)'}
               tone="secondary"
               onPress={exportPoRegister}
               disabled={exporting}
@@ -661,16 +675,19 @@ export default function WarehouseScreen({ user }) {
                 <Text style={[styles.mono, { marginTop: 8 }]}>
                   Scroll sideways for the remaining columns. Quantities are in pieces so they post to stock.
                 </Text>
+                <Pagination pager={po} label="purchase orders" />
               </>
             ) : (
-              <Text style={styles.empty}>No purchase orders match that filter.</Text>
+              <Text style={styles.empty}>
+                {po.loading ? 'Loading…' : po.error || 'No purchase orders match that filter.'}
+              </Text>
             )}
           </Card>
 
           {filteredOrders.map((order) => (
             <Card key={order.id}>
               <View style={styles.rowBetween}>
-                <Text style={{ fontSize: 15, fontWeight: '800', color: COLORS.primary }}>
+                <Text style={{ fontSize: 15, fontWeight: '700', color: COLORS.primary }}>
                   {order.order_no}
                 </Text>
                 <View style={[styles.row, styles.gap8]}>
@@ -686,12 +703,12 @@ export default function WarehouseScreen({ user }) {
 
               {order.items.map((item) => (
                 <View key={item.id} style={[styles.rowBetween, { paddingVertical: 4 }]}>
-                  <Text style={{ flex: 1, fontSize: 12.5 }} numberOfLines={1}>{item.product_name}</Text>
-                  <Text style={{ width: 84, fontSize: 12.5, textAlign: 'right' }}>
+                  <Text style={{ flex: 1, fontSize: 13 }} numberOfLines={1}>{item.product_name}</Text>
+                  <Text style={{ width: 84, fontSize: 13, textAlign: 'right' }}>
                     {item.quantity} pcs
                   </Text>
                   <Text style={{
-                    width: 84, fontSize: 12.5, textAlign: 'right', fontWeight: '600',
+                    width: 84, fontSize: 13, textAlign: 'right', fontWeight: '600',
                     color: item.received_quantity >= item.quantity ? COLORS.success : COLORS.warning,
                   }}>
                     {item.received_quantity} recd
@@ -699,12 +716,12 @@ export default function WarehouseScreen({ user }) {
                 </View>
               ))}
               {!!order.outstanding && (
-                <Text style={{ fontSize: 11.5, color: COLORS.warning, marginTop: 4 }}>
+                <Text style={{ fontSize: 12, color: COLORS.warning, marginTop: 4 }}>
                   {order.outstanding} pcs still outstanding.
                 </Text>
               )}
               {!!order.edited_by && (
-                <Text style={{ fontSize: 11.5, color: COLORS.warning, marginTop: 4 }}>
+                <Text style={{ fontSize: 12, color: COLORS.warning, marginTop: 4 }}>
                   Edited by {order.edited_by}: {order.edit_remarks}
                 </Text>
               )}
@@ -764,7 +781,7 @@ export default function WarehouseScreen({ user }) {
                     onChangeText={(v) => setReceiveMeta({ ...receiveMeta, received_location: v })}
                     placeholder="SGG"
                   />
-                  <Button title="POST RECEIPT TO WAREHOUSE" onPress={submitReceipt} />
+                  <Button title="Post receipt to warehouse" onPress={submitReceipt} />
                 </View>
               )}
             </Card>
@@ -779,7 +796,7 @@ export default function WarehouseScreen({ user }) {
             {orders.filter((o) => o.status === 'PENDING').map((order) => (
               <View key={order.id} style={styles.listRow}>
                 <View style={styles.rowBetween}>
-                  <Text style={{ fontSize: 14, fontWeight: '700' }}>{order.order_no}</Text>
+                  <Text style={{ fontSize: 14, fontWeight: '600' }}>{order.order_no}</Text>
                   <Pill label={order.status} tone="warning" />
                 </View>
                 <Text style={styles.mono}>
@@ -808,7 +825,7 @@ export default function WarehouseScreen({ user }) {
             {recons.map((recon) => (
               <View key={recon.id} style={styles.listRow}>
                 <View style={styles.rowBetween}>
-                  <Text style={{ fontSize: 14, fontWeight: '700' }}>
+                  <Text style={{ fontSize: 14, fontWeight: '600' }}>
                     {recon.flight_number} · {recon.flight_date}
                   </Text>
                   <Pill
@@ -838,13 +855,14 @@ export default function WarehouseScreen({ user }) {
 
       {tab === 'ledger' && (
         <Card>
-          <SectionTitle title="Recent stock movements" description="Every automatic and manual change to main inventory." />
-          {dashboard.recent_movements.map((move) => (
+          <SectionTitle title="Stock movements" description="Every automatic and manual change to main inventory, newest first." />
+          {!!moves.error && <Banner tone="danger" message={moves.error} />}
+          {moves.items.map((move) => (
             <View key={move.id} style={styles.listRow}>
               <View style={styles.rowBetween}>
-                <Text style={{ fontSize: 13.5, fontWeight: '600', flex: 1 }}>{move.product_name}</Text>
+                <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>{move.product_name}</Text>
                 <Text style={{
-                  fontWeight: '700',
+                  fontWeight: '600',
                   color: move.change_qty > 0 ? COLORS.success : COLORS.danger,
                 }}>
                   {move.change_qty > 0 ? '+' : ''}{move.change_qty}
@@ -856,7 +874,8 @@ export default function WarehouseScreen({ user }) {
               {!!move.reference && <Text style={styles.mono}>{move.reference}</Text>}
             </View>
           ))}
-          {!dashboard.recent_movements.length && <Text style={styles.empty}>No movements recorded.</Text>}
+          {!moves.items.length && !moves.loading && <Text style={styles.empty}>No movements recorded.</Text>}
+          <Pagination pager={moves} label="movements" />
         </Card>
       )}
 

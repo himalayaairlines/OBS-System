@@ -1,81 +1,109 @@
 import React, { useMemo, useState } from 'react';
 import {
-  ActivityIndicator, Modal, Pressable, ScrollView, Text, TextInput, View,
+  ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View, useWindowDimensions,
 } from 'react-native';
 
 import { registerDialogHandler } from './dialog';
-import { COLORS, MONTHS, styles } from './theme';
+import {
+  COLORS, CONTROL, MONTHS, NUMERIC, RADIUS, SPACE, TYPE, styles,
+} from './theme';
+
+/*
+ * Shared components. Every screen builds from these, so a change here is a
+ * change everywhere: keep the props stable.
+ */
 
 /* ----------------------------- buttons ----------------------------- */
-export function Button({ title, onPress, disabled, tone = 'primary', small, style }) {
-  const palette = {
-    primary: { bg: COLORS.primary, fg: '#FFFFFF', border: COLORS.primary },
-    secondary: { bg: COLORS.surface, fg: COLORS.primary, border: COLORS.primary },
-    ghost: { bg: 'transparent', fg: COLORS.muted, border: COLORS.border },
-    success: { bg: COLORS.success, fg: '#FFFFFF', border: COLORS.success },
-    danger: { bg: COLORS.danger, fg: '#FFFFFF', border: COLORS.danger },
-    warning: { bg: COLORS.warning, fg: '#FFFFFF', border: COLORS.warning },
-  }[tone];
+const BUTTON_TONES = {
+  primary: { bg: COLORS.primary, fg: '#FFFFFF', border: COLORS.primary },
+  secondary: { bg: COLORS.surface, fg: COLORS.primary, border: COLORS.primary },
+  ghost: { bg: COLORS.surface, fg: COLORS.text, border: COLORS.borderStrong },
+  success: { bg: COLORS.success, fg: '#FFFFFF', border: COLORS.success },
+  danger: { bg: COLORS.danger, fg: '#FFFFFF', border: COLORS.danger },
+  warning: { bg: COLORS.warning, fg: '#FFFFFF', border: COLORS.warning },
+};
 
+export function Button({ title, onPress, disabled, tone = 'primary', small, style, loading, accessibilityLabel }) {
+  const palette = BUTTON_TONES[tone] || BUTTON_TONES.primary;
+  const inactive = disabled || loading;
   return (
     <Pressable
       onPress={onPress}
-      disabled={disabled}
-      style={({ pressed }) => [
+      disabled={inactive}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel || (typeof title === 'string' ? title : undefined)}
+      accessibilityState={{ disabled: !!inactive, busy: !!loading }}
+      style={({ pressed, hovered }) => [
         {
           backgroundColor: palette.bg,
           borderColor: palette.border,
           borderWidth: 1,
-          borderRadius: 10,
-          paddingVertical: small ? 8 : 12,
-          paddingHorizontal: small ? 12 : 16,
+          borderRadius: RADIUS.md,
+          minHeight: small ? CONTROL.heightSmall : CONTROL.height,
+          paddingHorizontal: small ? SPACE.md : SPACE.lg,
           alignItems: 'center',
-          opacity: disabled ? 0.45 : pressed ? 0.8 : 1,
+          justifyContent: 'center',
+          flexDirection: 'row',
+          gap: SPACE.sm,
+          opacity: inactive ? 0.5 : pressed ? 0.85 : hovered ? 0.93 : 1,
         },
         style,
       ]}
     >
-      <Text style={{ color: palette.fg, fontWeight: '700', fontSize: small ? 12 : 14 }}>
+      {loading && <ActivityIndicator size="small" color={palette.fg} />}
+      <Text
+        numberOfLines={2}
+        style={{ color: palette.fg, fontWeight: '600', fontSize: small ? 13 : 14, textAlign: 'center' }}
+      >
         {title}
       </Text>
     </Pressable>
   );
 }
 
+/** Filter and tab chip. Squared off to match inputs and buttons. */
 export function Chip({ label, active, onPress, tone = 'primary', disabled }) {
-  const color = { primary: COLORS.primary, success: COLORS.success, danger: COLORS.danger }[tone];
+  const color = { primary: COLORS.primary, success: COLORS.success, danger: COLORS.danger }[tone] || COLORS.primary;
   return (
     <Pressable
       onPress={onPress}
       disabled={disabled}
-      style={{
-        paddingVertical: 7,
-        paddingHorizontal: 13,
-        borderRadius: 20,
+      accessibilityRole="button"
+      accessibilityState={{ selected: !!active, disabled: !!disabled }}
+      style={({ hovered }) => ({
+        minHeight: 32,
+        justifyContent: 'center',
+        paddingHorizontal: SPACE.md,
+        borderRadius: RADIUS.md,
         borderWidth: 1,
-        borderColor: active ? color : COLORS.border,
-        backgroundColor: active ? color : COLORS.surface,
+        borderColor: active ? color : COLORS.borderStrong,
+        backgroundColor: active ? color : hovered ? COLORS.surfaceAlt : COLORS.surface,
         opacity: disabled ? 0.45 : 1,
-      }}
+      })}
     >
-      <Text style={{ color: active ? '#FFFFFF' : COLORS.text, fontSize: 12.5, fontWeight: '600' }}>
+      <Text style={{ color: active ? '#FFFFFF' : COLORS.text, fontSize: 13, fontWeight: active ? '600' : '500' }}>
         {label}
       </Text>
     </Pressable>
   );
 }
 
+const PILL_TONES = {
+  success: { bg: COLORS.successSoft, fg: COLORS.success },
+  warning: { bg: COLORS.warningSoft, fg: COLORS.warning },
+  danger: { bg: COLORS.dangerSoft, fg: COLORS.danger },
+  info: { bg: COLORS.infoSoft, fg: COLORS.infoText },
+  muted: { bg: COLORS.surfaceAlt, fg: COLORS.muted },
+};
+
+/** Status badge. The label always carries the meaning; colour only reinforces it. */
 export function Pill({ label, tone = 'info' }) {
-  const palette = {
-    success: { bg: '#E3F5EE', fg: COLORS.success },
-    warning: { bg: '#FDF1DF', fg: COLORS.warning },
-    danger: { bg: '#FCE8E6', fg: COLORS.danger },
-    info: { bg: '#E8F0FE', fg: COLORS.info },
-    muted: { bg: COLORS.surfaceAlt, fg: COLORS.muted },
-  }[tone];
+  const palette = PILL_TONES[tone] || PILL_TONES.info;
   return (
-    <View style={{ backgroundColor: palette.bg, borderRadius: 14, paddingVertical: 3, paddingHorizontal: 9 }}>
-      <Text style={{ color: palette.fg, fontSize: 11, fontWeight: '700' }}>{label}</Text>
+    <View style={{
+      backgroundColor: palette.bg, borderRadius: RADIUS.sm, paddingVertical: 3, paddingHorizontal: SPACE.sm,
+    }}>
+      <Text style={[TYPE.badge, { color: palette.fg, letterSpacing: 0.3 }]}>{label}</Text>
     </View>
   );
 }
@@ -87,9 +115,9 @@ export function Card({ children, style, tight }) {
 
 export function SectionTitle({ title, description, right }) {
   return (
-    <View style={[styles.rowBetween, { marginBottom: description ? 10 : 8 }]}>
+    <View style={[styles.rowBetween, { marginBottom: SPACE.md, gap: SPACE.md, alignItems: 'flex-start' }]}>
       <View style={styles.flex1}>
-        <Text style={styles.sectionTitle}>{title}</Text>
+        <Text style={styles.sectionTitle} accessibilityRole="header">{title}</Text>
         {!!description && <Text style={styles.sectionDescription}>{description}</Text>}
       </View>
       {right}
@@ -99,9 +127,9 @@ export function SectionTitle({ title, description, right }) {
 
 export function PageHeader({ title, description, right }) {
   return (
-    <View style={[styles.rowBetween, { marginBottom: 14 }]}>
+    <View style={[styles.rowBetween, { marginBottom: SPACE.lg, gap: SPACE.md, alignItems: 'flex-start' }]}>
       <View style={styles.flex1}>
-        <Text style={styles.pageTitle}>{title}</Text>
+        <Text style={styles.pageTitle} accessibilityRole="header">{title}</Text>
         {!!description && <Text style={styles.pageDescription}>{description}</Text>}
       </View>
       {right}
@@ -109,72 +137,135 @@ export function PageHeader({ title, description, right }) {
   );
 }
 
+/** KPI tile. Same proportions everywhere; tone only for meaningful states. */
 export function Metric({ label, value, sub, tone = 'default', width }) {
   const color = {
     default: COLORS.text, success: COLORS.success,
     danger: COLORS.danger, warning: COLORS.warning, primary: COLORS.primary,
-  }[tone];
+  }[tone] || COLORS.text;
   return (
     <View
       style={{
         backgroundColor: COLORS.surfaceAlt,
-        borderRadius: 12,
-        padding: 12,
-        minWidth: width || 148,
+        borderRadius: RADIUS.md,
+        paddingVertical: SPACE.md,
+        paddingHorizontal: SPACE.md,
+        minWidth: width || 132,
         flexGrow: 1,
       }}
     >
-      <Text style={{ fontSize: 11, color: COLORS.muted, fontWeight: '600' }}>{label}</Text>
-      <Text style={{ fontSize: 19, fontWeight: '700', color, marginTop: 4 }} numberOfLines={1}>
+      <Text style={[TYPE.caption, { color: COLORS.muted, fontWeight: '500' }]} numberOfLines={1}>{label}</Text>
+      <Text style={[TYPE.metric, NUMERIC, { color, marginTop: SPACE.xs }]}>
         {value}
       </Text>
-      {!!sub && <Text style={{ fontSize: 11, color: COLORS.faint, marginTop: 2 }}>{sub}</Text>}
+      {!!sub && <Text style={[TYPE.caption, { color: COLORS.muted, marginTop: SPACE.xxs }]}>{sub}</Text>}
     </View>
   );
 }
 
+const BANNER_TONES = {
+  info: { bg: COLORS.infoSoft, border: '#C3D6FA', accent: COLORS.info, fg: COLORS.infoText },
+  success: { bg: COLORS.successSoft, border: '#BFE2D1', accent: COLORS.success, fg: COLORS.success },
+  warning: { bg: COLORS.warningSoft, border: '#EED7AE', accent: COLORS.warning, fg: COLORS.warning },
+  danger: { bg: COLORS.dangerSoft, border: '#F1C4BF', accent: COLORS.danger, fg: COLORS.danger },
+};
+
 export function Banner({ message, tone = 'info' }) {
   if (!message) return null;
-  const palette = {
-    info: { bg: '#E8F0FE', border: '#BBD2FB', fg: '#1A4FBF' },
-    success: { bg: '#E3F5EE', border: '#B6E2D2', fg: COLORS.success },
-    warning: { bg: '#FDF1DF', border: '#F2D9AE', fg: COLORS.warning },
-    danger: { bg: '#FCE8E6', border: '#F3C2BD', fg: COLORS.danger },
-  }[tone];
+  const palette = BANNER_TONES[tone] || BANNER_TONES.info;
   return (
-    <View style={[styles.banner, { backgroundColor: palette.bg, borderColor: palette.border }]}>
+    <View
+      accessibilityRole={tone === 'danger' ? 'alert' : undefined}
+      accessibilityLiveRegion={tone === 'danger' ? 'assertive' : 'polite'}
+      style={[styles.banner, { backgroundColor: palette.bg, borderColor: palette.border, borderLeftColor: palette.accent }]}
+    >
       <Text style={[styles.bannerText, { color: palette.fg }]}>{message}</Text>
     </View>
   );
 }
 
-export function Field({ label, hint, ...props }) {
+/* ------------------------------ inputs ------------------------------ */
+// Layout props belong on the wrapper, not the text box, so `style={{ flex: 1 }}`
+// on a Field in a row sizes the whole field (label and all) and never overflows.
+const LAYOUT_KEYS = [
+  'flex', 'flexGrow', 'flexShrink', 'flexBasis', 'width', 'minWidth', 'maxWidth', 'alignSelf',
+  'margin', 'marginTop', 'marginBottom', 'marginLeft', 'marginRight', 'marginHorizontal', 'marginVertical',
+];
+
+function splitStyle(style) {
+  const flat = StyleSheet.flatten(style) || {};
+  const outer = {};
+  const inner = {};
+  Object.entries(flat).forEach(([key, value]) => {
+    if (LAYOUT_KEYS.includes(key)) outer[key] = value; else inner[key] = value;
+  });
+  return [outer, inner];
+}
+
+export function Field({ label, hint, error, required, style, onFocus, onBlur, ...props }) {
+  const [focused, setFocused] = useState(false);
+  const [outer, inner] = splitStyle(style);
   return (
-    <View style={{ marginBottom: 12 }}>
-      {!!label && <Text style={styles.label}>{label}</Text>}
+    <View style={[{ marginBottom: SPACE.md }, outer]}>
+      {!!label && (
+        <Text style={styles.label}>
+          {label}
+          {required && <Text style={{ color: COLORS.danger }}> *</Text>}
+        </Text>
+      )}
       <TextInput
         placeholderTextColor={COLORS.faint}
+        accessibilityLabel={label}
         {...props}
-        style={[styles.input, props.multiline && styles.inputMultiline, props.style]}
+        onFocus={(e) => { setFocused(true); onFocus?.(e); }}
+        onBlur={(e) => { setFocused(false); onBlur?.(e); }}
+        style={[
+          styles.input,
+          props.multiline && styles.inputMultiline,
+          props.editable === false && { backgroundColor: COLORS.surfaceAlt, color: COLORS.muted },
+          focused && styles.inputFocused,
+          !!error && { borderColor: COLORS.danger },
+          inner,
+        ]}
       />
-      {!!hint && <Text style={[styles.mono, { marginTop: 4 }]}>{hint}</Text>}
+      {!!error && <Text style={[TYPE.caption, { color: COLORS.danger, marginTop: SPACE.xs }]}>{error}</Text>}
+      {!!hint && !error && <Text style={[styles.mono, { marginTop: SPACE.xs }]}>{hint}</Text>}
     </View>
   );
 }
 
-export function Select({ label, valueLabel, onPress, style, placeholder = 'Select' }) {
+export function Select({ label, valueLabel, onPress, style, placeholder = 'Select', disabled }) {
   return (
-    <View style={[{ marginBottom: 12 }, style]}>
+    <View style={[{ marginBottom: SPACE.md }, style]}>
       {!!label && <Text style={styles.label}>{label}</Text>}
-      <Pressable onPress={onPress} style={[styles.input, styles.rowBetween]}>
-        <Text style={{ color: valueLabel ? COLORS.text : COLORS.faint, fontSize: 14 }} numberOfLines={1}>
+      <Pressable
+        onPress={onPress}
+        disabled={disabled}
+        accessibilityRole="button"
+        accessibilityLabel={label ? `${label}: ${valueLabel || placeholder}` : valueLabel || placeholder}
+        style={({ hovered }) => [styles.input, styles.rowBetween, {
+          justifyContent: 'space-between',
+          borderColor: hovered ? COLORS.primary : COLORS.borderStrong,
+          opacity: disabled ? 0.5 : 1,
+        }]}
+      >
+        <Text style={{ color: valueLabel ? COLORS.text : COLORS.faint, fontSize: 14, flex: 1 }} numberOfLines={1}>
           {valueLabel || placeholder}
         </Text>
-        <Text style={{ color: COLORS.muted, fontSize: 12 }}>▾</Text>
+        <Text style={{ color: COLORS.muted, fontSize: 12, marginLeft: SPACE.sm }}>▾</Text>
       </Pressable>
     </View>
   );
 }
+
+/* ----------------------------- overlays ----------------------------- */
+const sheet = {
+  backgroundColor: COLORS.surface,
+  borderRadius: RADIUS.xl,
+  overflow: 'hidden',
+  width: '100%',
+  alignSelf: 'center',
+};
 
 export function OptionModal({
   visible, title, options, selectedValue, onSelect, onClose, multi,
@@ -194,15 +285,16 @@ export function OptionModal({
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <Pressable
         onPress={onClose}
-        style={{ flex: 1, backgroundColor: '#0009', justifyContent: 'center', padding: 22 }}
+        style={{ flex: 1, backgroundColor: COLORS.overlay, justifyContent: 'center', padding: SPACE.xl }}
       >
         <Pressable
           onPress={(e) => e.stopPropagation()}
-          style={{ backgroundColor: COLORS.surface, borderRadius: 14, maxHeight: '75%', overflow: 'hidden' }}
+          accessibilityViewIsModal
+          style={[sheet, { maxHeight: '80%', maxWidth: 520 }]}
         >
-          <View style={{ padding: 15, borderBottomWidth: 1, borderBottomColor: COLORS.border }}>
+          <View style={{ padding: SPACE.lg, borderBottomWidth: 1, borderBottomColor: COLORS.border }}>
             <View style={styles.rowBetween}>
-              <Text style={styles.sectionTitle}>{title}</Text>
+              <Text style={styles.sectionTitle} accessibilityRole="header">{title}</Text>
               {multi && <Pill label={`${(selectedValue || []).length} selected`} tone="info" />}
             </View>
             {showSearch && (
@@ -212,7 +304,8 @@ export function OptionModal({
                 placeholder={searchPlaceholder}
                 placeholderTextColor={COLORS.faint}
                 autoCorrect={false}
-                style={[styles.input, { marginTop: 10, paddingVertical: 8 }]}
+                accessibilityLabel={searchPlaceholder}
+                style={[styles.input, { marginTop: SPACE.md }]}
               />
             )}
           </View>
@@ -230,14 +323,19 @@ export function OptionModal({
                 <Pressable
                   key={String(option.value)}
                   onPress={() => onSelect(option.value)}
-                  style={{
-                    padding: 14,
+                  accessibilityRole={multi ? 'checkbox' : 'radio'}
+                  accessibilityState={{ checked: selected, selected }}
+                  style={({ hovered }) => ({
+                    minHeight: 44,
+                    justifyContent: 'center',
+                    paddingVertical: SPACE.sm + 2,
+                    paddingHorizontal: SPACE.lg,
                     borderBottomWidth: 1,
                     borderBottomColor: COLORS.surfaceAlt,
-                    backgroundColor: selected ? '#EAF1FA' : 'transparent',
-                  }}
+                    backgroundColor: selected ? COLORS.primarySoft : hovered ? COLORS.surfaceAlt : 'transparent',
+                  })}
                 >
-                  <Text style={{ fontSize: 14, color: COLORS.text, fontWeight: selected ? '700' : '400' }}>
+                  <Text style={{ fontSize: 14, color: COLORS.text, fontWeight: selected ? '600' : '400' }}>
                     {selected ? '✓  ' : ''}{option.label}
                   </Text>
                   {!!option.sub && <Text style={[styles.mono, { marginTop: 2 }]}>{option.sub}</Text>}
@@ -245,8 +343,8 @@ export function OptionModal({
               );
             })}
           </ScrollView>
-          <View style={{ padding: 12, borderTopWidth: 1, borderTopColor: COLORS.border }}>
-            <Button title={multi ? 'Done' : 'Close'} tone="secondary" onPress={onClose} />
+          <View style={{ padding: SPACE.md, borderTopWidth: 1, borderTopColor: COLORS.border }}>
+            <Button title={multi ? 'Done' : 'Close'} tone={multi ? 'primary' : 'ghost'} onPress={onClose} />
           </View>
         </Pressable>
       </Pressable>
@@ -293,17 +391,18 @@ export function CalendarModal({ visible, title = 'Select date', value, onSelect,
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <Pressable
         onPress={onClose}
-        style={{ flex: 1, backgroundColor: '#0009', justifyContent: 'center', padding: 22 }}
+        style={{ flex: 1, backgroundColor: COLORS.overlay, justifyContent: 'center', padding: 22 }}
       >
         <Pressable
           onPress={(e) => e.stopPropagation()}
-          style={{ backgroundColor: COLORS.surface, borderRadius: 14, padding: 16 }}
+          accessibilityViewIsModal
+          style={[sheet, { padding: SPACE.lg, maxWidth: 420 }]}
         >
           <Text style={[styles.sectionTitle, { marginBottom: 12 }]}>{title}</Text>
 
           <View style={[styles.rowBetween, { marginBottom: 10 }]}>
             <Button title="‹" tone="ghost" small onPress={() => step(-1)} style={{ width: 46 }} />
-            <Text style={{ fontWeight: '700', fontSize: 15, color: COLORS.text }}>
+            <Text style={[TYPE.bodyStrong, { fontSize: 15, color: COLORS.text }]}>
               {MONTHS[cursor.month]} {cursor.year}
             </Text>
             <Button title="›" tone="ghost" small onPress={() => step(1)} style={{ width: 46 }} />
@@ -313,7 +412,7 @@ export function CalendarModal({ visible, title = 'Select date', value, onSelect,
             {WEEKDAYS.map((day) => (
               <Text
                 key={day}
-                style={{ flex: 1, textAlign: 'center', fontSize: 11, color: COLORS.faint, fontWeight: '700' }}
+                style={{ flex: 1, textAlign: 'center', fontSize: 12, color: COLORS.muted, fontWeight: '600' }}
               >
                 {day}
               </Text>
@@ -339,7 +438,7 @@ export function CalendarModal({ visible, title = 'Select date', value, onSelect,
                       opacity: blocked ? 0.28 : 1,
                     }}
                   >
-                    <Text style={{ color: selected ? '#FFFFFF' : COLORS.text, fontWeight: selected ? '700' : '500' }}>
+                    <Text style={[NUMERIC, { fontSize: 14, color: selected ? '#FFFFFF' : COLORS.text, fontWeight: selected ? '600' : '400' }]}>
                       {day}
                     </Text>
                   </Pressable>
@@ -377,16 +476,18 @@ export function Loading({ label = 'Loading…' }) {
   return (
     <View style={{ padding: 28, alignItems: 'center' }}>
       <ActivityIndicator color={COLORS.primary} />
-      <Text style={[styles.mono, { marginTop: 8 }]}>{label}</Text>
+      <Text style={[styles.mono, { marginTop: SPACE.sm }]} accessibilityLiveRegion="polite">{label}</Text>
     </View>
   );
 }
 
 export function KeyValue({ label, value, tone }) {
   return (
-    <View style={[styles.rowBetween, { paddingVertical: 5 }]}>
-      <Text style={{ fontSize: 12.5, color: COLORS.muted }}>{label}</Text>
-      <Text style={{ fontSize: 13, color: tone || COLORS.text, fontWeight: '600' }}>{value}</Text>
+    <View style={[styles.rowBetween, { paddingVertical: 6, gap: SPACE.lg, alignItems: 'flex-start' }]}>
+      <Text style={[TYPE.small, { color: COLORS.muted }]}>{label}</Text>
+      <Text style={[TYPE.small, NUMERIC, { color: tone || COLORS.text, fontWeight: '600', flexShrink: 1, textAlign: 'right' }]}>
+        {value}
+      </Text>
     </View>
   );
 }
@@ -406,11 +507,12 @@ export function SeatMapModal({ visible, spec, selected, onSelect, onClose, taken
     <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <Pressable
         onPress={onClose}
-        style={{ flex: 1, backgroundColor: '#0009', justifyContent: 'center', padding: 16 }}
+        style={{ flex: 1, backgroundColor: COLORS.overlay, justifyContent: 'center', padding: 16 }}
       >
         <Pressable
           onPress={(e) => e.stopPropagation()}
-          style={{ backgroundColor: COLORS.surface, borderRadius: 14, maxHeight: '88%', overflow: 'hidden' }}
+          accessibilityViewIsModal
+          style={[sheet, { maxHeight: '88%', maxWidth: 420 }]}
         >
           <View style={{ padding: 14, borderBottomWidth: 1, borderBottomColor: COLORS.border }}>
             <Text style={styles.sectionTitle}>Select seat</Text>
@@ -427,8 +529,8 @@ export function SeatMapModal({ visible, spec, selected, onSelect, onClose, taken
                   <Text
                     key={letter}
                     style={{
-                      width: 40, textAlign: 'center', fontSize: 11,
-                      fontWeight: '700', color: COLORS.faint,
+                      width: 40, textAlign: 'center', fontSize: 12,
+                      fontWeight: '600', color: COLORS.muted,
                     }}
                   >
                     {letter}
@@ -442,7 +544,7 @@ export function SeatMapModal({ visible, spec, selected, onSelect, onClose, taken
           <ScrollView contentContainerStyle={{ paddingHorizontal: 14, paddingBottom: 10 }}>
             {rows.map((row) => (
               <View key={row} style={[styles.row, { marginBottom: 4 }]}>
-                <Text style={{ width: 26, fontSize: 11, color: COLORS.muted, fontWeight: '600' }}>
+                <Text style={[NUMERIC, { width: 26, fontSize: 12, color: COLORS.muted, fontWeight: '500' }]}>
                   {row}
                 </Text>
                 {spec.layout.map((block, blockIndex) => (
@@ -467,8 +569,8 @@ export function SeatMapModal({ visible, spec, selected, onSelect, onClose, taken
                         >
                           <Text
                             style={{
-                              fontSize: 10.5,
-                              fontWeight: isSelected ? '700' : '500',
+                              fontSize: 11,
+                              fontWeight: isSelected ? '600' : '500',
                               color: isSelected ? '#FFFFFF' : isTaken ? COLORS.faint : COLORS.text,
                             }}
                           >
@@ -503,16 +605,174 @@ export function SearchBar({ value, onChangeText, placeholder = 'Search…' }) {
         placeholder={placeholder}
         placeholderTextColor={COLORS.faint}
         autoCorrect={false}
-        style={[styles.input, { paddingVertical: 9 }]}
+        accessibilityLabel={placeholder}
+        style={[styles.input, { paddingRight: 40 }]}
       />
       {!!value && (
         <Pressable
           onPress={() => onChangeText('')}
-          style={{ position: 'absolute', right: 10, top: 9, padding: 4 }}
+          accessibilityRole="button"
+          accessibilityLabel="Clear search"
+          hitSlop={8}
+          style={{ position: 'absolute', right: 6, top: 0, bottom: 0, width: 32, alignItems: 'center', justifyContent: 'center' }}
         >
-          <Text style={{ color: COLORS.muted, fontSize: 14 }}>×</Text>
+          <Text style={{ color: COLORS.muted, fontSize: 18 }}>×</Text>
         </Pressable>
       )}
+    </View>
+  );
+}
+
+/* ----------------------------- pagination ---------------------------- */
+function pageWindow(page, pages, span) {
+  const start = Math.max(1, Math.min(page - Math.floor(span / 2), pages - span + 1));
+  return Array.from({ length: Math.min(span, pages) }, (_, i) => start + i);
+}
+
+function PageButton({ label, onPress, disabled, active, accessibilityLabel }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled || active}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel || String(label)}
+      accessibilityState={{ disabled: !!disabled, selected: !!active }}
+      style={({ hovered }) => ({
+        minWidth: 34, height: 34, paddingHorizontal: SPACE.sm, borderRadius: RADIUS.md,
+        alignItems: 'center', justifyContent: 'center', borderWidth: 1,
+        borderColor: active ? COLORS.primary : COLORS.borderStrong,
+        backgroundColor: active ? COLORS.primary : hovered && !disabled ? COLORS.surfaceAlt : COLORS.surface,
+        opacity: disabled ? 0.4 : 1,
+      })}
+    >
+      <Text style={[NUMERIC, { fontSize: 13, fontWeight: active ? '600' : '500', color: active ? '#FFFFFF' : COLORS.text }]}>
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
+/**
+ * Page controls for a paged list: "26–50 of 1,234", previous / numbered /
+ * next, and a rows-per-page choice. Pass the object returned by usePaged or
+ * usePagedArray straight in as `pager`. Renders nothing for a single page
+ * unless the page size can still be changed.
+ */
+export function Pagination({ pager, label = 'rows', sizes = [10, 25, 50, 100] }) {
+  const { width } = useWindowDimensions();
+  const { page, pages, total, pageSize, setPage, setPageSize, loading } = pager;
+  if (!total) return null;
+  const compactMode = width < 520;
+  const from = (page - 1) * pageSize + 1;
+  const to = Math.min(total, page * pageSize);
+  const go = (p) => setPage(Math.min(Math.max(1, p), pages));
+  return (
+    <View
+      accessibilityRole="toolbar"
+      accessibilityLabel="Pagination"
+      style={{
+        flexDirection: compactMode ? 'column' : 'row', alignItems: compactMode ? 'stretch' : 'center',
+        justifyContent: 'space-between', gap: SPACE.sm, paddingTop: SPACE.md, marginTop: SPACE.sm,
+        borderTopWidth: 1, borderTopColor: COLORS.surfaceAlt,
+      }}
+    >
+      <Text style={[TYPE.small, NUMERIC, { color: COLORS.muted }]} accessibilityLiveRegion="polite">
+        {loading ? 'Loading… ' : ''}{from.toLocaleString()}–{to.toLocaleString()} of {total.toLocaleString()} {label}
+      </Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: SPACE.xs, flexWrap: 'wrap', justifyContent: compactMode ? 'space-between' : 'flex-end' }}>
+        {pages > 1 && (
+          <View style={{ flexDirection: 'row', gap: SPACE.xs }}>
+            {!compactMode && <PageButton label="«" accessibilityLabel="First page" onPress={() => go(1)} disabled={page <= 1} />}
+            <PageButton label="‹" accessibilityLabel="Previous page" onPress={() => go(page - 1)} disabled={page <= 1} />
+            {compactMode ? (
+              <View style={{ height: 34, justifyContent: 'center', paddingHorizontal: SPACE.sm }}>
+                <Text style={[TYPE.small, NUMERIC, { color: COLORS.text }]}>Page {page} of {pages}</Text>
+              </View>
+            ) : pageWindow(page, pages, 5).map((p) => (
+              <PageButton key={p} label={p} accessibilityLabel={`Page ${p}`} active={p === page} onPress={() => go(p)} />
+            ))}
+            <PageButton label="›" accessibilityLabel="Next page" onPress={() => go(page + 1)} disabled={page >= pages} />
+            {!compactMode && <PageButton label="»" accessibilityLabel="Last page" onPress={() => go(pages)} disabled={page >= pages} />}
+          </View>
+        )}
+        {!!setPageSize && total > sizes[0] && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: SPACE.xs, marginLeft: compactMode ? 0 : SPACE.md }}>
+            <Text style={[TYPE.caption, { color: COLORS.muted }]}>Per page</Text>
+            {sizes.map((size) => (
+              <PageButton key={size} label={size} accessibilityLabel={`${size} per page`} active={size === pageSize}
+                onPress={() => setPageSize(size)} />
+            ))}
+          </View>
+        )}
+      </View>
+    </View>
+  );
+}
+
+/* ---------------------------- stock status --------------------------- */
+/** One vocabulary for stock state across every screen. */
+export function StockPill({ quantity, low }) {
+  if (Number(quantity) <= 0) return <Pill label="OUT OF STOCK" tone="danger" />;
+  if (low) return <Pill label="LOW STOCK" tone="warning" />;
+  return <Pill label="IN STOCK" tone="success" />;
+}
+
+/* --------------------------- simple table --------------------------- */
+/**
+ * Column table on tablets and desktops, stacked rows on phones.
+ *
+ *   columns  [{ key, label, flex = 1, align: 'left' | 'right' | 'center', render(row) }]
+ *   rows     array of records
+ *   rowKey   (row) => key
+ *   renderStacked (row) => node   phone layout for one row
+ */
+export function DataTable({ columns, rows, rowKey, renderStacked, emptyText = 'Nothing to show.', breakpoint = 700 }) {
+  const { width } = useWindowDimensions();
+  if (!rows.length) return <Text style={styles.empty}>{emptyText}</Text>;
+  if (width < breakpoint && renderStacked) {
+    return rows.map((row) => <View key={rowKey(row)} style={styles.listRow}>{renderStacked(row)}</View>);
+  }
+  const justify = (align) => (align === 'right' ? 'flex-end' : align === 'center' ? 'center' : 'flex-start');
+  return (
+    <View accessibilityRole="table">
+      <View style={{
+        flexDirection: 'row', paddingVertical: SPACE.sm, borderBottomWidth: 1, borderBottomColor: COLORS.border,
+        gap: SPACE.md,
+      }}>
+        {columns.map((c) => (
+          <View key={c.key} style={{ flex: c.flex || 1, alignItems: justify(c.align) }}>
+            <Text style={[TYPE.caption, { color: COLORS.muted, fontWeight: '600', textAlign: c.align || 'left' }]}>
+              {c.label}
+            </Text>
+          </View>
+        ))}
+      </View>
+      {rows.map((row) => (
+        <View
+          key={rowKey(row)}
+          accessibilityRole="row"
+          style={{
+            flexDirection: 'row', alignItems: 'center', minHeight: 44, paddingVertical: SPACE.sm,
+            borderBottomWidth: 1, borderBottomColor: COLORS.surfaceAlt, gap: SPACE.md,
+          }}
+        >
+          {columns.map((c) => {
+            const value = c.render ? c.render(row) : row[c.key];
+            return (
+              <View key={c.key} style={{ flex: c.flex || 1, alignItems: justify(c.align) }}>
+                {typeof value === 'string' || typeof value === 'number' ? (
+                  <Text
+                    numberOfLines={2}
+                    style={[TYPE.body, c.align === 'right' && NUMERIC, { color: COLORS.text, textAlign: c.align || 'left' }]}
+                  >
+                    {value}
+                  </Text>
+                ) : value}
+              </View>
+            );
+          })}
+        </View>
+      ))}
     </View>
   );
 }
@@ -529,7 +789,7 @@ export function SearchBar({ value, onChangeText, placeholder = 'Search…' }) {
  *   rows        [{ key, cells: [{ text, tone, bold, onPress, faint }] }]
  */
 export function FrozenTable({
-  frozen, groupHeader, columns, rows, rowHeight = 34, headerHeight = 30,
+  frozen, groupHeader, columns, rows, rowHeight = 36, headerHeight = 32,
 }) {
   const headerRows = frozen.header.length;
   const totalHeaderHeight = headerHeight * (groupHeader ? 2 : headerRows);
@@ -540,11 +800,11 @@ export function FrozenTable({
     borderBottomWidth: 1,
     borderBottomColor: COLORS.surfaceAlt,
     justifyContent: 'center',
-    paddingHorizontal: 6,
+    paddingHorizontal: SPACE.sm,
   };
 
   return (
-    <View style={{ borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, overflow: 'hidden' }}>
+    <View style={{ borderWidth: 1, borderColor: COLORS.border, borderRadius: RADIUS.md, overflow: 'hidden' }}>
       <View style={{ flexDirection: 'row' }}>
         {/* frozen column */}
         <View style={{ width: frozen.width, backgroundColor: COLORS.surface }}>
@@ -559,7 +819,7 @@ export function FrozenTable({
               <Text
                 key={index}
                 numberOfLines={1}
-                style={{ color: '#FFFFFF', fontSize: 11, fontWeight: '700' }}
+                style={{ color: '#FFFFFF', fontSize: 12, fontWeight: '600' }}
               >
                 {line}
               </Text>
@@ -575,7 +835,7 @@ export function FrozenTable({
             >
               {typeof frozen.cells[index] === 'string'
                 ? (
-                  <Text numberOfLines={1} style={{ fontSize: 11.5, fontWeight: '600', color: COLORS.text }}>
+                  <Text numberOfLines={1} style={{ fontSize: 13, fontWeight: '500', color: COLORS.text }}>
                     {frozen.cells[index]}
                   </Text>
                 )
@@ -600,7 +860,7 @@ export function FrozenTable({
                       alignItems: 'center',
                     }]}
                   >
-                    <Text numberOfLines={1} style={{ color: '#FFFFFF', fontSize: 10.5, fontWeight: '700' }}>
+                    <Text numberOfLines={1} style={{ color: '#FFFFFF', fontSize: 12, fontWeight: '600' }}>
                       {group.label}
                     </Text>
                   </View>
@@ -619,7 +879,7 @@ export function FrozenTable({
                     alignItems: column.align === 'right' ? 'flex-end' : 'center',
                   }]}
                 >
-                  <Text numberOfLines={2} style={{ color: '#FFFFFF', fontSize: 9.5, fontWeight: '700', textAlign: 'center' }}>
+                  <Text numberOfLines={2} style={{ color: '#FFFFFF', fontSize: 11, fontWeight: '600', textAlign: 'center' }}>
                     {column.label}
                   </Text>
                 </View>
@@ -633,9 +893,10 @@ export function FrozenTable({
                     <Text
                       numberOfLines={1}
                       style={{
-                        fontSize: 11.5,
+                        ...NUMERIC,
+                        fontSize: 13,
                         textAlign: columns[index]?.align === 'right' ? 'right' : 'center',
-                        fontWeight: cell.bold ? '700' : '400',
+                        fontWeight: cell.bold ? '600' : '400',
                         color: cell.faint ? COLORS.faint : cell.tone || COLORS.text,
                       }}
                     >
@@ -646,7 +907,7 @@ export function FrozenTable({
                     width: columns[index]?.width || 60,
                     height: rowHeight,
                     backgroundColor: cell.highlight
-                      ? '#FDF1DF'
+                      ? COLORS.warningSoft
                       : rowIndex % 2 ? COLORS.surfaceAlt : COLORS.surface,
                   }];
                   return cell.onPress
@@ -687,23 +948,24 @@ export function DialogHost() {
     <Modal visible transparent animationType="fade" onRequestClose={() => close(false)}>
       <View
         style={{
-          flex: 1, backgroundColor: '#0009',
+          flex: 1, backgroundColor: COLORS.overlay,
           alignItems: 'center', justifyContent: 'center', padding: 22,
         }}
       >
         <View
           style={{
-            backgroundColor: COLORS.surface, borderRadius: 16, padding: 20,
-            width: '100%', maxWidth: 420,
+            ...sheet, padding: SPACE.xl, maxWidth: 420,
           }}
+          accessibilityViewIsModal
+          accessibilityRole="alert"
         >
           {!!request.title && (
-            <Text style={{ fontSize: 17, fontWeight: '800', color: COLORS.text, marginBottom: 8 }}>
+            <Text style={[TYPE.sectionTitle, { fontSize: 17, color: COLORS.text, marginBottom: SPACE.sm }]}>
               {request.title}
             </Text>
           )}
           {!!request.message && (
-            <Text style={{ fontSize: 13.5, color: COLORS.muted, lineHeight: 20, marginBottom: 18 }}>
+            <Text style={[TYPE.body, { color: COLORS.muted, marginBottom: SPACE.xl }]}>
               {request.message}
             </Text>
           )}

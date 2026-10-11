@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends
 from fastapi import HTTPException
 
 from database import COMMISSION_MODEL, COMMISSION_RATE, get_connection
+from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from security import (
     current_user, date_filters, permissions_for, requires, today_iso, validate_date,
 )
@@ -473,6 +474,7 @@ def group_summary(user: dict, date: str | None = None):
 def logs(year: int | None = None, month: int | None = None, day: int | None = None,
          employee_id: str | None = None, module: str | None = None,
          status: str | None = None, limit: int = 500,
+         page: int | None = PageParam, page_size: int = PageSizeParam,
          user: dict = Depends(requires("logs"))):
     connection = get_connection()
     try:
@@ -487,6 +489,9 @@ def logs(year: int | None = None, month: int | None = None, day: int | None = No
             conditions.append("status=?")
             params.append(status.strip().upper())
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        if page:
+            return paginate_sql(connection, f"SELECT * FROM audit_logs {where} ORDER BY id DESC",
+                                params, page, page_size)
         rows = connection.execute(
             f"SELECT * FROM audit_logs {where} ORDER BY id DESC LIMIT ?",
             [*params, min(limit, 2000)],

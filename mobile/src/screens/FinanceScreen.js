@@ -131,7 +131,7 @@ export default function FinanceScreen({ user }) {
             onPress={() => setCalendar('effective_to')}
           />
           <Button
-            title="SAVE RATE"
+            title="Save rate"
             onPress={save}
             disabled={!form.rate_to_npr || !form.effective_from}
           />
@@ -142,11 +142,11 @@ export default function FinanceScreen({ user }) {
         <SectionTitle title="Rate history" description="Scheduled bands are highlighted so you can confirm future pricing." />
         {Object.entries(grouped).map(([code, bands]) => (
           <View key={code} style={{ marginBottom: 14 }}>
-            <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text, marginBottom: 4 }}>{code}</Text>
+            <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text, marginBottom: 4 }}>{code}</Text>
             {bands.map((band) => (
               <View key={band.id} style={styles.listRow}>
                 <View style={styles.rowBetween}>
-                  <Text style={{ fontSize: 13.5, fontWeight: '600' }}>
+                  <Text style={{ fontSize: 14, fontWeight: '600' }}>
                     {band.unit > 1 ? `${band.unit} ${code} = ` : ''}NPR {band.rate_to_npr}
                   </Text>
                   <Pill

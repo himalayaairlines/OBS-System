@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Text as RNText, View } from 'react-native';
 import Svg, { Circle, G, Line, Path, Polyline, Rect, Text as SvgText } from 'react-native-svg';
 
@@ -16,18 +16,43 @@ export function EmptyChart({ label = 'No data for this period.' }) {
   return <RNText style={styles.empty}>{label}</RNText>;
 }
 
+/*
+ * Charts draw at the width of their container instead of a fixed 340px, so on
+ * a desktop they fill the card rather than sitting small in the middle, and
+ * axis text stays the same size at every width. An explicit `width` still wins.
+ */
+const MAX_CHART_WIDTH = 1100;
+function autoWidth(Chart) {
+  return function Responsive(props) {
+    const [measured, setMeasured] = useState(0);
+    if (props.width) return <Chart {...props} />;
+    return (
+      <View
+        style={{ width: '100%' }}
+        onLayout={(e) => {
+          const w = Math.round(Math.min(MAX_CHART_WIDTH, e.nativeEvent.layout.width));
+          if (w && Math.abs(w - measured) > 2) setMeasured(w);
+        }}
+      >
+        {measured > 0 && <Chart {...props} width={measured} />}
+      </View>
+    );
+  };
+}
+
 /** Vertical bars with a value axis. `data` = [{ label, value }]. */
-export function BarChart({ data = [], height = 210, width = 340, color = COLORS.primary, format = compact }) {
+function BarChartBase({ data = [], height = 220, width = 340, color = COLORS.primary, format = compact }) {
   if (!data.length || data.every((d) => !Number(d.value))) return <EmptyChart />;
 
   const padLeft = 42;
   const padBottom = 34;
-  const padTop = 12;
+  const padTop = 22; // room for the value printed above the tallest bar
   const plotWidth = width - padLeft - 8;
   const plotHeight = height - padBottom - padTop;
   const max = niceMax(Math.max(...data.map((d) => Number(d.value) || 0)));
   const slot = plotWidth / data.length;
-  const barWidth = Math.max(8, Math.min(38, slot * 0.6));
+  const barWidth = Math.max(8, Math.min(44, slot * 0.6));
+  const labelChars = Math.max(4, Math.floor(slot / 6.5));
 
   return (
     <Svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`}>
@@ -36,7 +61,7 @@ export function BarChart({ data = [], height = 210, width = 340, color = COLORS.
         return (
           <G key={tick}>
             <Line x1={padLeft} y1={y} x2={width - 8} y2={y} stroke={COLORS.border} strokeWidth={1} />
-            <SvgText x={padLeft - 6} y={y + 4} fontSize="9" fill={COLORS.faint} textAnchor="end">
+            <SvgText x={padLeft - 6} y={y + 4} fontSize="11" fill={COLORS.muted} textAnchor="end">
               {format(max * tick)}
             </SvgText>
           </G>
@@ -52,15 +77,15 @@ export function BarChart({ data = [], height = 210, width = 340, color = COLORS.
             <Rect x={x} y={y} width={barWidth} height={barHeight} rx={3} fill={item.color || color} />
             <SvgText
               x={x + barWidth / 2}
-              y={height - padBottom + 14}
-              fontSize="9"
+              y={height - padBottom + 15}
+              fontSize="11"
               fill={COLORS.muted}
               textAnchor="middle"
             >
-              {String(item.label).slice(0, 8)}
+              {String(item.label).slice(0, labelChars)}
             </SvgText>
             {value > 0 && (
-              <SvgText x={x + barWidth / 2} y={y - 4} fontSize="9" fill={COLORS.text} textAnchor="middle">
+              <SvgText x={x + barWidth / 2} y={y - 5} fontSize="11" fill={COLORS.text} textAnchor="middle">
                 {format(value)}
               </SvgText>
             )}
@@ -72,11 +97,13 @@ export function BarChart({ data = [], height = 210, width = 340, color = COLORS.
 }
 
 /** Horizontal bars, better for long labels such as crew names. */
-export function RankBarChart({ data = [], width = 340, rowHeight = 30, format = compact }) {
+function RankBarChartBase({ data = [], width = 340, rowHeight = 30, format = compact }) {
   if (!data.length) return <EmptyChart />;
+  rowHeight = Math.max(rowHeight, 32);
   const height = data.length * rowHeight + 16;
-  const labelWidth = 104;
-  const plotWidth = width - labelWidth - 54;
+  const labelWidth = Math.round(Math.min(200, Math.max(110, width * 0.28)));
+  const labelChars = Math.floor(labelWidth / 7);
+  const plotWidth = width - labelWidth - 64;
   const max = Math.max(...data.map((d) => Number(d.value) || 0)) || 1;
 
   return (
@@ -87,8 +114,8 @@ export function RankBarChart({ data = [], width = 340, rowHeight = 30, format = 
         const y = index * rowHeight + 8;
         return (
           <G key={index}>
-            <SvgText x={0} y={y + 14} fontSize="10.5" fill={COLORS.text}>
-              {String(item.label).slice(0, 16)}
+            <SvgText x={0} y={y + 15} fontSize="12" fill={COLORS.text}>
+              {String(item.label).slice(0, labelChars)}
             </SvgText>
             <Rect
               x={labelWidth} y={y + 3} width={plotWidth} height={rowHeight - 12}
@@ -98,7 +125,7 @@ export function RankBarChart({ data = [], width = 340, rowHeight = 30, format = 
               x={labelWidth} y={y + 3} width={barWidth} height={rowHeight - 12}
               rx={4} fill={item.color || CHART_COLORS[index % CHART_COLORS.length]}
             />
-            <SvgText x={labelWidth + plotWidth + 6} y={y + 14} fontSize="10" fill={COLORS.muted}>
+            <SvgText x={labelWidth + plotWidth + 8} y={y + 15} fontSize="12" fill={COLORS.muted}>
               {format(value)}
             </SvgText>
           </G>
@@ -109,7 +136,7 @@ export function RankBarChart({ data = [], width = 340, rowHeight = 30, format = 
 }
 
 /** Line chart with a target reference line. `data` = [{ label, value }]. */
-export function LineChartView({ data = [], height = 200, width = 340, target = null, format = compact }) {
+function LineChartBase({ data = [], height = 220, width = 340, target = null, format = compact }) {
   if (data.length < 2) return <EmptyChart label="At least two data points are needed for a trend." />;
 
   const padLeft = 42;
@@ -133,7 +160,7 @@ export function LineChartView({ data = [], height = 200, width = 340, target = n
         return (
           <G key={tick}>
             <Line x1={padLeft} y1={y} x2={width - 10} y2={y} stroke={COLORS.border} strokeWidth={1} />
-            <SvgText x={padLeft - 6} y={y + 4} fontSize="9" fill={COLORS.faint} textAnchor="end">
+            <SvgText x={padLeft - 6} y={y + 4} fontSize="11" fill={COLORS.muted} textAnchor="end">
               {format(max * tick)}
             </SvgText>
           </G>
@@ -153,7 +180,7 @@ export function LineChartView({ data = [], height = 200, width = 340, target = n
           <SvgText
             x={width - 12}
             y={padTop + plotHeight - (target / max) * plotHeight - 5}
-            fontSize="9"
+            fontSize="11"
             fill={COLORS.accent}
             textAnchor="end"
           >
@@ -172,8 +199,8 @@ export function LineChartView({ data = [], height = 200, width = 340, target = n
           <SvgText
             key={index}
             x={padLeft + stepX * index}
-            y={height - padBottom + 15}
-            fontSize="9"
+            y={height - padBottom + 16}
+            fontSize="11"
             fill={COLORS.muted}
             textAnchor="middle"
           >
@@ -217,7 +244,7 @@ export function DonutChart({ data = [], size = 168, format = compact }) {
           return <Path key={index} d={path} fill={CHART_COLORS[index % CHART_COLORS.length]} />;
         })}
         <SvgText
-          x={size / 2} y={size / 2 + 4} fontSize="13" fontWeight="700"
+          x={size / 2} y={size / 2 + 5} fontSize="14" fontWeight="600"
           fill={COLORS.text} textAnchor="middle"
         >
           {format(total)}
@@ -233,11 +260,11 @@ export function DonutChart({ data = [], size = 168, format = compact }) {
                   backgroundColor: CHART_COLORS[index % CHART_COLORS.length],
                 }}
               />
-              <RNText style={{ fontSize: 12, color: COLORS.text, flex: 1 }} numberOfLines={1}>
+              <RNText style={{ fontSize: 13, color: COLORS.text, flex: 1 }} numberOfLines={1}>
                 {item.label}
               </RNText>
             </View>
-            <RNText style={{ fontSize: 11.5, color: COLORS.muted }}>
+            <RNText style={{ fontSize: 13, color: COLORS.muted, fontVariant: ['tabular-nums'] }}>
               {((Number(item.value) / total) * 100).toFixed(0)}%
             </RNText>
           </View>
@@ -262,3 +289,7 @@ export function ProgressBar({ value, max, tone = COLORS.primary, height = 10 }) 
     </View>
   );
 }
+
+export const BarChart = autoWidth(BarChartBase);
+export const RankBarChart = autoWidth(RankBarChartBase);
+export const LineChartView = autoWidth(LineChartBase);

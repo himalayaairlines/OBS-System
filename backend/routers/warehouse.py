@@ -8,7 +8,9 @@ Every movement is written to main_inventory_txn so stock is auditable.
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from alert_engine import enqueue_stock_event
 from database import get_connection
+from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from security import current_user, log_action, now_iso, requires, validate_date
 
 router = APIRouter(tags=["warehouse"])
@@ -122,6 +124,8 @@ def move_stock(connection, product_id: int, change: int, reason: str, reference:
         (product_id, change, balance, reason, reference,
          stock_date or now_iso()[:10], employee_id, now_iso()),
     )
+    # Same transaction as the movement: if it rolls back, so does the event.
+    enqueue_stock_event(connection, product_id, reason, reference)
     return balance
 
 
@@ -290,6 +294,7 @@ def list_orders(status: str | None = None, supply_type: str | None = None,
                 date_from: str | None = None, date_to: str | None = None,
                 delivery_from: str | None = None, delivery_to: str | None = None,
                 received_from: str | None = None, received_to: str | None = None,
+                page: int | None = PageParam, page_size: int = PageSizeParam,
                 user: dict = Depends(requires("warehouse"))):
     connection = get_connection()
     try:
@@ -319,6 +324,9 @@ def list_orders(status: str | None = None, supply_type: str | None = None,
             conditions.append("received_date <= ?")
             params.append(validate_date(received_to, "received to date"))
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        if page:
+            return paginate_sql(connection, f"SELECT id FROM purchase_orders {where} ORDER BY id DESC",
+                                params, page, page_size, mapper=lambda r: _order(connection, r["id"]))
         rows = connection.execute(
             f"SELECT id FROM purchase_orders {where} ORDER BY id DESC LIMIT 500", params
         ).fetchall()
@@ -606,15 +614,24 @@ def edit_order(order_id: int, data: OrderEdit, user: dict = Depends(requires("wa
 
 @router.get("/main-inventory/movements")
 def movements(product_id: int | None = None, limit: int = 200,
+              reason: str | None = None,
+              page: int | None = PageParam, page_size: int = PageSizeParam,
               user: dict = Depends(requires("warehouse"))):
     connection = get_connection()
     try:
         sql = """SELECT t.*, p.product_code, p.product_name
                  FROM main_inventory_txn t JOIN products p ON p.id = t.product_id"""
-        params = []
+        params, conditions = [], []
         if product_id:
-            sql += " WHERE t.product_id=?"
+            conditions.append("t.product_id=?")
             params.append(product_id)
+        if reason:
+            conditions.append("t.reason=?")
+            params.append(reason.strip().upper())
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        if page:
+            return paginate_sql(connection, sql + " ORDER BY t.id DESC", params, page, page_size)
         sql += " ORDER BY t.id DESC LIMIT ?"
         params.append(min(limit, 500))
         return [dict(r) for r in connection.execute(sql, params).fetchall()]

@@ -2,10 +2,11 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { ScrollView, Text, View } from 'react-native';
 
 import { api } from '../api';
+import { usePagedArray } from '../paging';
 import { confirm } from '../dialog';
 import { COLORS, ROLE_LABELS, styles } from '../theme';
 import {
-  Banner, Button, Card, Chip, Field, OptionModal, PageHeader, Pill,
+  Banner, Button, Card, Chip, Field, OptionModal, PageHeader, Pagination, Pill,
   SearchBar, SectionTitle, Select,
 } from '../ui';
 
@@ -40,6 +41,14 @@ function CrewRoster({ notify }) {
   const [positionPicker, setPositionPicker] = useState(false);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('');
+
+  // The roster is a small reference list held on the device, so it is
+  // filtered and paged here rather than on the server.
+  const term = search.trim().toLowerCase();
+  const filteredMembers = members
+    .filter((m) => !filter || m.position === filter)
+    .filter((m) => !term || m.name.toLowerCase().includes(term) || m.crew_code.toLowerCase().includes(term));
+  const roster = usePagedArray(filteredMembers, { resetKey: `${term}|${filter}` });
 
   const load = useCallback(async () => {
     try {
@@ -117,7 +126,7 @@ function CrewRoster({ notify }) {
         <Select label="Position" valueLabel={form.position} onPress={() => setPositionPicker(true)} />
         <View style={[styles.row, styles.gap8]}>
           <Button
-            title={editingId ? 'SAVE' : 'ADD CREW MEMBER'}
+            title={editingId ? 'Save' : 'Add crew member'}
             style={styles.flex1}
             onPress={save}
             disabled={!form.crew_code || !form.name}
@@ -147,14 +156,7 @@ function CrewRoster({ notify }) {
             />
           ))}
         </View>
-        {members
-          .filter((m) => !filter || m.position === filter)
-          .filter((m) => {
-            const term = search.trim().toLowerCase();
-            return !term || m.name.toLowerCase().includes(term)
-              || m.crew_code.toLowerCase().includes(term);
-          })
-          .map((member) => (
+        {roster.items.map((member) => (
           <View key={member.id} style={styles.listRow}>
             <View style={styles.rowBetween}>
               <View style={styles.flex1}>
@@ -182,6 +184,8 @@ function CrewRoster({ notify }) {
           </View>
         ))}
         {!members.length && <Text style={styles.empty}>No crew members yet.</Text>}
+        {!!members.length && !filteredMembers.length && <Text style={styles.empty}>No crew member matches.</Text>}
+        <Pagination pager={roster} label="crew members" />
       </Card>
 
       <OptionModal
@@ -198,7 +202,7 @@ function CrewRoster({ notify }) {
 
 function Users({ notify }) {
   const [users, setUsers] = useState([]);
-  const [form, setForm] = useState({ employee_id: '', name: '', password: '', role: 'crew' });
+  const [form, setForm] = useState({ employee_id: '', name: '', password: '', role: 'crew', email: '' });
   const [rolePicker, setRolePicker] = useState(false);
   const [editing, setEditing] = useState(null);
 
@@ -216,7 +220,7 @@ function Users({ notify }) {
     try {
       await api('/users', { method: 'POST', body: form });
       notify({ tone: 'success', text: `Account ${form.employee_id.toUpperCase()} created.` });
-      setForm({ employee_id: '', name: '', password: '', role: 'crew' });
+      setForm({ employee_id: '', name: '', password: '', role: 'crew', email: '' });
       load();
     } catch (error) {
       notify({ tone: 'danger', text: error.message });
@@ -280,8 +284,18 @@ function Users({ notify }) {
           secureTextEntry
           placeholder="At least 4 characters"
         />
+        <Field
+          label="Email (optional)"
+          hint="Needed to receive stock-alert emails."
+          value={form.email}
+          onChangeText={(v) => setForm({ ...form, email: v.trim() })}
+          keyboardType="email-address"
+          autoCapitalize="none"
+          autoCorrect={false}
+          placeholder="name@himalaya-airlines.com"
+        />
         <Button
-          title="CREATE ACCOUNT"
+          title="Create account"
           onPress={create}
           disabled={!form.employee_id || !form.name || form.password.length < 4}
         />
@@ -295,6 +309,7 @@ function Users({ notify }) {
               <View style={styles.flex1}>
                 <Text style={{ fontSize: 14, fontWeight: '600' }}>{user.name}</Text>
                 <Text style={styles.mono}>{user.employee_id} · {ROLE_LABELS[user.role] || user.role}</Text>
+                <Text style={styles.mono}>{user.email || 'No email address'}</Text>
               </View>
               <View style={[styles.row, styles.gap8]}>
                 {!!user.locked_at && <Pill label="LOCKED" tone="danger" />}
@@ -302,13 +317,13 @@ function Users({ notify }) {
               </View>
             </View>
             {!!user.locked_at && (
-              <Text style={{ fontSize: 11.5, color: COLORS.danger, marginTop: 3 }}>
+              <Text style={{ fontSize: 12, color: COLORS.danger, marginTop: 3 }}>
                 Locked after {user.failed_attempts} incorrect passwords on{' '}
                 {String(user.locked_at).replace('T', ' at ').slice(0, 19)}
               </Text>
             )}
             {!user.locked_at && !!user.failed_attempts && (
-              <Text style={{ fontSize: 11.5, color: COLORS.warning, marginTop: 3 }}>
+              <Text style={{ fontSize: 12, color: COLORS.warning, marginTop: 3 }}>
                 {user.failed_attempts} incorrect password attempt(s) since the last sign-in
               </Text>
             )}
@@ -331,10 +346,30 @@ function Users({ notify }) {
                 title="Reset password"
                 tone="ghost"
                 small
-                onPress={() => setEditing(editing?.id === user.id ? null : user)}
+                onPress={() => setEditing(editing?.id === user.id && editing.mode === 'password' ? null : { ...user, mode: 'password' })}
+              />
+              <Button
+                title="Email"
+                tone="ghost"
+                small
+                onPress={() => setEditing(editing?.id === user.id && editing.mode === 'email' ? null : { ...user, mode: 'email', newEmail: user.email || '' })}
               />
             </View>
-            {editing?.id === user.id && (
+            {editing?.id === user.id && editing.mode === 'email' && (
+              <View style={{ marginTop: 10 }}>
+                <Field
+                  label="Email address"
+                  value={editing.newEmail}
+                  onChangeText={(v) => setEditing({ ...editing, newEmail: v.trim() })}
+                  keyboardType="email-address"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  placeholder="Leave empty to remove"
+                />
+                <Button title="Save email" small onPress={() => update(user, { email: editing.newEmail })} />
+              </View>
+            )}
+            {editing?.id === user.id && editing.mode === 'password' && (
               <View style={{ marginTop: 10 }}>
                 <Field
                   label="New password"
@@ -343,7 +378,7 @@ function Users({ notify }) {
                   secureTextEntry
                 />
                 <Button
-                  title="SET PASSWORD"
+                  title="Set password"
                   small
                   onPress={() => update(user, { password: editing.password })}
                   disabled={(editing.password || '').length < 4}

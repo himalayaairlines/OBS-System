@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from crew_seed import CREW_POSITIONS
 from database import ROLES, get_connection
+from comms_core import EMAIL_RE
 from security import current_user, hash_password, log_action, now_iso, requires
 
 router = APIRouter(tags=["admin"])
@@ -17,6 +18,7 @@ class UserCreate(BaseModel):
     name: str
     password: str = Field(min_length=4)
     role: str
+    email: str | None = Field(default=None, max_length=254)
 
 
 class UserUpdate(BaseModel):
@@ -24,6 +26,17 @@ class UserUpdate(BaseModel):
     role: str
     active: bool = True
     password: str | None = None
+    # Omitted keeps the stored address; an empty string clears it.
+    email: str | None = Field(default=None, max_length=254)
+
+
+def _clean_email(value: str | None) -> str | None:
+    value = (value or "").strip().lower()
+    if not value:
+        return None
+    if not EMAIL_RE.match(value):
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+    return value
 
 
 class CrewMemberIn(BaseModel):
@@ -40,7 +53,7 @@ def list_users(user: dict = Depends(requires("users"))):
     try:
         rows = connection.execute(
             """SELECT id, employee_id, name, role, active, created_at,
-                      failed_attempts, locked_at
+                      failed_attempts, locked_at, email
                FROM users ORDER BY role, employee_id"""
         ).fetchall()
         return [dict(r) for r in rows]
@@ -53,11 +66,12 @@ def create_user(data: UserCreate, user: dict = Depends(requires("users"))):
     if data.role not in ROLES:
         raise HTTPException(status_code=400, detail="Unknown role.")
     employee_id = data.employee_id.strip().upper()
+    email = _clean_email(data.email)
     connection = get_connection()
     try:
         connection.execute(
-            "INSERT INTO users(employee_id,name,password,role,active,created_at) VALUES (?,?,?,?,1,?)",
-            (employee_id, data.name.strip(), hash_password(data.password), data.role, now_iso()),
+            "INSERT INTO users(employee_id,name,password,role,active,created_at,email) VALUES (?,?,?,?,1,?,?)",
+            (employee_id, data.name.strip(), hash_password(data.password), data.role, now_iso(), email),
         )
         connection.commit()
         row = connection.execute(
@@ -88,6 +102,8 @@ def update_user(user_id: int, data: UserUpdate, user: dict = Depends(requires("u
             ).fetchone()["c"]
             if remaining == 0:
                 raise HTTPException(status_code=400, detail="At least one active administrator is required.")
+        if data.email is not None:
+            connection.execute("UPDATE users SET email=? WHERE id=?", (_clean_email(data.email), user_id))
         if data.password:
             connection.execute(
                 """UPDATE users SET name=?, role=?, active=?, password=?,
@@ -102,7 +118,7 @@ def update_user(user_id: int, data: UserUpdate, user: dict = Depends(requires("u
             )
         connection.commit()
         row = connection.execute(
-            "SELECT id, employee_id, name, role, active FROM users WHERE id=?", (user_id,)
+            "SELECT id, employee_id, name, role, active, email FROM users WHERE id=?", (user_id,)
         ).fetchone()
     finally:
         connection.close()

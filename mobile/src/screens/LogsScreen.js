@@ -7,7 +7,8 @@ import * as Sharing from 'expo-sharing';
 import { api, downloadReport } from '../api';
 import { BarChart, RankBarChart } from '../charts';
 import { COLORS, MONTHS, compact, npr, styles } from '../theme';
-import { Banner, Button, Card, Chip, Field, KeyValue, OptionModal, PageHeader, Pill, SectionTitle, Select } from '../ui';
+import { usePaged } from '../paging';
+import { Banner, Button, Card, Chip, Field, KeyValue, OptionModal, PageHeader, Pagination, Pill, SectionTitle, Select } from '../ui';
 
 const YEARS = Array.from({ length: 6 }, (_, i) => new Date().getFullYear() - i);
 
@@ -26,10 +27,8 @@ export default function LogsScreen({ user }) {
 
   const [ranking, setRanking] = useState(null);
   const [top, setTop] = useState([]);
-  const [logs, setLogs] = useState([]);
   const [modules, setModules] = useState([]);
   const [destinations, setDestinations] = useState([]);
-  const [sales, setSales] = useState([]);
   const [products, setProducts] = useState([]);
 
   const [editing, setEditing] = useState(null);
@@ -46,6 +45,10 @@ export default function LogsScreen({ user }) {
     if (filter.destination) parts.push(`destination=${filter.destination}`);
     return parts.join('&');
   }, [filter]);
+
+  // Audit log and sales ledger are paged on the server; both grow without limit.
+  const logs = usePaged(`/logs?${query().replace(/&?destination=[^&]*/, '')}`, { enabled: canOversee && tab === 'logs' });
+  const sales = usePaged('/sales', { enabled: canSeeSales && tab === 'sales' });
 
   // Each tab exports exactly what it is showing, filters included.
   const EXPORTS = {
@@ -75,14 +78,13 @@ export default function LogsScreen({ user }) {
   const load = useCallback(async () => {
     if (!canOversee) return;
     try {
-      const [r, t, l, m, d] = await Promise.all([
+      const [r, t, m, d] = await Promise.all([
         api(`/crew-ranking?${query()}`),
         api(`/top-products?${query()}&limit=10`),
-        api(`/logs?${query().replace(/&?destination=[^&]*/, '')}&limit=300`),
         api('/logs/modules'),
         api(`/dashboard?${query()}`),
       ]);
-      setRanking(r); setTop(t); setLogs(l); setModules(m);
+      setRanking(r); setTop(t); setModules(m);
       setDestinations(d.destinations || []);
       setMessage(null);
     } catch (error) {
@@ -93,7 +95,6 @@ export default function LogsScreen({ user }) {
   const loadSales = useCallback(async () => {
     if (!canSeeSales) return;
     try {
-      setSales(await api('/sales?limit=120'));
       setProducts(await api('/products'));
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
@@ -115,7 +116,7 @@ export default function LogsScreen({ user }) {
       });
       setMessage({ tone: 'success', text: 'Sale corrected. The remarks will appear in the Excel export.' });
       setEditing(null); setEditProduct(null); setEditQuantity(''); setEditRemarks('');
-      loadSales();
+      sales.reload();
       load();
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
@@ -147,11 +148,12 @@ export default function LogsScreen({ user }) {
       {message && <Banner tone={message.tone} message={message.text} />}
 
       <Button
-        title={exporting ? 'Preparing…' : `DOWNLOAD ${(EXPORTS[tab]?.label || '').toUpperCase()} (EXCEL)`}
+        title={exporting ? 'Preparing…' : `Download ${(EXPORTS[tab]?.label || '').toLowerCase()} (Excel)`}
         tone="secondary"
         onPress={exportTab}
         disabled={exporting}
-        style={{ marginBottom: 14 }}
+        small
+        style={{ marginBottom: 14, alignSelf: 'flex-end' }}
       />
 
       {canOversee && tab !== 'sales' && (
@@ -185,10 +187,10 @@ export default function LogsScreen({ user }) {
             {ranking.ranking.map((entry) => (
               <View key={entry.crew_member_id} style={styles.listRow}>
                 <View style={styles.rowBetween}>
-                  <Text style={{ fontSize: 14, fontWeight: '700', flex: 1 }}>
+                  <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>
                     {entry.rank}. {entry.name}
                   </Text>
-                  <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.success }}>
+                  <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.success }}>
                     {npr(entry.commission_npr)}
                   </Text>
                 </View>
@@ -211,12 +213,12 @@ export default function LogsScreen({ user }) {
             />
             {(ranking.sectors || []).map((sector) => (
               <View key={sector.flight_id} style={styles.listRow}>
-                <Text style={{ fontSize: 14, fontWeight: '700' }}>{sector.duty_group_label}</Text>
+                <Text style={{ fontSize: 14, fontWeight: '600' }}>{sector.duty_group_label}</Text>
                 <KeyValue label="Sales" value={npr(sector.revenue_npr)} />
                 <KeyValue label="Commission" value={npr(sector.commission_pool_npr)} tone={COLORS.success} />
                 {(sector.sellers || []).map((seller) => (
                   <View key={seller.crew_member_id} style={[styles.rowBetween, { paddingVertical: 2 }]}>
-                    <Text style={{ fontSize: 12.5, flex: 1 }}>{seller.name}</Text>
+                    <Text style={{ fontSize: 13, flex: 1 }}>{seller.name}</Text>
                     <Text style={[styles.mono, { fontSize: 11 }]}>{npr(seller.sales_npr)}</Text>
                   </View>
                 ))}
@@ -242,10 +244,10 @@ export default function LogsScreen({ user }) {
             {top.map((product, index) => (
               <View key={product.product_id} style={styles.listRow}>
                 <View style={styles.rowBetween}>
-                  <Text style={{ fontSize: 13.5, fontWeight: '700', flex: 1 }}>
+                  <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>
                     {index + 1}. {product.product_name}
                   </Text>
-                  <Text style={{ fontSize: 13, fontWeight: '700', color: COLORS.primary }}>
+                  <Text style={{ fontSize: 13, fontWeight: '600', color: COLORS.primary }}>
                     {npr(product.revenue)}
                   </Text>
                 </View>
@@ -261,23 +263,25 @@ export default function LogsScreen({ user }) {
 
       {tab === 'logs' && (
         <Card>
-          <SectionTitle title="Activity log" description={`${logs.length} entries`} />
-          {logs.map((entry) => (
+          <SectionTitle title="Activity log" description={`${logs.total.toLocaleString()} entries, newest first`} />
+          {!!logs.error && <Banner tone="danger" message={logs.error} />}
+          {logs.items.map((entry) => (
             <View key={entry.id} style={styles.listRow}>
               <View style={styles.rowBetween}>
-                <Text style={{ fontSize: 13, fontWeight: '700', flex: 1 }}>{entry.module}</Text>
+                <Text style={{ fontSize: 13, fontWeight: '600', flex: 1 }}>{entry.module}</Text>
                 <Pill
                   label={entry.status}
                   tone={entry.status === 'SUCCESS' ? 'success' : entry.status === 'FAILED' ? 'danger' : 'warning'}
                 />
               </View>
-              <Text style={{ fontSize: 12.5, color: COLORS.text, marginTop: 3 }}>{entry.description}</Text>
+              <Text style={{ fontSize: 13, color: COLORS.text, marginTop: 3 }}>{entry.description}</Text>
               <Text style={styles.mono}>
                 {entry.employee_id || 'system'} · {entry.role || '—'} · {String(entry.timestamp).replace('T', ' ')}
               </Text>
             </View>
           ))}
-          {!logs.length && <Text style={styles.empty}>No log entries for this period.</Text>}
+          {!logs.items.length && !logs.loading && <Text style={styles.empty}>No log entries for this period.</Text>}
+          <Pagination pager={logs} label="entries" />
         </Card>
       )}
 
@@ -287,20 +291,21 @@ export default function LogsScreen({ user }) {
             title="Correct a sale"
             description="Fix a mis-keyed product or quantity. Remarks are mandatory and are carried into the Excel export."
           />
-          {sales.map((sale) => (
+          {!!sales.error && <Banner tone="danger" message={sales.error} />}
+          {sales.items.map((sale) => (
             <View key={sale.id} style={styles.listRow}>
               <View style={styles.rowBetween}>
-                <Text style={{ fontSize: 13.5, fontWeight: '600', flex: 1 }}>
+                <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>
                   {sale.product_name || sale.bundle_name} × {sale.quantity}
                 </Text>
-                <Text style={{ fontSize: 13, fontWeight: '700' }}>{npr(sale.npr_amount)}</Text>
+                <Text style={{ fontSize: 13, fontWeight: '600' }}>{npr(sale.npr_amount)}</Text>
               </View>
               <Text style={styles.mono}>
                 {sale.flight_number} · {sale.flight_date} · seat {sale.seat_number}
                 {' · '}{sale.seller_name || 'unattributed'} · {sale.sale_type}
               </Text>
               {!!sale.edited_by && (
-                <Text style={{ fontSize: 11.5, color: COLORS.warning, marginTop: 2 }}>
+                <Text style={{ fontSize: 12, color: COLORS.warning, marginTop: 2 }}>
                   Edited by {sale.edited_by}: {sale.edit_remarks}
                 </Text>
               )}
@@ -335,12 +340,13 @@ export default function LogsScreen({ user }) {
                     multiline
                     placeholder="Crew keyed water but sold a soft drink"
                   />
-                  <Button title="SAVE CORRECTION" onPress={saveEdit} disabled={!editRemarks.trim()} />
+                  <Button title="Save correction" onPress={saveEdit} disabled={!editRemarks.trim()} />
                 </View>
               )}
             </View>
           ))}
-          {!sales.length && <Text style={styles.empty}>No sales to show.</Text>}
+          {!sales.items.length && !sales.loading && <Text style={styles.empty}>No sales to show.</Text>}
+          <Pagination pager={sales} label="sale lines" />
         </Card>
       )}
 

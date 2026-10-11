@@ -115,7 +115,7 @@ export default function DashboardScreen({ user }) {
       <Card>
         <SectionTitle title="Revenue per passenger" description={`Target is ${npr(data.target_rpp)} per passenger.`} />
         <View style={[styles.rowBetween, { marginBottom: 8 }]}>
-          <Text style={{ fontSize: 30, fontWeight: '800', color: achievement >= 100 ? COLORS.success : COLORS.primary }}>
+          <Text style={{ fontSize: 30, fontWeight: '700', color: achievement >= 100 ? COLORS.success : COLORS.primary }}>
             {npr(data.rpp)}
           </Text>
           <Pill
@@ -232,10 +232,10 @@ export default function DashboardScreen({ user }) {
               .map((product, index) => (
                 <View key={product.product_id} style={styles.listRow}>
                   <View style={styles.rowBetween}>
-                    <Text style={{ fontSize: 13.5, fontWeight: '700', flex: 1 }} numberOfLines={1}>
+                    <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }} numberOfLines={1}>
                       {index + 1}. {product.product_name}
                     </Text>
-                    <Text style={{ fontSize: 13, fontWeight: '700', color: COLORS.primary }}>
+                    <Text style={{ fontSize: 13, fontWeight: '600', color: COLORS.primary }}>
                       {npr(product.revenue)}
                     </Text>
                   </View>
@@ -260,8 +260,8 @@ export default function DashboardScreen({ user }) {
         {data.routes.map((route) => (
           <View key={route.route} style={styles.listRow}>
             <View style={styles.rowBetween}>
-              <Text style={{ fontSize: 13.5, fontWeight: '600' }}>{route.route}</Text>
-              <Text style={{ fontSize: 13, fontWeight: '700', color: COLORS.primary }}>{npr(route.revenue)}</Text>
+              <Text style={{ fontSize: 14, fontWeight: '600' }}>{route.route}</Text>
+              <Text style={{ fontSize: 13, fontWeight: '600', color: COLORS.primary }}>{npr(route.revenue)}</Text>
             </View>
             <Text style={styles.mono}>
               {route.flights} flight(s) · {route.passengers} pax · RPP {npr(route.rpp)}
@@ -284,7 +284,7 @@ export default function DashboardScreen({ user }) {
         {data.flights.slice(0, 20).map((flight) => (
           <View key={flight.id} style={styles.listRow}>
             <View style={styles.rowBetween}>
-              <Text style={{ fontSize: 13.5, fontWeight: '700' }}>
+              <Text style={{ fontSize: 14, fontWeight: '600' }}>
                 {flight.flight_number} · {flight.origin}→{flight.destination}
               </Text>
               <Pill
@@ -303,7 +303,7 @@ export default function DashboardScreen({ user }) {
       <Card>
         <SectionTitle title="Export" description="Six sheets: summary, sales with remarks, flights, products, commission and reconciliation." />
         <Button
-          title={exporting ? 'Preparing…' : 'DOWNLOAD EXCEL WORKBOOK'}
+          title={exporting ? 'Preparing…' : 'Download Excel workbook'}
           onPress={exportExcel}
           disabled={exporting}
         />

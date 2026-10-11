@@ -2,11 +2,12 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 
 import { api, cached } from '../api';
+import { usePaged } from '../paging';
 import { confirm, notify } from '../dialog';
 import { COLORS, styles, todayString } from '../theme';
 import {
   Banner, Button, CalendarModal, Card, Field, OptionModal,
-  PageHeader, Pill, SectionTitle, Select,
+  PageHeader, Pagination, Pill, SectionTitle, Select,
 } from '../ui';
 
 /*
@@ -105,7 +106,7 @@ function FormField({ field, value, onChange, readOnly, onPickDate }) {
                 borderRadius: 8,
                 borderWidth: 1,
                 borderColor: isOn(option) ? COLORS.primary : COLORS.border,
-                backgroundColor: isOn(option) ? '#EAF1FA' : COLORS.surface,
+                backgroundColor: isOn(option) ? COLORS.primarySoft : COLORS.surface,
                 opacity: readOnly && !isOn(option) ? 0.5 : 1,
               }}
             >
@@ -143,7 +144,7 @@ function FormField({ field, value, onChange, readOnly, onPickDate }) {
         {field.groups.map((group) => (
           <View key={group.title} style={{ marginTop: 10 }}>
             <Text style={{
-              fontSize: 12.5, fontWeight: '700', color: COLORS.text,
+              fontSize: 13, fontWeight: '600', color: COLORS.text,
               backgroundColor: COLORS.surfaceAlt, paddingVertical: 5, paddingHorizontal: 8,
             }}
             >
@@ -231,7 +232,6 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
   const [flights, setFlights] = useState([]);
   const [flightId, setFlightId] = useState(initialFlightId || null);
   const [sector, setSector] = useState(null);       // reports_for_flight payload
-  const [filed, setFiled] = useState([]);           // management list
   const [message, setMessage] = useState(null);
   const [busy, setBusy] = useState(false);
 
@@ -281,22 +281,16 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     }
   }, []);
 
-  const loadFiled = useCallback(async () => {
-    if (!canReview) return;
-    const parts = [];
-    if (filterDate) parts.push(`date=${filterDate}`);
-    if (filterFlight) parts.push(`flight_number=${encodeURIComponent(filterFlight)}`);
-    try {
-      setFiled(await api(`/flight-reports${parts.length ? `?${parts.join('&')}` : ''}`));
-      setMessage(null);
-    } catch (error) {
-      setMessage({ tone: 'danger', text: error.message });
-    }
-  }, [canReview, filterDate, filterFlight]);
+  // Every report ever filed, so the management list is paged on the server.
+  const filedParts = [];
+  if (filterDate) filedParts.push(`date=${filterDate}`);
+  if (filterFlight) filedParts.push(`flight_number=${encodeURIComponent(filterFlight)}`);
+  const filedPager = usePaged(`/flight-reports${filedParts.length ? `?${filedParts.join('&')}` : ''}`, { enabled: canReview });
+  const filed = filedPager.items;
+  const loadFiled = filedPager.reload;
 
   useEffect(() => { loadForms(); loadFlights(); }, [loadForms, loadFlights]);
   useEffect(() => { loadSector(flightId); }, [flightId, loadSector]);
-  useEffect(() => { loadFiled(); }, [loadFiled]);
 
   /* --------------------------- open a form -------------------------- */
   function openForm(reportType) {
@@ -504,7 +498,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
               placeholder="Why is this being corrected?"
             />
             <Button
-              title={busy ? 'Saving…' : 'SAVE CORRECTION'}
+              title={busy ? 'Saving…' : 'Save correction'}
               onPress={() => saveCorrection(report)}
               disabled={busy || !online}
             />
@@ -514,14 +508,14 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
         <Card>
           <View style={[styles.row, styles.gap8]}>
             <Button
-              title="CANCEL"
+              title="Cancel"
               tone="ghost"
               style={styles.flex1}
               onPress={() => { setOpenType(null); setEditRemarks(''); }}
             />
             {!readOnly && (
               <Button
-                title={busy ? 'Submitting…' : 'SUBMIT'}
+                title={busy ? 'Submitting…' : 'Submit'}
                 tone="primary"
                 style={styles.flex1}
                 onPress={submitForm}
@@ -530,7 +524,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
             )}
             {readOnly && report?.may_unsubmit && !canReview && (
               <Button
-                title="UNSUBMIT"
+                title="Unsubmit"
                 tone="warning"
                 style={styles.flex1}
                 onPress={unsubmitForm}
@@ -620,7 +614,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
                 style={[styles.listRow, { paddingVertical: 12 }]}
               >
                 <View style={styles.rowBetween}>
-                  <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text, flex: 1 }}>
+                  <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text, flex: 1 }}>
                     {item.title}
                   </Text>
                   <Pill
@@ -679,7 +673,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
               style={[styles.listRow, { paddingVertical: 12 }]}
             >
               <View style={styles.rowBetween}>
-                <Text style={{ fontSize: 13.5, fontWeight: '700', color: COLORS.text, flex: 1 }}>
+                <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text, flex: 1 }}>
                   {r.title}
                 </Text>
                 <Pill label={`${r.issue_label} · ${r.rev_label}`} tone="muted" />
@@ -692,11 +686,13 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
               </Text>
             </Pressable>
           ))}
-          {!filed.length && (
+          {!!filedPager.error && <Banner tone="danger" message={filedPager.error} />}
+          {!filed.length && !filedPager.loading && (
             <Text style={styles.empty}>
               No reports match. Reports appear here as soon as a crew files them.
             </Text>
           )}
+          <Pagination pager={filedPager} label="reports" />
         </Card>
       )}
 

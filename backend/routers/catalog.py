@@ -9,6 +9,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from alert_engine import enqueue_stock_event
 from database import get_connection
 from security import current_user, log_action, now_iso, requires
 
@@ -71,6 +72,7 @@ def create_product(data: ProductIn, user: dict = Depends(requires("inventory")))
             "INSERT OR IGNORE INTO main_inventory(product_id,quantity,updated_at) VALUES (?,0,?)",
             (product_id, now_iso()),
         )
+        enqueue_stock_event(connection, product_id, "PRODUCT_CREATED")
         connection.commit()
         row = connection.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
     except sqlite3.IntegrityError:
@@ -95,6 +97,8 @@ def update_product(product_id: int, data: ProductIn, user: dict = Depends(requir
              data.unit.strip(), data.selling_price, data.cost, data.reorder_level,
              int(data.active), product_id),
         )
+        # Reorder level and active flag feed the stock-alert rules.
+        enqueue_stock_event(connection, product_id, "PRODUCT_UPDATE")
         connection.commit()
         row = connection.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
     except sqlite3.IntegrityError:
@@ -115,6 +119,7 @@ def deactivate_product(product_id: int, user: dict = Depends(requires("inventory
             raise HTTPException(status_code=404, detail="Product not found.")
         connection.execute("UPDATE products SET active=0 WHERE id=?", (product_id,))
         connection.execute("UPDATE bundle_items SET quantity=quantity WHERE product_id=?", (product_id,))
+        enqueue_stock_event(connection, product_id, "PRODUCT_DEACTIVATED")
         connection.commit()
     finally:
         connection.close()

@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from database import REPORT_UNSUBMIT_LIMIT, get_connection
+from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from report_forms import REPORT_FORMS, REPORT_TYPES, field_index, form_for
 from security import (
     current_user, log_action, now_iso, permissions_for, requires, today_iso,
@@ -161,6 +162,7 @@ def report_forms(user: dict = Depends(requires("flight_reports"))):
 def list_reports(flight_id: int | None = None, date: str | None = None,
                  flight_number: str | None = None, report_type: str | None = None,
                  status: str | None = None, limit: int = 300,
+                 page: int | None = PageParam, page_size: int = PageSizeParam,
                  user: dict = Depends(requires("flight_reports"))):
     """Filed reports. Management filter by date and flight; a device sees its own."""
     connection = get_connection()
@@ -191,6 +193,11 @@ def list_reports(flight_id: int | None = None, date: str | None = None,
             conditions.append("r.status=?")
             params.append(status.strip().upper())
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        if page:
+            return paginate_sql(
+                connection,
+                f"{REPORT_SELECT} {where} ORDER BY f.flight_date DESC, f.flight_number, r.report_type",
+                params, page, page_size, mapper=lambda row: _render(connection, row))
         rows = connection.execute(
             f"""{REPORT_SELECT} {where}
                 ORDER BY f.flight_date DESC, f.flight_number, r.report_type

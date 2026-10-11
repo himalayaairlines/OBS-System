@@ -1,13 +1,15 @@
 """SQLite schema, migrations and seed data for the Himalaya Airlines OBS system."""
 
 from datetime import date
+import os
 from pathlib import Path
 import sqlite3
 
 from crew_seed import CABIN_CREW, CREW_POSITIONS
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "obs.db"
+# OBS_DB_PATH lets tests and alternative deployments point at another file.
+DB_PATH = Path(os.getenv("OBS_DB_PATH") or BASE_DIR / "obs.db")
 
 ROLES = (
     "crew_supervisor",
@@ -24,19 +26,29 @@ ROLES = (
 RETIRED_ROLES = ("crew",)
 
 # Permission keys drive both the API guards and the mobile navigation.
+# Every role can read its own in-app notifications; that needs no key.
+#   comms_view       Communication Manager: dashboard, alerts, rules (read)
+#   comms_rules      create and edit stock-alert rules they own
+#   comms_rules_all  edit, disable or delete anyone's rule
+#   comms_groups     recipient groups and escalation policies
+#   comms_admin      delivery logs, retry/cancel, communication settings
+#   comms_templates  email templates
+#   smtp_view / smtp_manage / smtp_test   SMTP settings (manage = credentials)
 ROLE_PERMISSIONS = {
     # The OBS iPad account. Forms the duty group, sells, finishes the sector,
     # declares leftover stock and files the post-flight cabin reports.
     "crew_supervisor": {"crew", "sync", "reconcile_submit", "flight_reports"},
     # `groups` is read-only visibility of the duty groups the crew formed.
     # Nobody on the ground builds them any more.
-    "inventory": {"inventory", "warehouse", "groups", "sync"},
+    "inventory": {"inventory", "warehouse", "groups", "sync",
+                  "comms_view", "comms_rules"},
     # The inventory supervisor reconciles what the crew sold against what came
     # back, so they read the sales ledger and may correct a mis-keyed line.
     "inventory_supervisor": {
         "inventory", "warehouse", "warehouse_approve", "bundles",
         "groups", "stock_add", "reconcile_approve", "sync",
         "sales_view", "sales_edit",
+        "comms_view", "comms_rules", "comms_groups",
     },
     # Management oversee and correct; they do not sell, so no crew sales screen.
     # `groups_manage` is the post-lock amendment of a duty group, with remarks.
@@ -45,10 +57,14 @@ ROLE_PERMISSIONS = {
         "stock_add", "dashboard", "sync", "logs", "rates", "rates_edit",
         "sales_view", "sales_edit", "reports", "warehouse_approve",
         "reconcile_approve", "reconcile_submit", "flight_reports", "reports_review",
+        "comms_view", "comms_rules", "comms_rules_all", "comms_groups", "comms_admin",
+        "comms_templates", "smtp_view",
     },
     # Finance set rates and read performance. No sales, commission or sync.
     "finance": {"rates", "rates_edit", "dashboard", "reports"},
-    "admin": {"users", "crew_members"},
+    # The administrator owns system configuration, including SMTP credentials.
+    "admin": {"users", "crew_members", "smtp_view", "smtp_manage", "smtp_test",
+              "comms_admin", "comms_templates"},
 }
 
 # --------------------------------------------------------------------------- #
@@ -830,6 +846,10 @@ def initialize_database():
 
         # No starter crew groups: a duty group only exists once real crew have
         # picked their names on the iPad for a real sector.
+
+        # SMTP settings, Communication Manager and stock alerts.
+        from comms_schema import initialize_comms
+        initialize_comms(connection, _add_column)
 
         connection.commit()
     finally:
