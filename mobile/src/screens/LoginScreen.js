@@ -31,23 +31,33 @@ const C = {
 
 /* ------------------------------ pieces ------------------------------ */
 function HeroBackground() {
+  // Sized from its own layout: on Android a percentage-sized Svg inside a
+  // ScrollView did not stretch to the full width of the header.
+  const [size, setSize] = useState({ width: 0, height: 0 });
   return (
-    <Svg style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }} width="100%" height="100%"
-      preserveAspectRatio="none">
-      <Defs>
-        <LinearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
-          <Stop offset="0" stopColor={C.navy} />
-          <Stop offset="0.55" stopColor="#10306B" />
-          <Stop offset="1" stopColor={C.blue} />
-        </LinearGradient>
-        <RadialGradient id="glow" cx="80%" cy="95%" r="60%">
-          <Stop offset="0" stopColor={C.glow} stopOpacity="0.45" />
-          <Stop offset="1" stopColor={C.glow} stopOpacity="0" />
-        </RadialGradient>
-      </Defs>
-      <Rect x="0" y="0" width="100%" height="100%" fill="url(#sky)" />
-      <Rect x="0" y="0" width="100%" height="100%" fill="url(#glow)" />
-    </Svg>
+    <View
+      pointerEvents="none"
+      style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: C.navy }}
+      onLayout={(e) => setSize({ width: e.nativeEvent.layout.width, height: e.nativeEvent.layout.height })}
+    >
+      {size.width > 0 && (
+        <Svg width={size.width} height={size.height} preserveAspectRatio="none">
+          <Defs>
+            <LinearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+              <Stop offset="0" stopColor={C.navy} />
+              <Stop offset="0.55" stopColor="#10306B" />
+              <Stop offset="1" stopColor={C.blue} />
+            </LinearGradient>
+            <RadialGradient id="glow" cx="80%" cy="95%" r="60%">
+              <Stop offset="0" stopColor={C.glow} stopOpacity="0.45" />
+              <Stop offset="1" stopColor={C.glow} stopOpacity="0" />
+            </RadialGradient>
+          </Defs>
+          <Rect x="0" y="0" width="100%" height="100%" fill="url(#sky)" />
+          <Rect x="0" y="0" width="100%" height="100%" fill="url(#glow)" />
+        </Svg>
+      )}
+    </View>
   );
 }
 
@@ -257,7 +267,7 @@ export default function LoginScreen({ onLogin, notify }) {
       ...(wide ? { width: '51%' } : null),
       paddingHorizontal: wide ? 52 : 24,
       paddingTop: (wide ? 48 : 22) + (wide ? 0 : insets.top),
-      paddingBottom: wide ? 36 : 30,
+      paddingBottom: wide ? 36 : 20,
       justifyContent: 'space-between',
       overflow: 'hidden',
     }}>
@@ -280,30 +290,30 @@ export default function LoginScreen({ onLogin, notify }) {
         {!wide && <LanguageSwitch value={lang} onChange={changeLanguage} dark label={t.language} />}
       </View>
 
-      <View style={{ marginTop: wide ? 0 : 26, maxWidth: 560 }}>
-        <Text accessibilityRole="header" style={[ws(700), {
-          color: '#FFFFFF', fontSize: wide ? 36 : tablet ? 30 : 25, lineHeight: wide ? 46 : tablet ? 38 : 32,
-        }]}>
-          {t.headline}
-        </Text>
-        <Text style={[ws(400), {
-          color: 'rgba(255,255,255,0.80)', fontSize: wide ? 16.5 : 14.5, lineHeight: wide ? 26 : 22, marginTop: 14,
-        }]}>
-          {t.intro}
-        </Text>
-        {(wide || tablet) && (
+      {wide && (
+        <View style={{ maxWidth: 560 }}>
+          <Text accessibilityRole="header" style={[ws(700), {
+            color: '#FFFFFF', fontSize: 36, lineHeight: 46,
+          }]}>
+            {t.headline}
+          </Text>
+          <Text style={[ws(400), {
+            color: 'rgba(255,255,255,0.80)', fontSize: 16.5, lineHeight: 26, marginTop: 14,
+          }]}>
+            {t.intro}
+          </Text>
           <View style={{ marginTop: 26, gap: 11 }}>
             {t.features.map((feature) => (
               <View key={feature} style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 11 }}>
                 <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: C.bullet, marginTop: 9 }} />
-                <Text style={[ws(400), { color: 'rgba(255,255,255,0.92)', fontSize: wide ? 16 : 15, lineHeight: 24, flex: 1 }]}>
+                <Text style={[ws(400), { color: 'rgba(255,255,255,0.92)', fontSize: 16, lineHeight: 24, flex: 1 }]}>
                   {feature}
                 </Text>
               </View>
             ))}
           </View>
-        )}
-      </View>
+        </View>
+      )}
 
       {wide && (
         <Text style={[ws(400), { color: 'rgba(255,255,255,0.55)', fontSize: 13 }]}>{t.footer}</Text>
