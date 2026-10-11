@@ -43,7 +43,7 @@ const NAV = [
   // Crew file the post-flight cabin reports here; management read and correct them.
   { key: 'reports', label: 'Reports', permission: 'flight_reports' },
   // Stock alerts. Administrators reach it for SMTP and the delivery log.
-  { key: 'comms', label: 'Comms', anyPermission: ['comms_view', 'comms_admin', 'smtp_view'] },
+  { key: 'comms', label: 'Communication Manager', anyPermission: ['comms_view', 'comms_admin', 'smtp_view'] },
   { key: 'admin', label: 'Admin', permission: 'users' },
 ];
 

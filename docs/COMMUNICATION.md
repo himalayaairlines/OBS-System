@@ -105,8 +105,8 @@ Every signed-in user can read and mark their own notifications, and nobody else'
    The start-up banner shows `v7.3` and whether the worker is embedded.
 
 4. In the app, sign in as **ADMIN001**. Under **Admin → Login accounts**, give each person who should receive email an address.
-5. Under **Comms → Settings → SMTP / email**: enter host, port, encryption, username, password and sender, then **Save**. Use **Test connection**, then **Send test email**, and only then switch on **Send email**.
-6. Sign in as an inventory user and create a rule under **Comms → Alert rules → New rule**. Use **Simulate** before activating.
+5. Under **Communication Manager → Settings → SMTP / email**: enter host, port, encryption, username, password and sender, then **Save**. Use **Test connection**, then **Send test email**, and only then switch on **Send email**.
+6. Sign in as an inventory user and create a rule under **Communication Manager → Alert rules → New rule**. Use **Simulate** before activating.
 
 ### SMTP notes
 
