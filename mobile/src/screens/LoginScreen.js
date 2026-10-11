@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Platform, Pressable, ScrollView, StatusBar, Text, TextInput, View, useWindowDimensions,
+  Image, Platform, Pressable, ScrollView, StatusBar, Text, TextInput, View, useWindowDimensions,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -51,18 +51,20 @@ function HeroBackground() {
   );
 }
 
-function PlaneMark({ size = 52 }) {
+const HIMALAYA_LOGO = require('../../assets/himalaya-logo.png');
+
+function BrandLogo({ size = 52 }) {
   return (
     <View style={{
       width: size, height: size, borderRadius: 14, alignItems: 'center', justifyContent: 'center',
-      backgroundColor: 'rgba(255,255,255,0.10)', borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)',
+      backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)',
     }}>
-      <Svg width={size * 0.46} height={size * 0.46} viewBox="0 0 24 24">
-        <Path
-          fill="#FFFFFF"
-          d="M21 16v-2l-8-5V3.5a1.5 1.5 0 0 0-3 0V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5Z"
-        />
-      </Svg>
+      <Image
+        source={HIMALAYA_LOGO}
+        style={{ width: size * 0.78, height: size * 0.78 }}
+        resizeMode="contain"
+        accessibilityLabel="Himalaya Airlines logo"
+      />
     </View>
   );
 }
@@ -265,7 +267,7 @@ export default function LoginScreen({ onLogin, notify }) {
         justifyContent: 'space-between', gap: 14,
       }}>
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14, flexShrink: 1 }}>
-          <PlaneMark size={wide ? 52 : 44} />
+          <BrandLogo size={wide ? 52 : 44} />
           <View style={{ flexShrink: 1 }}>
             <Text style={[ws(700), { color: '#FFFFFF', fontSize: wide ? 19 : 16, letterSpacing: 0.4 }]} numberOfLines={1}>
               HIMALAYA AIRLINES
