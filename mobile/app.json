@@ -1,4 +1,3 @@
-
 {
   "expo": {
     "name": "Himalaya OBS",
@@ -14,10 +13,18 @@
       "supportsTablet": true
     },
     "android": {
-      "package": "com.himalaya.obs"
+      "package": "com.himalaya.obs",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#12387A"
+      }
     },
     "web": {
-      "bundler": "metro"
+      "bundler": "metro",
+      "favicon": "./assets/favicon.png",
+      "name": "Himalaya Airlines OBS",
+      "shortName": "H9 OBS",
+      "themeColor": "#0B4F8A"
     },
     "extra": {
       "eas": {
@@ -34,6 +41,8 @@
           }
         }
       ]
-    ]
+    ],
+    "icon": "./assets/icon.png",
+    "backgroundColor": "#0A2454"
   }
 }

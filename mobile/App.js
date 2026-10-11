@@ -17,6 +17,7 @@ import { Banner, Button, Card, DialogHost, Field, Pill } from './src/ui';
 import AdminScreen from './src/screens/AdminScreen';
 import LoginScreen from './src/screens/LoginScreen';
 import { loadFonts } from './src/fonts';
+import SplashScreen from './src/SplashScreen';
 import CommsScreen from './src/screens/comms/CommsScreen';
 import NotificationsScreen from './src/screens/NotificationsScreen';
 import { BellIcon } from './src/screens/comms/shared';
@@ -63,6 +64,12 @@ function AppContent() {
   const insets = useSafeAreaInsets();
   const [user, setUser] = useState(null);
   const [booting, setBooting] = useState(true);
+  // Keep the splash up briefly so it doesn't just flash on fast starts.
+  const [splashShown, setSplashShown] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setSplashShown(true), 1200);
+    return () => clearTimeout(t);
+  }, []);
   const [page, setPage] = useState('crew');
   const [online, setOnline] = useState(true);
   const [queueCount, setQueueCount] = useState(0);
@@ -218,12 +225,8 @@ function AppContent() {
     setProfileOpen(false);
   }
 
-  if (booting) {
-    return (
-      <SafeAreaView style={[styles.screen, { justifyContent: 'center' }]}>
-        <Text style={styles.empty}>Starting…</Text>
-      </SafeAreaView>
-    );
+  if (booting || !splashShown) {
+    return <SplashScreen />;
   }
 
   if (!user) {
