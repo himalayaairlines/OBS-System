@@ -4,16 +4,12 @@ import { Text } from '../../text';
 
 import { api } from '../../api';
 import { COLORS, styles } from '../../theme';
-import { Banner, Button, Card, Chip, Field, KeyValue, SectionTitle } from '../../ui';
+import { Banner, Button, Card, Chip, Field, KeyValue, Notice, SectionTitle } from '../../ui';
 import { StatusPill, Toggle, WEEKDAYS, has, when } from './shared';
 
+/** Alert-engine settings. The mail server has its own module (SmtpScreen). */
 export default function Settings({ user }) {
-  return (
-    <>
-      {(has(user, 'comms_view') || has(user, 'comms_admin')) && <CommsSettings user={user} />}
-      {has(user, 'smtp_view') && <SmtpSettings user={user} />}
-    </>
-  );
+  return (has(user, 'comms_view') || has(user, 'comms_admin')) ? <CommsSettings user={user} /> : null;
 }
 
 /* ----------------------------- communication ---------------------------- */
@@ -57,7 +53,7 @@ function CommsSettings({ user }) {
     }
   }
 
-  if (!form) return message ? <Banner tone={message.tone} message={message.text} /> : null;
+  if (!form) return message ? <Notice message={message} /> : null;
   const toggleDay = (d) => setForm({
     ...form, business_days: form.business_days.includes(d) ? form.business_days.filter((x) => x !== d) : [...form.business_days, d],
   });
@@ -65,7 +61,7 @@ function CommsSettings({ user }) {
   return (
     <Card>
       <SectionTitle title="Communication defaults" description="Timezone and hours used for business-hours rules, daily reminders and digests." />
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       <Toggle label="Stock alerts enabled" value={form.alerts_enabled} disabled={!editable}
         onChange={(v) => setForm({ ...form, alerts_enabled: v })}
         hint="Master switch. Off: no rule opens alerts or sends reminders, escalations or digests. Rules and item settings are kept." />
@@ -112,7 +108,7 @@ function CommsSettings({ user }) {
 }
 
 /* ---------------------------------- SMTP --------------------------------- */
-function SmtpSettings({ user }) {
+export function SmtpSettings({ user }) {
   const canManage = has(user, 'smtp_manage');
   const canTest = has(user, 'smtp_test');
   const [cfg, setCfg] = useState(null);
@@ -185,7 +181,7 @@ function SmtpSettings({ user }) {
     setBusy(false);
   }
 
-  if (!form) return message ? <Banner tone={message.tone} message={message.text} /> : null;
+  if (!form) return message ? <Notice message={message} /> : null;
   const set = (patch) => setForm({ ...form, ...patch });
   const securityOptions = [['starttls', 'STARTTLS (587)'], ['ssl', 'SSL/TLS (465)']];
   if (cfg?.plaintext_allowed || form.security === 'none') securityOptions.push(['none', 'None (internal relay)']);
@@ -197,7 +193,7 @@ function SmtpSettings({ user }) {
         description="Outgoing mail server. TLS certificates are always verified. Microsoft 365 needs SMTP AUTH enabled for the mailbox; OAuth-only tenants are not supported yet."
         right={<StatusPill status={cfg.enabled ? 'ACTIVE' : 'DISABLED'} />}
       />
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       <Toggle label="Send email" value={form.enabled} disabled={!canManage} onChange={(v) => set({ enabled: v })}
         hint="When off, emails queue up and nothing is lost; in-app alerts keep working." />
       <Field label="SMTP host" value={form.host} editable={canManage} autoCapitalize="none" onChangeText={(v) => set({ host: v.trim() })} placeholder="smtp.office365.com" />

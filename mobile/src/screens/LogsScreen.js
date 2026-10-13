@@ -9,7 +9,10 @@ import { api, downloadReport } from '../api';
 import { BarChart, RankBarChart } from '../charts';
 import { COLORS, MONTHS, compact, npr, styles } from '../theme';
 import { usePaged } from '../paging';
-import { Banner, Button, Card, Chip, Field, KeyValue, OptionModal, PageHeader, Pagination, Pill, SectionTitle, Select } from '../ui';
+import {
+  Banner, Button, Card, Chip, Field, KeyValue, Notice, OptionModal, PageHeader, Pagination, Pill,
+  SectionTitle, Select,
+} from '../ui';
 
 const YEARS = Array.from({ length: 6 }, (_, i) => new Date().getFullYear() - i);
 
@@ -146,7 +149,7 @@ export default function LogsScreen({ user }) {
           <Chip key={item.key} label={item.label} active={tab === item.key} onPress={() => setTab(item.key)} />
         ))}
       </View>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
 
       <Button
         title={exporting ? 'Preparing…' : `Download ${(EXPORTS[tab]?.label || '').toLowerCase()} (Excel)`}

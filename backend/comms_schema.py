@@ -244,7 +244,7 @@ CREATE INDEX IF NOT EXISTS idx_alert_events_incident ON alert_events(incident_id
 CREATE TABLE IF NOT EXISTS notification_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     idempotency_key TEXT NOT NULL UNIQUE,
-    kind TEXT NOT NULL CHECK (kind IN ('ALERT','REMINDER','ESCALATION','RECOVERY','DIGEST','TEST')),
+    kind TEXT NOT NULL CHECK (kind IN ('ALERT','REMINDER','ESCALATION','RECOVERY','DIGEST','TEST','SECURITY')),
     channel TEXT NOT NULL DEFAULT 'EMAIL' CHECK (channel IN ('EMAIL')),
     incident_id INTEGER,
     rule_id INTEGER,

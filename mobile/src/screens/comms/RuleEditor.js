@@ -5,7 +5,8 @@ import { Text } from '../../text';
 import { api } from '../../api';
 import { COLORS, ROLE_LABELS, styles } from '../../theme';
 import {
-  Banner, Button, CalendarModal, Card, Chip, Field, KeyValue, OptionModal, SectionTitle, Select,
+  Banner, Button, CalendarModal, Card, Chip, Field, KeyValue, Notice, OptionModal, SectionTitle,
+  Select,
 } from '../../ui';
 import {
   FREQUENCY_LABELS, LEVEL_LABELS, RECIPIENT_TYPE_LABELS, TRIGGER_LABELS, Toggle, qty, recipientLabel,
@@ -355,7 +356,7 @@ export default function RuleEditor({ rule, options, onDone, onCancel }) {
           <Chip key={label} label={`${index + 1}. ${label}`} active={step === index} onPress={() => setStep(index)} />
         ))}
       </View>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       {steps[step]}
       <View style={[styles.row, styles.gap8, { marginTop: 16 }]}>
         <Button title="Back" tone="ghost" style={styles.flex1} disabled={step === 0} onPress={() => setStep(step - 1)} />

@@ -5,7 +5,7 @@ import { Text } from '../../text';
 import { api } from '../../api';
 import { confirm } from '../../dialog';
 import { COLORS, styles } from '../../theme';
-import { Banner, Button, Card, Chip, KeyValue, SearchBar, SectionTitle } from '../../ui';
+import { Banner, Button, Card, Chip, KeyValue, Notice, SearchBar, SectionTitle } from '../../ui';
 import RuleEditor from './RuleEditor';
 import SimulationResult from './SimulationResult';
 import { FREQUENCY_LABELS, SeverityPill, StatusPill, has, recipientLabel, when } from './shared';
@@ -93,7 +93,7 @@ export default function Rules({ user, options, reloadOptions }) {
     const r = selected;
     return (
       <>
-        {message && <Banner tone={message.tone} message={message.text} />}
+        {message && <Notice message={message} />}
         <Card>
           <SectionTitle title={r.name} description={r.description} right={<StatusPill status={r.status} />} />
           <KeyValue label="Owner" value={r.owner_name || '—'} />
@@ -168,7 +168,7 @@ export default function Rules({ user, options, reloadOptions }) {
 
   return (
     <>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       <Card>
         <SectionTitle
           title={`Alert rules (${rules.length})`}

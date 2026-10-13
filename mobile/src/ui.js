@@ -4,7 +4,7 @@ import {
 } from 'react-native';
 import { Text, TextInput } from './text';
 
-import { registerDialogHandler } from './dialog';
+import { notify, registerDialogHandler } from './dialog';
 import {
   COLORS, CONTROL, MONTHS, NUMERIC, RADIUS, SPACE, TYPE, styles,
 } from './theme';
@@ -170,6 +170,27 @@ const BANNER_TONES = {
   warning: { bg: COLORS.warningSoft, border: '#EED7AE', accent: COLORS.warning, fg: COLORS.warning },
   danger: { bg: COLORS.dangerSoft, border: '#F1C4BF', accent: COLORS.danger, fg: COLORS.danger },
 };
+
+// Each message pops up once, even if its Notice is unmounted and mounted again.
+const SHOWN = new WeakSet();
+const NOTICE_TITLES = { success: 'Done', info: 'Notice', warning: 'Please note' };
+
+/**
+ * The result of an action (`{ tone, text }`). Confirmations (success, info,
+ * warning) open as a pop-up dialog; errors stay inline next to the form so the
+ * person can still see what to fix. A new message object pops up again even
+ * when its text repeats.
+ */
+export function Notice({ message, title }) {
+  const popup = !!message && !!message.text && !message.inline && message.tone in NOTICE_TITLES;
+  React.useEffect(() => {
+    if (!popup || SHOWN.has(message)) return;
+    SHOWN.add(message);
+    notify({ title: message.title || title || NOTICE_TITLES[message.tone], message: message.text });
+  }, [message]); // eslint-disable-line react-hooks/exhaustive-deps
+  if (!message || popup) return null;
+  return <Banner tone={message.tone} message={message.text} />;
+}
 
 export function Banner({ message, tone = 'info' }) {
   if (!message) return null;

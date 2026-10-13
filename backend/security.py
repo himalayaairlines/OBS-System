@@ -1,35 +1,74 @@
-"""Password hashing, session tokens, permission guards and audit logging."""
+"""Password hashing, sessions, permission guards and audit logging.
 
-from datetime import datetime, date, timedelta
+Sessions (7.5) live in the `user_sessions` table. The client holds a random
+bearer token; the database keeps only its SHA-256, the device, address and
+timestamps. A session ends when it is signed out or revoked, after
+`session_idle_minutes` without a request, or `session_hours` after sign-in
+(OBS iPad accounts: `device_session_hours`, no idle limit). Changing or
+resetting a password ends every other session of that user.
+"""
+
+from contextvars import ContextVar
+from datetime import datetime, date, timedelta, timezone
 import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 
 from database import ROLE_PERMISSIONS, get_connection
 
-PBKDF2_ROUNDS = 120_000
-SESSION_TTL_HOURS = 18
+PBKDF2_ROUNDS = 310_000
+# The account that works offline on board; see the module docstring.
+DEVICE_ROLES = {"crew_supervisor"}
+# While a weak or default password must be changed, only these work.
+PASSWORD_CHANGE_PATHS = {"/me", "/logout", "/change-password", "/account", "/account/sessions"}
+
+_CLIENT: ContextVar[dict] = ContextVar("obs_client", default={})
+
+
+# --------------------------------------------------------------------------- #
+# Request context (set by the middleware in main.py)
+# --------------------------------------------------------------------------- #
+def set_client(ip: str | None, user_agent: str | None, client: str | None, path: str | None):
+    return _CLIENT.set({"ip": ip, "ua": (user_agent or "")[:300], "client": client, "path": path})
+
+
+def reset_client(token):
+    _CLIENT.reset(token)
+
+
+def client_info() -> dict:
+    return _CLIENT.get() or {}
+
+
+def describe_device(user_agent: str | None, client: str | None = None) -> str:
+    """'Chrome on Windows', 'OBS app on iPad'... Good enough to recognise a device."""
+    ua = user_agent or ""
+    if client in ("ios-app", "android-app"):
+        return "OBS app on " + ("iPad / iPhone" if client == "ios-app" else "Android")
+    browser = next((name for key, name in (("Edg/", "Edge"), ("OPR/", "Opera"), ("Firefox/", "Firefox"),
+                                           ("Chrome/", "Chrome"), ("Safari/", "Safari")) if key in ua), None)
+    system = next((name for key, name in (("iPad", "iPad"), ("iPhone", "iPhone"), ("Android", "Android"),
+                                          ("Windows", "Windows"), ("Mac OS X", "macOS"), ("Linux", "Linux"))
+                   if key in ua), None)
+    if "okhttp" in ua or "Expo" in ua or "CFNetwork" in ua:
+        return "OBS app"
+    if browser and system:
+        return f"{browser} on {system}"
+    return browser or system or "Unknown device"
+
 
 # --------------------------------------------------------------------------- #
 # Administrator recovery code
 # --------------------------------------------------------------------------- #
-# The break-glass code that lets an administrator who is locked out, or who has
-# forgotten the password, set a new one without another administrator's help.
-#
-# Set OBS_ADMIN_RECOVERY_CODE in the environment to use your own. The built-in
-# fallback is stored as a hash so the code itself is not readable in the source,
-# but anyone who can run the server can still try codes against it, which is why
-# every attempt is rate limited and written to the audit log.
-_DEFAULT_RECOVERY_HASH = (
-    "pbkdf2$120000$d9f255024e84ac825f14ee7dd8fda71d$"
-    "23d5091d342450e76515d97a9e0e2491975988417f45b88c561146b7edc5259e"
-)
-
-# Wrong codes allowed before recovery is refused for a while.
+# Break-glass reset for an administrator who cannot use the e-mailed reset
+# link. It works only when OBS_ADMIN_RECOVERY_CODE is set on the server: there
+# is deliberately no built-in default, because a code shipped with the software
+# would be the same for everyone.
 RECOVERY_ATTEMPT_LIMIT = 5
 RECOVERY_COOLDOWN_MINUTES = 15
 
@@ -40,15 +79,17 @@ def _normalise_code(code: str) -> str:
     return (code or "").strip().upper()
 
 
+def recovery_configured() -> bool:
+    return len(os.getenv("OBS_ADMIN_RECOVERY_CODE", "").strip()) >= 12
+
+
 def recovery_code_matches(code: str) -> bool:
     """True when `code` is the configured administrator recovery code."""
     configured = os.getenv("OBS_ADMIN_RECOVERY_CODE", "").strip()
     supplied = _normalise_code(code)
-    if not supplied:
+    if not supplied or not recovery_configured():
         return False
-    if configured:
-        return hmac.compare_digest(supplied, _normalise_code(configured))
-    return verify_password(supplied, _DEFAULT_RECOVERY_HASH)
+    return hmac.compare_digest(supplied, _normalise_code(configured))
 
 
 def recovery_cooldown_remaining() -> int:
@@ -69,10 +110,6 @@ def record_recovery_failure():
 def clear_recovery_failures():
     _recovery_failures.clear()
 
-# In-process session store. A production deployment would move this to the
-# database or a cache, but it already removes the "trust the header" hole.
-_SESSIONS: dict[str, dict] = {}
-
 
 # --------------------------------------------------------------------------- #
 # Passwords
@@ -88,8 +125,9 @@ def is_hashed(stored: str) -> bool:
 
 
 def verify_password(raw: str, stored: str) -> bool:
-    if not is_hashed(stored):
-        return hmac.compare_digest(raw, stored or "")
+    # Plaintext rows are converted at start-up, so anything unhashed is refused.
+    if not is_hashed(stored) or raw is None:
+        return False
     try:
         _, rounds, salt, expected = stored.split("$")
         digest = hashlib.pbkdf2_hmac("sha256", raw.encode(), bytes.fromhex(salt), int(rounds))
@@ -98,55 +136,193 @@ def verify_password(raw: str, stored: str) -> bool:
         return False
 
 
+def needs_rehash(stored: str) -> bool:
+    try:
+        return int(stored.split("$")[1]) < PBKDF2_ROUNDS
+    except (IndexError, ValueError, AttributeError):
+        return True
+
+
+PASSWORD_MIN_LENGTH = 10
+
+
+def password_problems(raw: str, user: dict | None = None) -> list[str]:
+    """Unmet password rules, as sentences. Empty means the password is acceptable.
+
+    At least 10 characters, three of lower-case / upper-case / digit / symbol,
+    and none of the person's name parts, employee ID or e-mail name.
+    """
+    raw = raw or ""
+    problems = []
+    if len(raw) < PASSWORD_MIN_LENGTH:
+        problems.append(f"Use at least {PASSWORD_MIN_LENGTH} characters.")
+    classes = sum(bool(re.search(p, raw)) for p in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]"))
+    if classes < 3:
+        problems.append("Use three of: lower-case, upper-case, digit, symbol.")
+    lowered = raw.lower()
+    words = set()
+    for value in ((user or {}).get("name"), (user or {}).get("employee_id"),
+                  ((user or {}).get("email") or "").split("@")[0]):
+        for part in re.split(r"[\s._\-@]+", str(value or "").lower()):
+            if len(part) >= 3:
+                words.add(part)
+    if any(word in lowered for word in words):
+        problems.append("Do not use your name, employee ID or e-mail name.")
+    return problems
+
+
+# --------------------------------------------------------------------------- #
+# Settings used here (read straight from app_settings to avoid an import cycle)
+# --------------------------------------------------------------------------- #
+def auth_setting(connection, key: str, default: str) -> str:
+    row = connection.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row and row["value"] not in (None, "") else default
+
+
+def _utc() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def token_hash(token: str) -> str:
+    return hashlib.sha256((token or "").encode()).hexdigest()
+
+
 # --------------------------------------------------------------------------- #
 # Sessions
 # --------------------------------------------------------------------------- #
-def create_session(user: dict) -> str:
-    token = secrets.token_urlsafe(32)
-    _SESSIONS[token] = {
-        "user": user,
-        "expires": datetime.now() + timedelta(hours=SESSION_TTL_HOURS),
-    }
-    return token
+def session_limits(connection, role: str) -> tuple[int | None, int]:
+    """(idle minutes or None, absolute hours) for a role."""
+    if role in DEVICE_ROLES:
+        return None, int(auth_setting(connection, "device_session_hours", "24"))
+    return (int(auth_setting(connection, "session_idle_minutes", "60")),
+            int(auth_setting(connection, "session_hours", "12")))
 
 
-def destroy_session(token: str | None):
-    if token:
-        _SESSIONS.pop(token, None)
+def create_session(user: dict, two_factor: bool = False, connection=None) -> str:
+    """Open a session for `user` and return the bearer token (shown once)."""
+    own = connection is None
+    connection = connection or get_connection()
+    try:
+        info = client_info()
+        idle, hours = session_limits(connection, user["role"])
+        now = _utc()
+        token = secrets.token_urlsafe(32)
+        connection.execute(
+            """INSERT INTO user_sessions
+               (token_hash,user_id,created_at,last_seen_at,expires_at,idle_minutes,ip_address,
+                user_agent,device,two_factor)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (token_hash(token), user["id"], _iso(now), _iso(now), _iso(now + timedelta(hours=hours)), idle,
+             info.get("ip"), info.get("ua"), describe_device(info.get("ua"), info.get("client")),
+             int(bool(two_factor))))
+        if own:
+            connection.commit()
+        return token
+    finally:
+        if own:
+            connection.close()
+
+
+def destroy_session(token: str | None, reason: str = "SIGNED_OUT"):
+    if not token:
+        return
+    connection = get_connection()
+    try:
+        connection.execute(
+            "UPDATE user_sessions SET revoked_at=?, revoked_reason=? WHERE token_hash=? AND revoked_at IS NULL",
+            (_iso(_utc()), reason, token_hash(token)))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def revoke_user_sessions(connection, user_id: int, reason: str, keep_session_id: int | None = None) -> int:
+    """End every live session of a user (optionally except one). Caller commits."""
+    return connection.execute(
+        "UPDATE user_sessions SET revoked_at=?, revoked_reason=? "
+        "WHERE user_id=? AND revoked_at IS NULL AND (? IS NULL OR id<>?)",
+        (_iso(_utc()), reason, user_id, keep_session_id, keep_session_id)).rowcount
+
+
+def session_alive(row, now=None) -> bool:
+    now = now or _utc()
+    if row["revoked_at"] or _parse(row["expires_at"]) <= now:
+        return False
+    if row["idle_minutes"] and now - _parse(row["last_seen_at"]) > timedelta(minutes=int(row["idle_minutes"])):
+        return False
+    return True
 
 
 def _session_user(token: str | None):
-    entry = _SESSIONS.get(token or "")
-    if not entry:
-        return None
-    if entry["expires"] < datetime.now():
-        _SESSIONS.pop(token, None)
-        return None
-    return entry["user"]
+    """(user row, session row) for a live session, or (None, None)."""
+    if not token:
+        return None, None
+    connection = get_connection()
+    try:
+        session = connection.execute("SELECT * FROM user_sessions WHERE token_hash=?",
+                                     (token_hash(token),)).fetchone()
+        if not session:
+            return None, None
+        now = _utc()
+        if not session_alive(session, now):
+            if not session["revoked_at"]:
+                connection.execute(
+                    "UPDATE user_sessions SET revoked_at=?, revoked_reason='EXPIRED' WHERE id=?",
+                    (_iso(now), session["id"]))
+                connection.commit()
+            return None, None
+        user = connection.execute(
+            """SELECT id, employee_id, name, role, active, email, email_verified, two_factor,
+                      must_change_password FROM users WHERE id=?""", (session["user_id"],)).fetchone()
+        if not user or not user["active"]:
+            connection.execute(
+                "UPDATE user_sessions SET revoked_at=?, revoked_reason='ACCOUNT_DISABLED' WHERE id=?",
+                (_iso(now), session["id"]))
+            connection.commit()
+            return None, None
+        # Write activity at most once a minute.
+        if now - _parse(session["last_seen_at"]) >= timedelta(seconds=60):
+            info = client_info()
+            connection.execute(
+                "UPDATE user_sessions SET last_seen_at=?, ip_address=COALESCE(?, ip_address) WHERE id=?",
+                (_iso(now), info.get("ip"), session["id"]))
+            connection.commit()
+        return dict(user), dict(session)
+    finally:
+        connection.close()
+
+
+def _bearer(authorization: str | None) -> str | None:
+    if authorization and authorization.lower().startswith("bearer "):
+        return authorization.split(" ", 1)[1].strip()
+    return None
 
 
 def current_user(authorization: str | None = Header(default=None)) -> dict:
     """Resolve the caller from a Bearer token issued by /login."""
-    token = None
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization.split(" ", 1)[1].strip()
-    user = _session_user(token)
+    token = _bearer(authorization)
+    user, session = _session_user(token)
     if not user:
         raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
-
-    connection = get_connection()
-    try:
-        row = connection.execute(
-            "SELECT id, employee_id, name, role, active FROM users WHERE id=?",
-            (user["id"],),
-        ).fetchone()
-    finally:
-        connection.close()
-    if not row or not row["active"]:
-        destroy_session(token)
-        raise HTTPException(status_code=401, detail="Account is no longer active.")
-    resolved = dict(row)
+    path = client_info().get("path") or ""
+    if user["must_change_password"] and path not in PASSWORD_CHANGE_PATHS:
+        raise HTTPException(
+            status_code=403,
+            detail="Your password must be changed before you continue. Open My Account and set a new one.")
+    resolved = dict(user)
     resolved["token"] = token
+    resolved["session_id"] = session["id"]
     return resolved
 
 
@@ -154,15 +330,19 @@ def permissions_for(role: str) -> set[str]:
     return ROLE_PERMISSIONS.get(role, set())
 
 
+def _deny(user: dict, permission: str):
+    log_action(user, "ACCESS", "PERMISSION_DENIED",
+               f"{user['employee_id']} was refused '{permission}' on {client_info().get('path') or '?'}.",
+               status="FAILED", metadata={"permission": permission, "path": client_info().get("path")})
+    raise HTTPException(status_code=403, detail="You do not have permission to perform this action.")
+
+
 def requires(permission: str):
     """Dependency factory: `user = Depends(requires("dashboard"))`."""
 
     def dependency(user: dict = Depends(current_user)) -> dict:
         if permission not in permissions_for(user["role"]):
-            raise HTTPException(
-                status_code=403,
-                detail="You do not have permission to perform this action.",
-            )
+            _deny(user, permission)
         return user
 
     return dependency
@@ -173,10 +353,7 @@ def requires_role(*roles: str):
 
     def dependency(user: dict = Depends(current_user)) -> dict:
         if user["role"] not in allowed:
-            raise HTTPException(
-                status_code=403,
-                detail="You do not have permission to perform this action.",
-            )
+            _deny(user, "role:" + "/".join(sorted(allowed)))
         return user
 
     return dependency
@@ -185,6 +362,24 @@ def requires_role(*roles: str):
 # --------------------------------------------------------------------------- #
 # Shared helpers
 # --------------------------------------------------------------------------- #
+def utc_text(value):
+    """Any stored time as 'YYYY-MM-DDTHH:MM:SSZ' for the client.
+
+    The database holds three formats: '...Z' (UTC, sessions and sign-ins),
+    'YYYY-MM-DD HH:MM:SS' (SQLite CURRENT_TIMESTAMP, UTC) and
+    'YYYY-MM-DDTHH:MM:SS' (now_iso, server-local time).
+    """
+    if not value:
+        return value
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc) if " " in str(value) else stamp.astimezone()
+    return stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def now_iso() -> str:
     return datetime.now().replace(microsecond=0).isoformat()
 
@@ -194,13 +389,14 @@ def today_iso() -> str:
 
 
 def log_action(user, module, action, description, target_type=None, target_id=None,
-               status="SUCCESS", metadata=None):
+               status="SUCCESS", metadata=None, ip=None):
     connection = get_connection()
     try:
         connection.execute(
             """INSERT INTO audit_logs
-               (timestamp,employee_id,role,module,action,target_type,target_id,description,status,metadata)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+               (timestamp,employee_id,role,module,action,target_type,target_id,description,status,
+                metadata,ip_address)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 now_iso(),
                 (user or {}).get("employee_id"),
@@ -209,6 +405,7 @@ def log_action(user, module, action, description, target_type=None, target_id=No
                 None if target_id is None else str(target_id),
                 description, status,
                 json.dumps(metadata or {}, ensure_ascii=False, default=str),
+                ip or client_info().get("ip"),
             ),
         )
         connection.commit()

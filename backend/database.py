@@ -34,21 +34,24 @@ RETIRED_ROLES = ("crew",)
 #   comms_admin      delivery logs, retry/cancel, communication settings
 #   comms_templates  email templates
 #   smtp_view / smtp_manage / smtp_test   SMTP settings (manage = credentials)
+#   security_view    sign-in analytics dashboard and the security audit log
+#   alerts_handle    acknowledge a stock alert sent to you, from the notification bell
+# The Communication Manager and SMTP Settings belong to the administrator alone
+# (7.5). Other roles still receive alerts through recipient groups (in-app bell
+# and e-mail); they just cannot configure them.
 ROLE_PERMISSIONS = {
     # The OBS iPad account. Forms the duty group, sells, finishes the sector,
     # declares leftover stock and files the post-flight cabin reports.
     "crew_supervisor": {"crew", "sync", "reconcile_submit", "flight_reports"},
     # `groups` is read-only visibility of the duty groups the crew formed.
     # Nobody on the ground builds them any more.
-    "inventory": {"inventory", "warehouse", "groups", "sync",
-                  "comms_view", "comms_rules"},
+    "inventory": {"inventory", "warehouse", "groups", "sync", "alerts_handle"},
     # The inventory supervisor reconciles what the crew sold against what came
     # back, so they read the sales ledger and may correct a mis-keyed line.
     "inventory_supervisor": {
         "inventory", "warehouse", "warehouse_approve", "bundles",
         "groups", "stock_add", "reconcile_approve", "sync",
-        "sales_view", "sales_edit",
-        "comms_view", "comms_rules", "comms_groups", "comms_item_settings",
+        "sales_view", "sales_edit", "alerts_handle",
     },
     # Management oversee and correct; they do not sell, so no crew sales screen.
     # `groups_manage` is the post-lock amendment of a duty group, with remarks.
@@ -56,17 +59,17 @@ ROLE_PERMISSIONS = {
         "inventory", "warehouse", "bundles", "groups", "groups_manage",
         "stock_add", "dashboard", "sync", "logs", "rates", "rates_edit",
         "sales_view", "sales_edit", "reports", "warehouse_approve",
-        "reconcile_approve", "reconcile_submit", "flight_reports", "reports_review",
-        "comms_view", "comms_rules", "comms_rules_all", "comms_groups", "comms_admin", "comms_item_settings",
-        "comms_templates", "smtp_view",
+        "reconcile_approve", "reconcile_submit", "flight_reports", "reports_review", "alerts_handle",
     },
     # Finance set rates and read performance. No sales, commission or sync.
     "finance": {"rates", "rates_edit", "dashboard", "reports"},
     # The administrator owns system configuration, including SMTP credentials.
-    "admin": {"users", "crew_members", "smtp_view", "smtp_manage", "smtp_test",
+    "admin": {"users", "crew_members", "smtp_view", "smtp_manage", "smtp_test", "alerts_handle",
               "comms_admin", "comms_templates",
               # Stock Alert Settings: see and configure alerts (7.4).
-              "comms_view", "comms_rules", "comms_rules_all", "comms_groups", "comms_item_settings"},
+              "comms_view", "comms_rules", "comms_rules_all", "comms_groups", "comms_item_settings",
+              # Sign-in analytics and the security audit log (7.5).
+              "security_view"},
 }
 
 # --------------------------------------------------------------------------- #
@@ -94,8 +97,8 @@ DUTY_GROUP_AMEND_LIMIT = 1
 # --------------------------------------------------------------------------- #
 # Sign-in protection
 # --------------------------------------------------------------------------- #
-# Consecutive wrong passwords before the account is locked. Only an
-# administrator can unlock it; the count resets on a successful sign-in.
+# Default for consecutive wrong passwords before a temporary lock. The live
+# values are app_settings lockout_attempts / lockout_minutes (7.5).
 LOGIN_ATTEMPT_LIMIT = 5
 
 # --------------------------------------------------------------------------- #
@@ -852,6 +855,10 @@ def initialize_database():
         # SMTP settings, Communication Manager and stock alerts.
         from comms_schema import initialize_comms
         initialize_comms(connection, _add_column)
+
+        # Accounts and sign-in security (7.5).
+        from auth_schema import initialize_auth
+        initialize_auth(connection, _add_column, demo_ids=[u[0] for u in DEMO_USERS])
 
         connection.commit()
     finally:

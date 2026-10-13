@@ -5,7 +5,7 @@ import { Text } from '../text';
 import { api } from '../api';
 import { usePaged } from '../paging';
 import { COLORS, styles } from '../theme';
-import { Banner, Button, Card, Chip, PageHeader, Pagination } from '../ui';
+import { Banner, Button, Card, Chip, Notice, PageHeader, Pagination } from '../ui';
 import { Dot, SeverityPill, StatusPill, has, when } from './comms/shared';
 
 /** The signed-in user's own in-app notifications. */
@@ -43,6 +43,19 @@ export default function NotificationsScreen({ user, online, openAlert, onChange 
   }
 
   const canOpen = has(user, 'comms_view');
+  // Everyone else who receives alerts can still acknowledge them here.
+  const canAck = !canOpen && has(user, 'alerts_handle');
+
+  async function acknowledge(item) {
+    try {
+      await api(`/communication/alerts/${item.incident_id}/acknowledge`, { method: 'POST', body: { comment: null } });
+      setMessage({ tone: 'success', text: 'Alert acknowledged. Escalation stops for this alert.' });
+      markRead(item);
+      pager.reload?.();
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+  }
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
@@ -52,7 +65,7 @@ export default function NotificationsScreen({ user, online, openAlert, onChange 
         right={data.unread > 0 ? <Button title="Mark all read" tone="secondary" small onPress={markAll} /> : null}
       />
       {!online && <Banner tone="warning" message="Notifications need a connection." />}
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
 
       <View style={[styles.wrap, { marginBottom: 12 }]}>
         <Chip label="All" active={filter === 'all'} onPress={() => setFilter('all')} />
@@ -93,6 +106,9 @@ export default function NotificationsScreen({ user, online, openAlert, onChange 
               <Text style={styles.mono}>{when(item.created_at)}</Text>
               <View style={[styles.row, styles.gap8]}>
                 {!!item.incident_status && <StatusPill status={item.incident_status} />}
+                {canAck && !!item.incident_id && ['OPEN', 'ESCALATED'].includes(item.incident_status) && (
+                  <Button title="Acknowledge" tone="success" small onPress={() => acknowledge(item)} />
+                )}
                 {canOpen && !!item.incident_id && (
                   <Button title="Open alert" tone="ghost" small
                     onPress={() => { markRead(item); openAlert?.(item.incident_id); }} />

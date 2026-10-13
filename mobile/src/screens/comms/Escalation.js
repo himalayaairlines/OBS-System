@@ -5,7 +5,7 @@ import { Text } from '../../text';
 import { api } from '../../api';
 import { confirm } from '../../dialog';
 import { COLORS, ROLE_LABELS, styles } from '../../theme';
-import { Banner, Button, Card, Chip, Field, OptionModal, Pill, SectionTitle, Select } from '../../ui';
+import { Banner, Button, Card, Chip, Field, Notice, OptionModal, Pill, SectionTitle, Select } from '../../ui';
 import { RECIPIENT_TYPE_LABELS, Toggle, has, recipientLabel } from './shared';
 
 const EMPTY = { name: '', description: '', active: true, steps: [{ step_no: 1, after_minutes: '240', recipient_type: 'USER', recipient_value: null }] };
@@ -75,7 +75,7 @@ export default function Escalation({ user, options, reloadOptions }) {
 
   return (
     <>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       {form && (
         <Card>
           <SectionTitle title={form.id ? 'Edit escalation policy' : 'New escalation policy'}

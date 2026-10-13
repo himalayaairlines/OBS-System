@@ -1096,7 +1096,8 @@ def _act(incident_id, user, fn):
 
 
 @router.post("/alerts/{incident_id}/acknowledge")
-def acknowledge(incident_id: int, data: CommentIn, user: dict = Depends(requires("comms_view"))):
+def acknowledge(incident_id: int, data: CommentIn,
+                user: dict = Depends(requires_any("comms_view", "alerts_handle"))):
     def run(connection, incident):
         if incident["status"] not in ("OPEN", "ESCALATED"):
             raise HTTPException(status_code=400, detail=f"This alert is {incident['status'].lower()}.")

@@ -5,7 +5,7 @@ import { Text } from '../../text';
 import { api } from '../../api';
 import { usePaged } from '../../paging';
 import { COLORS, ROLE_LABELS, styles } from '../../theme';
-import { Banner, Button, Card, Chip, Field, KeyValue, OptionModal, Pagination, SectionTitle } from '../../ui';
+import { Banner, Button, Card, Chip, Field, KeyValue, Notice, OptionModal, Pagination, SectionTitle } from '../../ui';
 import { SeverityPill, StatusPill, qty, when } from './shared';
 
 export default function Alerts({ options, focusId, clearFocus }) {
@@ -53,7 +53,7 @@ export default function Alerts({ options, focusId, clearFocus }) {
     const live = !['RESOLVED'].includes(d.status);
     return (
       <>
-        {message && <Banner tone={message.tone} message={message.text} />}
+        {message && <Notice message={message} />}
         <Card>
           <SectionTitle
             title={`#${d.id} ${d.product_name}`}
@@ -162,7 +162,7 @@ export default function Alerts({ options, focusId, clearFocus }) {
 
   return (
     <>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       <Card>
         <SectionTitle title={`Alerts (${data.total})`} description="Raised only by active rules. Sorted by severity." />
         <View style={[styles.wrap, { marginBottom: 8 }]}>

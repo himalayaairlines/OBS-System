@@ -6,8 +6,8 @@ import { api, cached, enqueueSale, orderRef, saveDutyGroup, writeCache } from '.
 import { confirm, notify } from '../dialog';
 import { COLORS, money, npr, styles } from '../theme';
 import {
-  Banner, Button, Card, Field, Metric, OptionModal, PageHeader,
-  Pill, SearchBar, SeatMapModal, SectionTitle, Select,
+  Banner, Button, Card, Field, Metric, Notice, OptionModal, PageHeader, Pill, SearchBar,
+  SeatMapModal, SectionTitle, Select,
 } from '../ui';
 
 // Mirrors DUTY_GROUP_SIZE in the backend. The server refuses anything else.
@@ -524,7 +524,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports })
           message="Showing the last saved copy of flights, products and rates. Connect before the flight to refresh."
         />
       )}
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
 
       <Card>
         <SectionTitle title="Flight" description="Only flights assigned to this device are listed." />

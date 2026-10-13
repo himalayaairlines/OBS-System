@@ -8,8 +8,8 @@ import { api, downloadReport } from '../api';
 import { BarChart, DonutChart, LineChartView, ProgressBar } from '../charts';
 import { COLORS, MONTHS, compact, npr, styles } from '../theme';
 import {
-  Banner, Button, Card, Chip, KeyValue, Metric, OptionModal,
-  PageHeader, Pill, SectionTitle, Select,
+  Banner, Button, Card, Chip, KeyValue, Metric, Notice, OptionModal, PageHeader, Pill,
+  SectionTitle, Select,
 } from '../ui';
 
 const YEARS = Array.from({ length: 6 }, (_, i) => new Date().getFullYear() - i);
@@ -68,7 +68,7 @@ export default function DashboardScreen({ user }) {
     return (
       <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
         <PageHeader title="Revenue Dashboard" />
-        {message && <Banner tone={message.tone} message={message.text} />}
+        {message && <Notice message={message} />}
         {failed ? (
           <>
             <Text style={styles.empty}>The dashboard could not be loaded.</Text>
@@ -102,7 +102,7 @@ export default function DashboardScreen({ user }) {
         description={`${periodLabel}${filter.destination ? ` · ${filter.destination}` : ' · all destinations'}`}
         right={<Pill label={`${data.flight_count} flights`} tone="info" />}
       />
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
 
       <Card tight>
         <View style={styles.wrap}>

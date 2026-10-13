@@ -11,6 +11,7 @@ import { API_BASE, KEYS, api } from '../api';
 import { ws } from '../fonts';
 import { LANGUAGES, LOGIN_TEXT } from '../i18n/login';
 import { Banner } from '../ui';
+import { PasswordRules, passwordOk } from '../password';
 
 const LANGUAGE_KEY = 'obs.loginLanguage';
 const C = {
@@ -175,7 +176,7 @@ function LinkButton({ title, onPress, align = 'flex-end' }) {
 }
 
 /* ------------------------------ screen ------------------------------ */
-export default function LoginScreen({ onLogin, notify }) {
+export default function LoginScreen({ onLogin, notify, resetToken, onResetDone }) {
   const { width } = useWindowDimensions();
   const insets = useSafeAreaInsets();
   const wide = width >= 900;
@@ -188,36 +189,131 @@ export default function LoginScreen({ onLogin, notify }) {
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
+  const [info, setInfo] = useState('');
   const [busy, setBusy] = useState(false);
   const passwordRef = useRef(null);
+  // signin | otp | forgot | recovery | reset
+  const [mode, setMode] = useState(resetToken ? 'reset' : 'signin');
 
-  // Break-glass reset for an administrator who is locked out or has forgotten
-  // the password. Only an administrator can unlock accounts, so without this
-  // one forgotten password would strand the whole system.
-  const [recovering, setRecovering] = useState(false);
+  // Two-factor sign-in: the code challenge from /login.
+  const [otp, setOtp] = useState(null);
+  const [code, setCode] = useState('');
+  const [clock, setClock] = useState(Date.now());
+
+  // Reset / invitation link opened in the browser.
+  const [link, setLink] = useState(null);
+  const [newPassword, setNewPassword] = useState('');
+  const [repeatPassword, setRepeatPassword] = useState('');
+  const [resetDone, setResetDone] = useState(null);
+
+  // Break-glass administrator reset, shown only when the server has a recovery code configured.
+  const [recoveryAvailable, setRecoveryAvailable] = useState(false);
   const [recovery, setRecovery] = useState({ employee_id: '', recovery_code: '', new_password: '', confirm_password: '' });
   const [recoveryMessage, setRecoveryMessage] = useState(null);
   const setRecoveryField = (key, value) => setRecovery((r) => ({ ...r, [key]: value }));
 
   useEffect(() => {
     AsyncStorage.getItem(LANGUAGE_KEY).then((saved) => { if (LOGIN_TEXT[saved]) setLang(saved); }).catch(() => {});
+    api('/admin-recovery', { auth: false }).then((r) => setRecoveryAvailable(!!r.available)).catch(() => {});
   }, []);
 
-  function changeLanguage(code) {
-    setLang(code);
-    AsyncStorage.setItem(LANGUAGE_KEY, code).catch(() => {});
+  useEffect(() => {
+    if (!resetToken) return;
+    api(`/password/reset-info?token=${encodeURIComponent(resetToken)}`, { auth: false })
+      .then(setLink)
+      .catch((err) => setError(err.message));
+  }, [resetToken]);
+
+  // One-second tick for the code countdowns.
+  useEffect(() => {
+    if (mode !== 'otp') return undefined;
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [mode]);
+
+  function changeLanguage(code_) {
+    setLang(code_);
+    AsyncStorage.setItem(LANGUAGE_KEY, code_).catch(() => {});
+  }
+
+  function go(next) {
+    setError('');
+    setInfo('');
+    setMode(next);
+  }
+
+  async function finish(session) {
+    await AsyncStorage.setItem(KEYS.session, JSON.stringify(session));
+    onLogin(session);
   }
 
   async function submit() {
     setError('');
-    if (!employeeId.trim() || !password) return setError(t.missing);
+    if (!employeeId.trim() || !password) return setError(t.missingId);
     setBusy(true);
     try {
-      const session = await api('/login', {
-        method: 'POST', auth: false, body: { employee_id: employeeId.trim(), password },
+      const result = await api('/login', {
+        method: 'POST', auth: false, body: { identifier: employeeId.trim(), password },
       });
-      await AsyncStorage.setItem(KEYS.session, JSON.stringify(session));
-      onLogin(session);
+      if (result.otp_required) {
+        setOtp({ ...result, startedAt: Date.now() });
+        setCode('');
+        setPassword('');
+        go('otp');
+      } else {
+        await finish(result);
+      }
+    } catch (err) {
+      setError(err.message);
+    }
+    setBusy(false);
+  }
+
+  async function verify() {
+    setError('');
+    setBusy(true);
+    try {
+      await finish(await api('/login/verify', { method: 'POST', auth: false, body: { challenge: otp.challenge, code } }));
+    } catch (err) {
+      setError(err.message);
+    }
+    setBusy(false);
+  }
+
+  async function resend() {
+    setError('');
+    try {
+      const result = await api('/login/resend', { method: 'POST', auth: false, body: { challenge: otp.challenge } });
+      setOtp({ ...result, startedAt: Date.now() });
+      setCode('');
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function sendReset() {
+    setError('');
+    if (!employeeId.trim()) return setError(t.forgotNeedId);
+    setBusy(true);
+    try {
+      const result = await api('/password/forgot', { method: 'POST', auth: false, body: { identifier: employeeId.trim() } });
+      setInfo(result.detail);
+    } catch (err) {
+      setError(err.message);
+    }
+    setBusy(false);
+  }
+
+  async function saveReset() {
+    setError('');
+    if (newPassword !== repeatPassword) return setError(t.mismatch);
+    setBusy(true);
+    try {
+      const result = await api('/password/reset', {
+        method: 'POST', auth: false,
+        body: { token: resetToken, new_password: newPassword, confirm_password: repeatPassword },
+      });
+      setResetDone(result.detail);
     } catch (err) {
       setError(err.message);
     }
@@ -229,7 +325,6 @@ export default function LoginScreen({ onLogin, notify }) {
     if (!recovery.employee_id.trim() || !recovery.recovery_code.trim()) {
       return setRecoveryMessage({ tone: 'danger', text: t.recMissing });
     }
-    if (recovery.new_password.length < 4) return setRecoveryMessage({ tone: 'danger', text: t.recShort });
     if (recovery.new_password !== recovery.confirm_password) {
       return setRecoveryMessage({ tone: 'danger', text: t.recMismatch });
     }
@@ -247,9 +342,8 @@ export default function LoginScreen({ onLogin, notify }) {
       });
       setEmployeeId(result.employee_id);
       setPassword('');
-      setRecovering(false);
       setRecovery({ employee_id: '', recovery_code: '', new_password: '', confirm_password: '' });
-      setError('');
+      go('signin');
       notify?.({ title: t.signIn, message: t.recDone(result.employee_id) });
     } catch (err) {
       setRecoveryMessage({ tone: 'danger', text: err.message });
@@ -318,73 +412,177 @@ export default function LoginScreen({ onLogin, notify }) {
   );
 
   /* ------------------------------ form ------------------------------ */
-  const card = (
-    <View style={{
-      width: '100%', maxWidth: 480, backgroundColor: C.card, borderRadius: 18, borderWidth: 1, borderColor: C.border,
-      padding: tablet ? 38 : 24,
-      shadowColor: '#0A1A3F', shadowOpacity: 0.06, shadowRadius: 24, shadowOffset: { width: 0, height: 8 }, elevation: 2,
-    }}>
-      {!recovering ? (
-        <>
-          <Text accessibilityRole="header" style={[ws(700), { fontSize: 28, color: C.text }]}>{t.signIn}</Text>
-          <Text style={[ws(400), { fontSize: 16, color: C.muted, lineHeight: 25, marginTop: 8, marginBottom: 26 }]}>
-            {t.signInSub}
+  const title = (text) => <Text accessibilityRole="header" style={[ws(700), { fontSize: 26, color: C.text }]}>{text}</Text>;
+  const sub = (text) => (
+    <Text style={[ws(400), { fontSize: 15.5, color: C.muted, lineHeight: 24, marginTop: 8, marginBottom: 24 }]}>{text}</Text>
+  );
+  const eye = (
+    <Pressable onPress={() => setShowPassword((v) => !v)} hitSlop={8}
+      style={{ paddingHorizontal: 14, paddingVertical: 12 }}
+      accessibilityRole="button" accessibilityLabel={showPassword ? t.hide : t.show}>
+      <EyeIcon open={showPassword} />
+    </Pressable>
+  );
+  const otpLeft = otp ? Math.max(0, otp.expires_in - Math.floor((clock - otp.startedAt) / 1000)) : 0;
+  const resendLeft = otp ? Math.max(0, otp.resend_in - Math.floor((clock - otp.startedAt) / 1000)) : 0;
+  const mmss = (secs) => `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+  const rulesLabels = { length: t.ruleLength, mix: t.ruleMix, personal: t.ruleName };
+
+  let content;
+  if (mode === 'otp' && otp) {
+    content = (
+      <>
+        {title(t.otpTitle)}
+        {sub(t.otpIntro(otp.email || ''))}
+        {!!error && <Banner tone="danger" message={error} />}
+        <Input
+          label={t.otpLabel}
+          value={code}
+          onChangeText={(v) => setCode(v.replace(/[^0-9]/g, '').slice(0, 6))}
+          keyboardType="number-pad"
+          autoComplete="one-time-code"
+          textContentType="oneTimeCode"
+          placeholder="••••••"
+          maxLength={6}
+          autoFocus
+          onSubmitEditing={() => code.length === 6 && verify()}
+        />
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: -8, marginBottom: 18 }}>
+          <Text style={[ws(400), { fontSize: 13.5, color: otpLeft ? C.muted : '#B3261E' }]}>
+            {otpLeft ? t.otpValid(mmss(otpLeft)) : t.otpExpired}
           </Text>
-          {!!error && <Banner tone="danger" message={error} />}
-          <Input
-            label={t.employeeId}
-            value={employeeId}
-            onChangeText={setEmployeeId}
-            autoCapitalize="characters"
-            autoCorrect={false}
-            autoComplete="username"
-            textContentType="username"
-            placeholder="CREW001"
-            returnKeyType="next"
-            onSubmitEditing={() => passwordRef.current?.focus()}
-          />
-          <Input
-            label={t.password}
-            inputRef={passwordRef}
-            value={password}
-            onChangeText={setPassword}
-            secureTextEntry={!showPassword}
-            autoCapitalize="none"
-            autoComplete="current-password"
-            textContentType="password"
-            placeholder="••••••••"
-            returnKeyType="go"
-            onSubmitEditing={submit}
-            right={(
-              <Pressable onPress={() => setShowPassword((s) => !s)} hitSlop={8}
-                style={{ paddingHorizontal: 14, paddingVertical: 12 }}
-                accessibilityRole="button" accessibilityLabel={showPassword ? t.hide : t.show}>
-                <EyeIcon open={showPassword} />
+          {resendLeft > 0
+            ? <Text style={[ws(400), { fontSize: 13.5, color: C.faint }]}>{t.resendIn(resendLeft)}</Text>
+            : (
+              <Pressable onPress={resend} accessibilityRole="link" hitSlop={6}>
+                <Text style={[ws(600), { fontSize: 13.5, color: C.link }]}>{t.resend}</Text>
               </Pressable>
             )}
-          />
-          <LinkButton title={t.forgot} onPress={() => { setRecovering(true); setRecoveryMessage(null); }} />
-          <PrimaryButton title={busy ? t.signingIn : t.continue} onPress={submit} disabled={busy} />
-        </>
-      ) : (
-        <>
-          <Text accessibilityRole="header" style={[ws(700), { fontSize: 22, color: C.text }]}>{t.recTitle}</Text>
-          <Text style={[ws(400), { fontSize: 14.5, color: C.muted, lineHeight: 22, marginTop: 8, marginBottom: 22 }]}>
-            {t.recIntro}
+        </View>
+        <PrimaryButton title={busy ? t.verifying : t.verify} onPress={verify} disabled={busy || code.length !== 6 || !otpLeft} />
+        <Text style={[ws(400), { fontSize: 13, color: C.faint, lineHeight: 20, marginTop: 16 }]}>{t.otpHelp}</Text>
+      </>
+    );
+  } else if (mode === 'forgot') {
+    content = (
+      <>
+        {title(t.forgotTitle)}
+        {sub(t.forgotIntro)}
+        {!!error && <Banner tone="danger" message={error} />}
+        {!!info && <Banner tone="success" message={info} />}
+        <Input label={t.identifier} value={employeeId} onChangeText={setEmployeeId} autoCapitalize="none"
+          autoCorrect={false} autoComplete="username" keyboardType="email-address"
+          placeholder="name@himalaya-airlines.com" onSubmitEditing={sendReset} />
+        <PrimaryButton title={busy ? t.sending : t.sendLink} onPress={sendReset} disabled={busy || !employeeId.trim()} />
+        {recoveryAvailable && (
+          <>
+            <View style={{ height: 14 }} />
+            <LinkButton align="center" title={t.useRecovery} onPress={() => { go('recovery'); setRecoveryMessage(null); }} />
+          </>
+        )}
+      </>
+    );
+  } else if (mode === 'reset') {
+    const person = link ? { name: link.name, employee_id: link.employee_id, email: link.email } : {};
+    content = (
+      <>
+        {title(link?.kind === 'INVITE' ? t.inviteTitle : t.resetTitle)}
+        {link ? (
+          <Text style={[ws(400), { fontSize: 15.5, color: C.muted, lineHeight: 24, marginTop: 8, marginBottom: 24 }]}>
+            {t.resetFor} <Text style={[ws(700), { color: C.text }]}>{link.name}</Text>
+            {link.email ? ` (${link.email})` : ''}
           </Text>
-          {!!recoveryMessage && <Banner tone={recoveryMessage.tone} message={recoveryMessage.text} />}
-          <Input label={t.employeeId} value={recovery.employee_id} autoCapitalize="characters" autoCorrect={false}
-            onChangeText={(v) => setRecoveryField('employee_id', v)} placeholder="ADMIN001" />
-          <Input label={t.recoveryCode} value={recovery.recovery_code} secureTextEntry autoCapitalize="characters"
-            onChangeText={(v) => setRecoveryField('recovery_code', v)} />
-          <Input label={t.newPassword} value={recovery.new_password} secureTextEntry autoComplete="new-password"
-            onChangeText={(v) => setRecoveryField('new_password', v)} />
-          <Input label={t.confirmPassword} value={recovery.confirm_password} secureTextEntry autoComplete="new-password"
-            onChangeText={(v) => setRecoveryField('confirm_password', v)} onSubmitEditing={submitRecovery} />
-          <PrimaryButton title={busy ? t.saving : t.setPassword} onPress={submitRecovery} disabled={busy} />
-          <View style={{ height: 16 }} />
-          <LinkButton align="center" title={t.back} onPress={() => { setRecovering(false); setRecoveryMessage(null); }} />
-        </>
+        ) : !error && sub(t.checkingLink)}
+        {!!error && <Banner tone="danger" message={error} />}
+        {resetDone ? (
+          <>
+            <Banner tone="success" message={resetDone} />
+            <PrimaryButton title={t.signIn} onPress={() => { onResetDone?.(); setResetDone(null); go('signin'); }} />
+          </>
+        ) : link && (
+          <>
+            <Input label={t.newPassword} value={newPassword} onChangeText={setNewPassword}
+              secureTextEntry={!showPassword} autoComplete="new-password" textContentType="newPassword" right={eye} />
+            <PasswordRules password={newPassword} person={person} labels={rulesLabels} />
+            <Input label={t.repeatPassword} value={repeatPassword} onChangeText={setRepeatPassword}
+              secureTextEntry={!showPassword} autoComplete="new-password" onSubmitEditing={saveReset} />
+            <PrimaryButton title={busy ? t.saving : t.savePassword} onPress={saveReset}
+              disabled={busy || !passwordOk(newPassword, person) || !repeatPassword} />
+          </>
+        )}
+      </>
+    );
+  } else if (mode === 'recovery') {
+    content = (
+      <>
+        {title(t.recTitle)}
+        {sub(t.recIntro)}
+        {!!recoveryMessage && <Banner tone={recoveryMessage.tone} message={recoveryMessage.text} />}
+        <Input label={t.employeeId} value={recovery.employee_id} autoCapitalize="characters" autoCorrect={false}
+          onChangeText={(v) => setRecoveryField('employee_id', v)} placeholder="ADMIN001" />
+        <Input label={t.recoveryCode} value={recovery.recovery_code} secureTextEntry autoCapitalize="characters"
+          onChangeText={(v) => setRecoveryField('recovery_code', v)} />
+        <Input label={t.newPassword} value={recovery.new_password} secureTextEntry autoComplete="new-password"
+          onChangeText={(v) => setRecoveryField('new_password', v)} />
+        <PasswordRules password={recovery.new_password} person={{ employee_id: recovery.employee_id }} labels={rulesLabels} />
+        <Input label={t.confirmPassword} value={recovery.confirm_password} secureTextEntry autoComplete="new-password"
+          onChangeText={(v) => setRecoveryField('confirm_password', v)} onSubmitEditing={submitRecovery} />
+        <PrimaryButton title={busy ? t.saving : t.setPassword} onPress={submitRecovery} disabled={busy} />
+      </>
+    );
+  } else {
+    content = (
+      <>
+        {title(t.signIn)}
+        {sub(t.signInSub2)}
+        {!!error && <Banner tone="danger" message={error} />}
+        <Input
+          label={t.identifier}
+          value={employeeId}
+          onChangeText={setEmployeeId}
+          autoCapitalize="none"
+          autoCorrect={false}
+          autoComplete="username"
+          textContentType="username"
+          placeholder="CREW001 / name@himalaya-airlines.com"
+          returnKeyType="next"
+          onSubmitEditing={() => passwordRef.current?.focus()}
+        />
+        <Input
+          label={t.password}
+          inputRef={passwordRef}
+          value={password}
+          onChangeText={setPassword}
+          secureTextEntry={!showPassword}
+          autoCapitalize="none"
+          autoComplete="current-password"
+          textContentType="password"
+          placeholder="••••••••"
+          returnKeyType="go"
+          onSubmitEditing={submit}
+          right={eye}
+        />
+        <LinkButton title={t.forgot} onPress={() => go('forgot')} />
+        <PrimaryButton title={busy ? t.signingIn : t.continue} onPress={submit} disabled={busy} />
+        <Text style={[ws(400), { fontSize: 12.5, color: C.faint, lineHeight: 19, marginTop: 14 }]}>{t.lockHint}</Text>
+      </>
+    );
+  }
+
+  const card = (
+    <View style={{ width: '100%', maxWidth: 480 }}>
+      <View style={{
+        width: '100%', backgroundColor: C.card, borderRadius: 18, borderWidth: 1, borderColor: C.border,
+        padding: tablet ? 38 : 24,
+        shadowColor: '#0A1A3F', shadowOpacity: 0.06, shadowRadius: 24, shadowOffset: { width: 0, height: 8 }, elevation: 2,
+      }}>
+        {content}
+      </View>
+      {mode !== 'signin' && !(mode === 'reset' && resetDone) && (
+        <View style={{ marginTop: 18 }}>
+          <LinkButton align="center" title={mode === 'otp' ? t.otherAccount : t.backToSignIn}
+            onPress={() => { if (mode === 'reset') onResetDone?.(); setOtp(null); go('signin'); }} />
+        </View>
       )}
     </View>
   );

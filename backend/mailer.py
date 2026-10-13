@@ -297,6 +297,11 @@ def deliver_due(connect, owner: str, limit: int = 20, job_ids: list[int] | None 
                 outcome = "FAILED"
                 error = f"Gave up after {job['attempts']} attempts. Last error: {error}"
             with immediate(connection):
+                if job["kind"] == "SECURITY" and outcome in ("ACCEPTED", "FAILED"):
+                    # Sign-in codes and reset links must not sit in the delivery log.
+                    connection.execute(
+                        "UPDATE notification_jobs SET body_text=?, body_html=NULL WHERE id=?",
+                        ("(Security message. The content was removed after sending.)", job["id"]))
                 connection.execute(
                     """UPDATE notification_jobs SET status=?, last_error=?, smtp_response=COALESCE(?, smtp_response),
                            accepted_at=?, next_attempt_at=?, locked_until=NULL, lock_owner=NULL,

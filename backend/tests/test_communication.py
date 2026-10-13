@@ -33,6 +33,7 @@ os.environ["OBS_SECRET_KEY"] = Fernet.generate_key().decode()
 import uvicorn  # noqa: E402
 
 import alert_engine  # noqa: E402
+import database  # noqa: E402
 import comms_worker  # noqa: E402
 import mailer  # noqa: E402
 import main  # noqa: E402
@@ -44,10 +45,26 @@ PORT = free_port()
 BASE = f"http://127.0.0.1:{PORT}"
 _server = None
 TOKENS = {}
+PASSWORDS = {"INV777": "Stock#Count2026"}
+
+
+# In the shipped matrix only the administrator configures stock alerts (7.5).
+# The alert engine still supports rules owned by several people, so these tests
+# lend the pre-7.5 Communication Manager rights to the other roles to exercise
+# ownership and recipient rules with distinct users. Restored afterwards.
+DELEGATED = {
+    "inventory": {"comms_view", "comms_rules"},
+    "inventory_supervisor": {"comms_view", "comms_rules", "comms_groups", "comms_item_settings"},
+    "management": {"comms_view", "comms_rules", "comms_rules_all", "comms_groups", "comms_admin",
+                   "comms_item_settings", "comms_templates", "smtp_view"},
+}
+SHIPPED = {role: set(perms) for role, perms in database.ROLE_PERMISSIONS.items()}
 
 
 def setUpModule():
     global _server
+    for role, extra in DELEGATED.items():
+        database.ROLE_PERMISSIONS[role] |= extra
     config = uvicorn.Config(main.app, host="127.0.0.1", port=PORT, log_level="warning")
     _server = uvicorn.Server(config)
     threading.Thread(target=_server.run, daemon=True).start()
@@ -61,6 +78,8 @@ def setUpModule():
 
 
 def tearDownModule():
+    for role, perms in SHIPPED.items():
+        database.ROLE_PERMISSIONS[role] = perms
     if _server:
         _server.should_exit = True
 
@@ -68,7 +87,8 @@ def tearDownModule():
 def call(method, path, who=None, body=None):
     headers = {"Content-Type": "application/json"}
     if who:
-        headers["Authorization"] = f"Bearer {token(who)}"
+        # A raw session token (long) or an Employee ID to sign in as.
+        headers["Authorization"] = f"Bearer {who if len(who) > 30 else token(who)}"
     data = json.dumps(body).encode() if body is not None else None
     request = urllib.request.Request(f"{BASE}{path}", data=data, method=method, headers=headers)
     try:
@@ -80,7 +100,7 @@ def call(method, path, who=None, body=None):
 
 def token(who):
     if who not in TOKENS:
-        status, body = call("POST", "/login", body={"employee_id": who, "password": "1234"})
+        status, body = call("POST", "/login", body={"employee_id": who, "password": PASSWORDS.get(who, "1234")})
         assert status == 200, body
         TOKENS[who] = body["token"]
     return TOKENS[who]
@@ -160,6 +180,9 @@ class Base(unittest.TestCase):
         connection.execute("UPDATE products SET active=1")
         connection.execute("UPDATE smtp_settings SET enabled=0 WHERE id=1")
         connection.execute("UPDATE app_settings SET value='' WHERE key='external_email_domains'")
+        # The demo password 1234 would otherwise force a password change first.
+        connection.execute("UPDATE app_settings SET value='0' WHERE key='require_strong_passwords'")
+        connection.execute("UPDATE users SET must_change_password=0, failed_attempts=0, locked_at=NULL, lock_reason=NULL")
         for key, value in (("alerts_enabled", "1"), ("allow_snooze_critical", "0"),
                            ("critical_ignores_business_hours", "0"), ("max_snooze_hours", "72")):
             connection.execute("UPDATE app_settings SET value=? WHERE key=?", (value, key))
@@ -694,7 +717,7 @@ class RegressionTests(Base):
         status, users = call("GET", "/users", "ADMIN001")
         self.assertIn("email", users[0])
         status, health = call("GET", "/health")
-        self.assertEqual(health["version"], "7.4")
+        self.assertEqual(health["version"], "7.5")
 
     def test_stock_movements_unchanged(self):
         before = q("SELECT quantity FROM main_inventory WHERE product_id=?", (self.p1,))[0]["quantity"]
@@ -802,7 +825,7 @@ class EndToEndTests(Base):
             self.assertEqual(status, 200)
             # 2-3. Administrator creates an inventory officer with an email address.
             status, officer = call("POST", "/users", "ADMIN001", {
-                "employee_id": "INV777", "name": "Test Officer", "password": "1234", "role": "inventory",
+                "employee_id": "INV777", "name": "Test Officer", "password": "Stock#Count2026", "role": "inventory",
                 "email": "officer@himalaya-airlines.com"})
             self.assertEqual(status, 200, officer)
             # 4-5. The officer logs in and creates a low-stock rule.
@@ -1267,6 +1290,282 @@ class StockAlertAcceptanceTests(Base):
             self.assertEqual(self.incidents(status="OPEN"), [])
         finally:
             smtp.stop()
+
+
+
+# --------------------------------------------------------------------------- #
+# 7.5 Accounts and sign-in security
+# --------------------------------------------------------------------------- #
+import email as _email  # noqa: E402
+import re as _re  # noqa: E402
+import urllib.parse as _urlparse  # noqa: E402
+
+
+def login_raw(identifier, password):
+    return call("POST", "/login", body={"identifier": identifier, "password": password})
+
+
+def set_setting(key, value):
+    connection = db()
+    connection.execute("UPDATE app_settings SET value=? WHERE key=?", (value, key))
+    connection.commit()
+    connection.close()
+
+
+def mail_text(message):
+    parsed = _email.message_from_string(message["data"])
+    parts = [p for p in parsed.walk() if p.get_content_type() == "text/plain"]
+    return parts[0].get_payload(decode=True).decode() if parts else message["data"]
+
+
+class AccountSecurityTests(Base):
+    STRONG = "Blue#Harbour77"
+
+    def setUp(self):
+        super().setUp()
+        TOKENS.clear()
+        connection = db()
+        for table in ("user_sessions", "auth_tokens"):
+            connection.execute(f"DELETE FROM {table}")
+        connection.execute("DELETE FROM users WHERE employee_id LIKE 'NEW%'")
+        connection.execute("UPDATE users SET two_factor=0, email_verified=0")
+        connection.commit()
+        connection.close()
+        set_setting("app_url", "https://obs.example.test")
+        set_setting("session_idle_minutes", "60")
+        self.smtp = FakeSMTP().start()
+        status, _ = call("PUT", "/settings/smtp", "ADMIN001", {
+            "enabled": True, "host": "127.0.0.1", "port": self.smtp.port, "security": "none",
+            "auth_enabled": True, "username": "obs", "password": "secret",
+            "sender_email": "obs@himalaya-airlines.com"})
+        assert status == 200
+        self.smtp.messages.clear()
+
+    def tearDown(self):
+        self.smtp.stop()
+
+    def test_communication_manager_is_admin_only(self):
+        config = {p for p in ("comms_view", "comms_rules", "comms_groups", "comms_admin", "comms_templates",
+                              "comms_item_settings", "smtp_view")}
+        for role, perms in SHIPPED.items():
+            if role != "admin":
+                self.assertFalse(perms & config, role)
+        self.assertLessEqual(config, SHIPPED["admin"])
+        # Recipients can still acknowledge alerts from the bell.
+        for role in ("inventory", "inventory_supervisor", "management"):
+            self.assertIn("alerts_handle", SHIPPED[role])
+
+    def test_admin_set_password_forces_change_except_shared_devices(self):
+        status, dev = call("POST", "/users", "ADMIN001", {
+            "employee_id": "NEWPAD1", "name": "OBS iPad 09", "password": self.STRONG, "role": "crew_supervisor"})
+        self.assertEqual(status, 200, dev)
+        base = {"name": dev["name"], "role": "crew_supervisor", "active": True}
+        status, view = call("PUT", f"/users/{dev['id']}", "ADMIN001", {**base, "password": "Cabin#Device2026"})
+        self.assertEqual(status, 200, view)
+        self.assertFalse(view["must_change_password"])
+        status, view = call("PUT", f"/users/{dev['id']}", "ADMIN001",
+                            {**base, "password": "Cabin#Device2027", "require_change": True})
+        self.assertTrue(view["must_change_password"])
+        status, person = call("POST", "/users", "ADMIN001", {
+            "employee_id": "NEWINV1", "name": "Sita Gurung", "password": self.STRONG, "role": "inventory"})
+        self.assertEqual(status, 200, person)
+        status, view = call("PUT", f"/users/{person['id']}", "ADMIN001",
+                            {"name": "Sita Gurung", "role": "inventory", "active": True, "password": "Stock#Count2031"})
+        self.assertTrue(view["must_change_password"])
+
+    def test_login_by_email_and_uniform_failures(self):
+        status, body = login_raw("isup@himalaya-airlines.com", "1234")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["employee_id"], "ISUP001")
+        unknown = login_raw("NOBODY99", "x")
+        wrong = login_raw("ISUP001", "wrong")
+        self.assertEqual(unknown, wrong)  # same status, same text: no account discovery
+        for _ in range(5):
+            login_raw("ISUP001", "wrong")
+        locked = login_raw("ISUP001", "1234")
+        self.assertEqual(locked, wrong)  # a locked account answers the same way
+        row = q("SELECT lock_reason FROM users WHERE employee_id='ISUP001'")[0]
+        self.assertEqual(row["lock_reason"], "AUTO")
+        # The temporary lock runs out on its own.
+        connection = db()
+        connection.execute("UPDATE users SET locked_at='2000-01-01T00:00:00Z' WHERE employee_id='ISUP001'")
+        connection.commit()
+        connection.close()
+        self.assertEqual(login_raw("ISUP001", "1234")[0], 200)
+        events = [r["action"] for r in q("SELECT action FROM audit_logs WHERE action IN "
+                                         "('LOGIN_FAILED','ACCOUNT_LOCKED','LOGIN_BLOCKED')")]
+        self.assertIn("ACCOUNT_LOCKED", events)
+        self.assertIn("LOGIN_BLOCKED", events)
+
+    def test_sessions_change_password_and_idle(self):
+        a = login_raw("INV001", "1234")[1]["token"]
+        b = login_raw("INV001", "1234")[1]["token"]
+        sessions = call("GET", "/account/sessions", b)[1]
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(sum(1 for s in sessions if s["current"]), 1)
+        status, body = call("POST", "/change-password", b, {"old_password": "1234", "new_password": self.STRONG,
+                                                             "confirm_password": self.STRONG})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["other_sessions_ended"], 1)
+        self.assertEqual(call("GET", "/me", a)[0], 401)
+        self.assertEqual(call("GET", "/me", b)[0], 200)
+        self.assertEqual(len(self.smtp.messages), 1)  # security notice to inv@
+        self.assertIn("was changed", mail_text(self.smtp.messages[0]))
+        # Idle timeout.
+        connection = db()
+        connection.execute("UPDATE user_sessions SET last_seen_at='2000-01-01T00:00:00Z'")
+        connection.commit()
+        connection.close()
+        self.assertEqual(call("GET", "/me", b)[0], 401)
+        # Put the demo password back for the other tests.
+        connection = db()
+        from security import hash_password
+        connection.execute("UPDATE users SET password=? WHERE employee_id='INV001'", (hash_password("1234"),))
+        connection.commit()
+        connection.close()
+
+    def test_revoke_other_devices_and_logout(self):
+        a = login_raw("MGT001", "1234")[1]["token"]
+        b = login_raw("MGT001", "1234")[1]["token"]
+        self.assertEqual(call("POST", "/account/sessions/revoke-others", b)[1]["ended"], 1)
+        self.assertEqual(call("GET", "/me", a)[0], 401)
+        call("POST", "/logout", b)
+        self.assertEqual(call("GET", "/me", b)[0], 401)
+        stored = q("SELECT token_hash FROM user_sessions")
+        self.assertTrue(all(b not in r["token_hash"] and len(r["token_hash"]) == 64 for r in stored))
+
+    def test_weak_password_must_be_changed(self):
+        set_setting("require_strong_passwords", "1")
+        status, body = login_raw("FIN001", "1234")
+        self.assertTrue(body["must_change_password"])
+        token_ = body["token"]
+        self.assertEqual(call("GET", "/exchange-rates/active", token_)[0], 403)
+        self.assertEqual(call("GET", "/account", token_)[0], 200)
+        status, _ = call("POST", "/change-password", token_, {"old_password": "1234", "new_password": self.STRONG,
+                                                               "confirm_password": self.STRONG})
+        self.assertEqual(status, 200)
+        self.assertEqual(call("GET", "/exchange-rates/active", token_)[0], 200)
+        weak = call("POST", "/change-password", token_, {"old_password": self.STRONG, "new_password": "finance12",
+                                                          "confirm_password": "finance12"})
+        self.assertEqual(weak[0], 400)
+        connection = db()
+        from security import hash_password
+        connection.execute("UPDATE users SET password=?, must_change_password=0 WHERE employee_id='FIN001'",
+                           (hash_password("1234"),))
+        connection.commit()
+        connection.close()
+
+    def test_two_factor_sign_in(self):
+        mgt = user_id("MGT001")
+        self.assertEqual(call("POST", f"/users/{mgt}/two-factor", "ADMIN001", {"enabled": True})[0], 200)
+        status, body = login_raw("MGT001", "1234")
+        self.assertEqual(status, 200)
+        self.assertTrue(body["otp_required"])
+        self.assertNotIn("token", body)
+        self.assertTrue(body["email"].startswith("mg") and "*" in body["email"])
+        code = _re.search(r"\b(\d{6})\b", mail_text(self.smtp.messages[-1])).group(1)
+        wrong = call("POST", "/login/verify", body={"challenge": body["challenge"], "code": "000000" if code != "000000" else "111111"})
+        self.assertEqual(wrong[0], 400)
+        self.assertEqual(call("POST", "/login/resend", body={"challenge": body["challenge"]})[0], 429)
+        ok = call("POST", "/login/verify", body={"challenge": body["challenge"], "code": code})
+        self.assertEqual(ok[0], 200, ok)
+        self.assertEqual(call("GET", "/me", ok[1]["token"])[0], 200)
+        self.assertEqual(call("POST", "/login/verify", body={"challenge": body["challenge"], "code": code})[0], 400)
+        jobs = q("SELECT body_text FROM notification_jobs WHERE kind='SECURITY'")
+        self.assertTrue(all(code not in j["body_text"] for j in jobs))  # wiped after sending
+        sessions = call("GET", "/account/sessions", ok[1]["token"])[1]
+        self.assertTrue(sessions[0]["two_factor"])
+        call("POST", f"/users/{mgt}/two-factor", "ADMIN001", {"enabled": False})
+
+    def test_forgot_and_reset_password(self):
+        old = login_raw("ISUP001", "1234")[1]["token"]
+        generic = call("POST", "/password/forgot", body={"identifier": "nobody@himalaya-airlines.com"})
+        real = call("POST", "/password/forgot", body={"identifier": "isup@himalaya-airlines.com"})
+        self.assertEqual(generic, real)
+        self.assertEqual(len(self.smtp.messages), 1)
+        text = mail_text(self.smtp.messages[0])
+        link = _re.search(r"https://obs\.example\.test/reset-password\?token=([\w-]+)", text)
+        self.assertTrue(link, text)
+        token_ = link.group(1)
+        info = call("GET", f"/password/reset-info?token={token_}")[1]
+        self.assertEqual(info["kind"], "RESET")
+        self.assertEqual(call("POST", "/password/reset", body={"token": token_, "new_password": "short",
+                                                               "confirm_password": "short"})[0], 400)
+        done = call("POST", "/password/reset", body={"token": token_, "new_password": self.STRONG,
+                                                     "confirm_password": self.STRONG})
+        self.assertEqual(done[0], 200, done)
+        self.assertEqual(call("GET", "/me", old)[0], 401)  # every session ended
+        self.assertEqual(call("POST", "/password/reset", body={"token": token_, "new_password": self.STRONG,
+                                                               "confirm_password": self.STRONG})[0], 400)
+        self.assertEqual(login_raw("ISUP001", self.STRONG)[0], 200)
+        self.assertIn("reset", mail_text(self.smtp.messages[-1]))  # security notice
+        self.assertTrue(q("SELECT email_verified FROM users WHERE employee_id='ISUP001'")[0]["email_verified"])
+        self.assertTrue(all(token_ not in j["body_text"] for j in q("SELECT body_text FROM notification_jobs")))
+        connection = db()
+        from security import hash_password
+        connection.execute("UPDATE users SET password=? WHERE employee_id='ISUP001'", (hash_password("1234"),))
+        connection.commit()
+        connection.close()
+
+    def test_invite_flow_and_admin_controls(self):
+        status, new = call("POST", "/users/invite", "ADMIN001", {
+            "employee_id": "NEW001", "name": "Asha Rai", "email": "asha.rai@himalaya-airlines.com",
+            "role": "inventory"})
+        self.assertEqual(status, 200, new)
+        self.assertEqual(new["status"], "INVITED")
+        self.assertEqual(login_raw("NEW001", "")[0], 401)
+        token_ = _urlparse.parse_qs(_urlparse.urlparse(_re.search(r"https://\S+", mail_text(
+            self.smtp.messages[-1])).group(0)).query)["token"][0]
+        self.assertEqual(call("GET", f"/password/reset-info?token={token_}")[1]["kind"], "INVITE")
+        bad = call("POST", "/password/reset", body={"token": token_, "new_password": "AshaRai#2026",
+                                                    "confirm_password": "AshaRai#2026"})
+        self.assertEqual(bad[0], 400)  # contains her name
+        self.assertEqual(call("POST", "/password/reset", body={"token": token_, "new_password": self.STRONG,
+                                                               "confirm_password": self.STRONG})[0], 200)
+        users = call("GET", "/users?page=1&q=NEW001", "ADMIN001")[1]
+        self.assertEqual(users["items"][0]["status"], "ACTIVE")
+        signed = login_raw("asha.rai@himalaya-airlines.com", self.STRONG)
+        self.assertEqual(signed[0], 200)
+        # Lock by administrator ends the session and blocks sign-in until unlocked.
+        self.assertEqual(call("POST", f"/users/{new['id']}/lock", "ADMIN001", {"reason": "test"})[1]["status"], "LOCKED")
+        self.assertEqual(call("GET", "/me", signed[1]["token"])[0], 401)
+        self.assertEqual(login_raw("NEW001", self.STRONG)[0], 401)
+        call("POST", f"/users/{new['id']}/unlock", "ADMIN001")
+        self.assertEqual(login_raw("NEW001", self.STRONG)[0], 200)
+        # Duplicate e-mail refused; a regular user cannot manage accounts.
+        dup = call("POST", "/users/invite", "ADMIN001", {"employee_id": "NEW002", "name": "X Y",
+                                                         "email": "asha.rai@himalaya-airlines.com", "role": "finance"})
+        self.assertEqual(dup[0], 400)
+        self.assertEqual(call("POST", "/users/invite", "MGT001", {"employee_id": "NEW003", "name": "X Y",
+                                                                  "email": "x@himalaya-airlines.com", "role": "admin"})[0], 403)
+        # Deactivating ends sessions.
+        again = login_raw("NEW001", self.STRONG)[1]["token"]
+        call("DELETE", f"/users/{new['id']}", "ADMIN001")
+        self.assertEqual(call("GET", "/me", again)[0], 401)
+
+    def test_audit_log_and_overview(self):
+        login_raw("FIN001", "wrong-password")
+        call("GET", "/users", "FIN001")  # refused: logged as PERMISSION_DENIED
+        status, audit = call("GET", "/security/audit?event=LOGIN_FAILED", "ADMIN001")
+        self.assertEqual(status, 200)
+        self.assertTrue(audit["items"])
+        self.assertEqual(audit["items"][0]["account"], "FIN001")
+        self.assertEqual(audit["items"][0]["ip_address"], "127.0.0.1")
+        self.assertIn("LOGIN_FAILED", audit["events"])
+        denied = call("GET", "/security/audit?event=PERMISSION_DENIED", "ADMIN001")[1]["items"]
+        self.assertTrue(any(d["by"] == "FIN001" for d in denied))
+        self.assertEqual(call("GET", "/security/audit", "MGT001")[0], 403)
+        status, ov = call("GET", "/security/overview", "ADMIN001")
+        self.assertEqual(status, 200)
+        self.assertGreaterEqual(ov["sessions"]["active"], 1)
+        self.assertEqual(len(ov["sign_ins"]["trend"]), 14)
+        self.assertGreaterEqual(ov["sign_ins"]["failed_24h"], 1)
+
+    def test_recovery_code_needs_configuration(self):
+        self.assertFalse(call("GET", "/admin-recovery")[1]["available"])
+        self.assertEqual(call("POST", "/admin-recovery", body={
+            "employee_id": "ADMIN001", "recovery_code": "anything", "new_password": self.STRONG,
+            "confirm_password": self.STRONG})[0], 404)
 
 
 if __name__ == "__main__":

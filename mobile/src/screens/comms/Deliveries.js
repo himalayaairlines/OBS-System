@@ -5,7 +5,7 @@ import { Text } from '../../text';
 import { api } from '../../api';
 import { usePaged } from '../../paging';
 import { COLORS, styles } from '../../theme';
-import { Banner, Button, Card, Chip, Pagination, SectionTitle } from '../../ui';
+import { Banner, Button, Card, Chip, Notice, Pagination, SectionTitle } from '../../ui';
 import { StatusPill, when } from './shared';
 
 const STATUSES = [
@@ -32,7 +32,7 @@ export default function Deliveries() {
 
   return (
     <>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       <Card>
         <SectionTitle
           title={`Delivery log (${data.total})`}

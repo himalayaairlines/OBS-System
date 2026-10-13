@@ -5,7 +5,7 @@ import { Text } from '../../text';
 import { api } from '../../api';
 import { confirm } from '../../dialog';
 import { COLORS, ROLE_LABELS, styles } from '../../theme';
-import { Banner, Button, Card, Field, OptionModal, Pill, SectionTitle, Select } from '../../ui';
+import { Banner, Button, Card, Field, Notice, OptionModal, Pill, SectionTitle, Select } from '../../ui';
 import { Toggle, has } from './shared';
 
 const EMPTY = { name: '', description: '', active: true, user_ids: [] };
@@ -61,7 +61,7 @@ export default function Groups({ user, options, reloadOptions }) {
 
   return (
     <>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       {form && (
         <Card>
           <SectionTitle title={form.id ? 'Edit group' : 'New recipient group'} />

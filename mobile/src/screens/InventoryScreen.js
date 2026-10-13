@@ -10,8 +10,8 @@ import { usePaged } from '../paging';
 import { confirm } from '../dialog';
 import { COLORS, npr, styles, todayString } from '../theme';
 import {
-  Banner, Button, CalendarModal, Card, Chip, Field, KeyValue, OptionModal,
-  FrozenTable, PageHeader, Pagination, Pill, SearchBar, SectionTitle, Select,
+  Banner, Button, CalendarModal, Card, Chip, Field, FrozenTable, KeyValue, Notice, OptionModal,
+  PageHeader, Pagination, Pill, SearchBar, SectionTitle, Select,
 } from '../ui';
 
 const TABS = [
@@ -41,7 +41,7 @@ export default function InventoryScreen({ user }) {
           <Chip key={item.key} label={item.label} active={tab === item.key} onPress={() => setTab(item.key)} />
         ))}
       </View>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
 
       {tab === 'flights' && <FlightsTab notify={setMessage} />}
       {tab === 'products' && <ProductsTab notify={setMessage} />}

@@ -60,7 +60,7 @@ Restart `expo start` after changing it.
 
 ## 3. Demo accounts
 
-All passwords are `1234`. Change them from the profile menu.
+All passwords are `1234`. Because that breaks the password policy, each account must choose a new password at its first sign-in (10+ characters, 3 of lower/upper/digit/symbol, not containing the name).
 
 | Employee ID | Role | Sees |
 |---|---|---|
@@ -70,7 +70,7 @@ All passwords are `1234`. Change them from the profile menu.
 | `ISUP001` | Inventory Supervisor | The above plus bundles and all approvals |
 | `MGT001` | Management | Oversight, corrections, dashboard, logs (no selling screen) |
 | `FIN001` | Finance | Exchange rates and the dashboard only |
-| `ADMIN001` | Administrator | Crew roster and login accounts |
+| `ADMIN001` | Administrator | Dashboard (user analytics), Communication Manager, SMTP Settings, Users & Access (login accounts, crew roster, sign-in settings), Audit Log |
 
 ## 4. The workflow end to end
 

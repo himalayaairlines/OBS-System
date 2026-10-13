@@ -4,7 +4,7 @@ import { Text } from '../../text';
 
 import { api } from '../../api';
 import { COLORS, styles } from '../../theme';
-import { Banner, Button, Card, Chip, Field, SectionTitle } from '../../ui';
+import { Banner, Button, Card, Chip, Field, Notice, SectionTitle } from '../../ui';
 import { when } from './shared';
 
 const NAMES = {
@@ -79,7 +79,7 @@ export default function Templates() {
 
   return (
     <>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       <Card>
         <SectionTitle title="Email templates" description="Plain text. Values are inserted as text and escaped in the HTML copy; nothing in a template is executed." />
         <View style={[styles.wrap, { marginBottom: 12 }]}>

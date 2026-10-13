@@ -16,7 +16,7 @@ import { api } from './api';
 export const PAGE_SIZES = [10, 25, 50, 100];
 const EMPTY = { items: [], total: 0, page: 1, pages: 1, page_size: 25, has_prev: false, has_next: false };
 
-export function usePaged(path, { pageSize: initialSize = 25, enabled = true } = {}) {
+export function usePaged(path, { pageSize: initialSize = 10, enabled = true } = {}) {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(initialSize);
   const [data, setData] = useState(EMPTY);
@@ -53,7 +53,7 @@ export function usePaged(path, { pageSize: initialSize = 25, enabled = true } = 
   };
 }
 
-export function usePagedArray(items, { pageSize: initialSize = 25, resetKey } = {}) {
+export function usePagedArray(items, { pageSize: initialSize = 10, resetKey } = {}) {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(initialSize);
   useEffect(() => { setPage(1); }, [resetKey, pageSize]);

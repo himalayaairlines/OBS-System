@@ -10,8 +10,8 @@ import { confirm } from '../dialog';
 import { usePaged } from '../paging';
 import { COLORS, npr, styles, todayString } from '../theme';
 import {
-  Banner, Button, CalendarModal, Card, Field, KeyValue, Metric,
-  PageHeader, Pagination, Pill, SectionTitle, Select,
+  Banner, Button, CalendarModal, Card, Field, KeyValue, Metric, Notice, PageHeader, Pagination,
+  Pill, SectionTitle, Select,
 } from '../ui';
 
 export default function SyncScreen({ user, online, onQueueChange, goToReports }) {
@@ -60,7 +60,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
       setSummary(s);
       setSales(list);
     } catch (error) {
-      setMessage({ tone: 'warning', text: `Live totals unavailable: ${error.message}` });
+      setMessage({ tone: 'warning', inline: true, text: `Live totals unavailable: ${error.message}` });
     }
   }, [date, isInventory, reloadReturns]);
 
@@ -232,7 +232,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
         right={<Pill label={online ? 'ONLINE' : 'OFFLINE'} tone={online ? 'success' : 'warning'} />}
       />
 
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
 
       {!isInventory && (
       <Card>

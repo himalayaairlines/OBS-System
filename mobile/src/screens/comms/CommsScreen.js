@@ -24,7 +24,7 @@ const TABS = [
   { key: 'escalation', label: 'Escalation', any: ['comms_view'] },
   { key: 'deliveries', label: 'Delivery log', any: ['comms_admin'] },
   { key: 'templates', label: 'Templates', any: ['comms_templates'] },
-  { key: 'settings', label: 'Settings', any: ['comms_view', 'comms_admin', 'smtp_view'] },
+  { key: 'settings', label: 'Settings', any: ['comms_view', 'comms_admin'] },
 ];
 
 /** Communication Manager: stock-alert rules, alerts, recipients and email. */
@@ -61,7 +61,7 @@ export default function CommsScreen({ user, online, initialAlertId, onHandled })
     <ScrollView style={styles.screen} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
       <PageHeader
         title="Communication Manager"
-        description="Stock-alert rules, recipients and email delivery. Products without a rule never send alerts."
+        description="Stock-alert rules, recipients and alert delivery. Products without a rule never send alerts."
       />
       {!online && <Banner tone="warning" message="The Communication Manager needs a connection." />}
       {!!error && <Banner tone="danger" message={error} />}

@@ -4,7 +4,10 @@ import { Text } from '../text';
 
 import { api } from '../api';
 import { COLORS, styles, todayString } from '../theme';
-import { Banner, Button, CalendarModal, Card, Field, KeyValue, OptionModal, PageHeader, Pill, SectionTitle, Select } from '../ui';
+import {
+  Banner, Button, CalendarModal, Card, Field, KeyValue, Notice, OptionModal, PageHeader, Pill,
+  SectionTitle, Select,
+} from '../ui';
 
 export default function FinanceScreen({ user }) {
   const readOnly = !['finance', 'management'].includes(user.role);
@@ -81,7 +84,7 @@ export default function FinanceScreen({ user }) {
         title="Exchange Rates"
         description="Each rate applies over a date range. Future rates can be set in advance and take effect automatically."
       />
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
 
       <Card>
         <SectionTitle title="Rates in force today" />

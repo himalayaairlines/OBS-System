@@ -7,8 +7,8 @@ import { usePaged } from '../paging';
 import { confirm, notify } from '../dialog';
 import { COLORS, styles, todayString } from '../theme';
 import {
-  Banner, Button, CalendarModal, Card, Field, OptionModal,
-  PageHeader, Pagination, Pill, SectionTitle, Select,
+  Banner, Button, CalendarModal, Card, Field, Notice, OptionModal, PageHeader, Pagination, Pill,
+  SectionTitle, Select,
 } from '../ui';
 
 /*
@@ -423,7 +423,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
           description={`${form.manual} · ${form.appendix}`}
           right={<Pill label={form.form_code} tone="muted" />}
         />
-        {message && <Banner tone={message.tone} message={message.text} />}
+        {message && <Notice message={message} />}
 
         <Card>
           <View style={styles.wrap}>
@@ -567,7 +567,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
           ? 'Cabin reports filed by the crew after each sector.'
           : 'Complete these after finishing a sector. Each crew files its own set.'}
       />
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
 
       <Card>
         <SectionTitle

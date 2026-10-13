@@ -6,8 +6,8 @@ import { api, apiText } from '../../api';
 import { usePaged } from '../../paging';
 import { COLORS, ROLE_LABELS, styles } from '../../theme';
 import {
-  Banner, Button, Card, Chip, DataTable, Field, KeyValue, Metric, OptionModal, Pagination, Pill,
-  SearchBar, SectionTitle, Select,
+  Banner, Button, Card, Chip, DataTable, Field, KeyValue, Metric, Notice, OptionModal, Pagination,
+  Pill, SearchBar, SectionTitle, Select,
 } from '../../ui';
 import { FREQUENCY_LABELS, SeverityPill, StatusPill, Toggle, has, qty, when } from './shared';
 
@@ -112,7 +112,7 @@ export default function ItemAlerts({ user, options }) {
 
   return (
     <>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       {coverage?.global_off && (
         <Banner tone="warning" message="Stock alerts are switched off for the whole system (Settings). No item will alert until they are switched back on." />
       )}
@@ -344,7 +344,7 @@ function ItemDetail({ productId, canEdit, onBack, options, user }) {
   useEffect(() => { load(); }, [load]);
 
   if (!detail || !form) {
-    return message ? <Banner tone={message.tone} message={message.text} /> : <Text style={styles.empty}>Loading…</Text>;
+    return message ? <Notice message={message} /> : <Text style={styles.empty}>Loading…</Text>;
   }
   const { item, configuration: config, suggestion } = detail;
   const saved = formFrom(config.item_setting);
@@ -383,7 +383,7 @@ function ItemDetail({ productId, canEdit, onBack, options, user }) {
 
   return (
     <>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       <Card>
         <SectionTitle
           title={item.product_name}
@@ -566,7 +566,7 @@ function BulkPanel({ ids, onDone }) {
   return (
     <View style={{ borderWidth: 1, borderColor: COLORS.border, borderRadius: 8, padding: 12, marginBottom: 12 }}>
       <Text style={[styles.sectionTitle, { marginBottom: 8 }]}>Bulk edit {ids.length} items</Text>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       <SettingForm form={form} setForm={(f) => { setForm(f); setPreview(null); }} />
       <View style={[styles.row, styles.gap8]}>
         <Button title="Preview" tone="secondary" onPress={() => run(true)} />
@@ -618,7 +618,7 @@ function ImportPanel({ onDone }) {
       <Text style={[styles.mono, { marginBottom: 8 }]}>
         Paste CSV with the export's columns (export first to get the template). Check the dry run, then apply. If any line has an error, nothing is applied.
       </Text>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       <Field label="CSV" value={csv} multiline onChangeText={(v) => { setCsv(v); setResult(null); }}
         placeholder="product_code,product_name,category,mode,low_threshold,critical_threshold,recovery_threshold,note" />
       <View style={[styles.row, styles.gap8]}>
@@ -724,7 +724,7 @@ function QuickSetup({ products, productIds, options, onCancel, onDone }) {
       <SectionTitle
         title={single ? `Set up alert: ${products[0]?.product_name || ''}` : `Set up alert for ${productIds.length} items`}
         description="Creates an active alert rule for this item only. You can change it later under Alert rules or with item overrides." />
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
       <Field label="Rule name" value={form.name} onChangeText={(v) => set({ name: v })} />
       <View style={[styles.wrap, { gap: 8 }]}>
         <Field label="Alert when stock is below" required value={form.low} keyboardType="number-pad" style={{ flex: 1, minWidth: 140 }}

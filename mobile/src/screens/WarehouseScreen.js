@@ -10,7 +10,7 @@ import { usePaged } from '../paging';
 import { BarChart } from '../charts';
 import { COLORS, compact, npr, styles, todayString } from '../theme';
 import {
-  Banner, Button, CalendarModal, Card, Chip, DataTable, Field, FrozenTable, Metric,
+  Banner, Button, CalendarModal, Card, Chip, DataTable, Field, FrozenTable, Metric, Notice,
   OptionModal, PageHeader, Pagination, Pill, SearchBar, SectionTitle, Select, StockPill,
 } from '../ui';
 
@@ -253,7 +253,7 @@ export default function WarehouseScreen({ user }) {
     return (
       <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
         <PageHeader title="Main Inventory" />
-        {message && <Banner tone={message.tone} message={message.text} />}
+        {message && <Notice message={message} />}
         <Text style={styles.empty}>Loading warehouse data…</Text>
       </ScrollView>
     );
@@ -281,7 +281,7 @@ export default function WarehouseScreen({ user }) {
           <Chip key={item.key} label={item.label} active={tab === item.key} onPress={() => setTab(item.key)} />
         ))}
       </View>
-      {message && <Banner tone={message.tone} message={message.text} />}
+      {message && <Notice message={message} />}
 
       {!!dashboard.low_stock_count && (
         <Banner

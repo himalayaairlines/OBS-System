@@ -6,7 +6,7 @@ import { Platform } from 'react-native';
 
 // The oldest backend this app can talk to. Bump both this and API_VERSION in
 // backend/main.py whenever endpoints are added.
-export const REQUIRED_API_VERSION = '7.4';
+export const REQUIRED_API_VERSION = '7.5';
 
 export const KEYS = {
   session: 'obs.session',
@@ -43,6 +43,16 @@ export function getToken() {
   return sessionToken;
 }
 
+// Called when the server says the session has ended (idle or absolute limit,
+// signed out elsewhere, password changed on another device).
+let onSessionEnded = null;
+export function setSessionEndedHandler(fn) {
+  onSessionEnded = fn;
+}
+
+// Tells the server which app made the request, for the signed-in devices list.
+const CLIENT_NAME = Platform.OS === 'web' ? null : `${Platform.OS}-app`;
+
 export class ApiError extends Error {
   constructor(message, status) {
     super(message);
@@ -68,6 +78,7 @@ export async function api(endpoint, { method = 'GET', body, auth = true, timeout
       const headers = {};
       if (body) headers['Content-Type'] = 'application/json';
       if (auth && sessionToken) headers.Authorization = `Bearer ${sessionToken}`;
+      if (CLIENT_NAME) headers['X-OBS-Client'] = CLIENT_NAME;
 
       const response = await fetch(`${API_BASE}${endpoint}`, {
         method: verb,
@@ -82,6 +93,7 @@ export async function api(endpoint, { method = 'GET', body, auth = true, timeout
         const detail = payload.detail || (response.status === 404
           ? `The server does not have ${endpoint}. It is probably running an older build — restart uvicorn from the current backend folder.`
           : `Request failed (${response.status})`);
+        if (response.status === 401 && auth && sessionToken && onSessionEnded) onSessionEnded(detail);
         throw new ApiError(detail, response.status);
       }
       return payload;

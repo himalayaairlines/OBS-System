@@ -6,7 +6,7 @@ name: himalaya-obs
 services:
   backend:
     build: ./backend
-    image: himalaya-obs-backend:7.4
+    image: himalaya-obs-backend:7.5
     restart: unless-stopped
     env_file:
       - path: .env

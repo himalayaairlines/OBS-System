@@ -17,13 +17,14 @@ from fastapi.responses import JSONResponse
 from database import DB_PATH, ROLE_PERMISSIONS, initialize_database
 from routers import (
     admin, analytics, auth, catalog, communication, flight_reports, flights, notifications,
-    obs, rates, register, reports, sales, settings_smtp, stock_alert_settings, warehouse,
+    obs, rates, register, reports, sales, security_admin, settings_smtp, stock_alert_settings, warehouse,
 )
+import security
 import comms_worker
 
 # Bumped whenever endpoints are added. The app compares it on login and warns
 # if it is talking to an older server, which otherwise shows up as bare 404s.
-API_VERSION = "7.4"
+API_VERSION = "7.5"
 
 app = FastAPI(
     title="Himalaya Airlines OBS Revenue Management System",
@@ -43,6 +44,31 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
+
+class ClientContext:
+    """Remember the caller's address, browser and path for sessions and the audit log.
+
+    Behind nginx, uvicorn's --proxy-headers already turns X-Forwarded-For into
+    request.client, so this sees the real client address.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        client = scope.get("client") or (None, None)
+        token = security.set_client(client[0], headers.get("user-agent"), headers.get("x-obs-client"),
+                                    scope.get("path"))
+        try:
+            return await self.app(scope, receive, send)
+        finally:
+            security.reset_client(token)
+
+
+app.add_middleware(ClientContext)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,10 +91,10 @@ async def unhandled_error(request: Request, exc: Exception):
                  "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
     return JSONResponse(
         status_code=500,
+        # The details stay in the server log; the caller gets a reference only.
         content={
-            "detail": f"{type(exc).__name__}: {exc}",
+            "detail": f"Unexpected server error ({type(exc).__name__}). The details are in the server log.",
             "path": request.url.path,
-            "hint": "The full traceback is in the uvicorn terminal.",
         },
         headers={"Access-Control-Allow-Origin": "*"},
     )
@@ -78,7 +104,7 @@ initialize_database()
 
 for module in (auth, admin, flights, catalog, warehouse, obs, register, sales, rates,
                analytics, reports, flight_reports, settings_smtp, communication, stock_alert_settings,
-               notifications):
+               notifications, security_admin):
     app.include_router(module.router)
 
 

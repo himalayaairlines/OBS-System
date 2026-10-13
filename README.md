@@ -1,6 +1,6 @@
 # Himalaya Airlines OBS Revenue Management System
 
-![API version](https://img.shields.io/badge/API-v7.4-0B4F8A)
+![API version](https://img.shields.io/badge/API-v7.5-0B4F8A)
 ![Backend](https://img.shields.io/badge/backend-FastAPI%20%2B%20SQLite-009688)
 ![Mobile](https://img.shields.io/badge/mobile-Expo%2057%20%2F%20React%20Native-000020)
 ![Platforms](https://img.shields.io/badge/runs%20on-iPad%20%7C%20Android%20%7C%20web-lightgrey)
@@ -97,7 +97,7 @@ On first start, the server creates `backend/obs.db` and fills it with demo data.
 
 ```bash
 curl http://localhost:8000/health
-# {"status":"online","version":"7.4","routes":...}
+# {"status":"online","version":"7.5","routes":...}
 ```
 
 Open <http://localhost:8000/docs> for the interactive API reference.
@@ -128,7 +128,7 @@ Press `w` to open the app in a browser, or scan the QR code with Expo Go. Restar
 
 ### 3. Sign in
 
-The seed data creates one demo account for each role. Every password is `1234`; change it from the profile menu.
+The seed data creates one demo account for each role. Every password is `1234`. That does not meet the password policy, so each demo account has to choose a new password at its first sign-in. For a throwaway demo you can switch off **Require strong passwords** under Users & Access → Sign-in settings.
 
 | Employee ID | Account | Role |
 |---|---|---|
@@ -150,11 +150,27 @@ Each role sees only the screens its permissions allow. The permission sets are d
 |---|---|---|
 | `EXPO_PUBLIC_API_BASE` | `mobile/.env` | Base URL of the API. If it isn't set, the build falls back to a default address hard-coded in `src/api.js`. |
 | `OBS_ALLOWED_ORIGINS` | backend environment | Comma-separated CORS origins. If it isn't set, any origin is allowed, which is only suitable for development. |
-| `OBS_ADMIN_RECOVERY_CODE` | backend environment | Recovery code for the administrator account. Set this in any real deployment. |
+| `OBS_ADMIN_RECOVERY_CODE` | backend environment | Turns on the administrator recovery page. At least 12 characters. Without it the page is switched off; there is no built-in default code. |
+| `OBS_APP_URL` | backend environment | Public address of the web app, used in password-reset and invitation links (and alert e-mails). Overrides **SMTP Settings → Application address**. Links are never built from the request's Host header. |
 | `OBS_SECRET_KEY` | backend environment | Fernet key that encrypts the stored SMTP password. Set this in production. |
 | `OBS_EMBEDDED_WORKER` | backend environment | `1` (default) runs the alert/email worker inside the API; set `0` when running `python worker.py` separately. |
 
 **Version check:** at login the app compares its `REQUIRED_API_VERSION` (in `mobile/src/api.js`) with the version the API reports (`API_VERSION` in `backend/main.py`). If they don't match, the app shows a warning banner. Change both values together.
+
+## Sign-in and account security (API 7.5)
+
+- **Sign in** with Employee ID or e-mail. Every failure gets the same message, so the page never reveals whether an account exists.
+- **Password policy:** at least 10 characters, 3 of lower-case / upper-case / digit / symbol, and not containing the person's name or e-mail name. Passwords that break it (the demo `1234`, for example) must be changed at the next sign-in while **Require strong passwords** is on.
+- **Forgot password:** e-mails a reset link valid for 30 minutes, usable once. After a reset or a password change every other session is signed out and a security notice (time in UTC and IP address) is e-mailed.
+- **Two-factor sign-in:** per user, switched on by an administrator. A 6-digit code is e-mailed at each sign-in; it expires after 5 minutes.
+- **Sessions** end after 60 minutes without activity or 12 hours after sign-in (crew supervisor devices: 24 hours, no idle limit). People see and end their sessions under **My Account**.
+- **Lockout:** 5 wrong passwords lock an account for 15 minutes. Administrators can also lock and unlock accounts.
+- **New users** are invited by e-mail and choose their own password (link valid 72 hours). Shared cabin devices without a mailbox get a password set by the administrator under **Users & Access → Add device account**.
+- **Audit Log** records sign-ins, failures, password and account changes, refused access and SMTP changes, with the IP address. Codes, passwords and links are never recorded.
+
+Reset and invitation links need the application address: set **SMTP Settings → Application address** (or `OBS_APP_URL`). They also need working SMTP.
+
+On laptops and larger screens (1024 px and wider) the web app uses a sidebar layout; phones and tablets keep the tab layout.
 
 ## Usage
 
