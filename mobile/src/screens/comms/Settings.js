@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Text, View } from 'react-native';
+import { View } from 'react-native';
+import { Text } from '../../text';
 
 import { api } from '../../api';
 import { COLORS, styles } from '../../theme';
@@ -24,7 +25,10 @@ function CommsSettings({ user }) {
   const load = useCallback(async () => {
     try {
       const s = await api('/communication/settings');
-      setForm({ ...s, external_email_domains: s.external_email_domains.join(', '), sweep_minutes: String(s.sweep_minutes) });
+      setForm({
+        ...s, external_email_domains: s.external_email_domains.join(', '), sweep_minutes: String(s.sweep_minutes),
+        max_snooze_hours: String(s.max_snooze_hours ?? 72),
+      });
     } catch (e) {
       setMessage({ tone: 'danger', text: e.message });
     }
@@ -41,6 +45,9 @@ function CommsSettings({ user }) {
           business_days: form.business_days, digest_time: form.digest_time, digest_weekday: form.digest_weekday,
           external_email_domains: form.external_email_domains.split(',').map((d) => d.trim()).filter(Boolean),
           sweep_minutes: Number(form.sweep_minutes) || 5,
+          alerts_enabled: form.alerts_enabled, max_snooze_hours: Number(form.max_snooze_hours) || 72,
+          allow_snooze_critical: form.allow_snooze_critical,
+          critical_ignores_business_hours: form.critical_ignores_business_hours,
         },
       });
       setMessage({ tone: 'success', text: 'Communication settings saved.' });
@@ -59,6 +66,18 @@ function CommsSettings({ user }) {
     <Card>
       <SectionTitle title="Communication defaults" description="Timezone and hours used for business-hours rules, daily reminders and digests." />
       {message && <Banner tone={message.tone} message={message.text} />}
+      <Toggle label="Stock alerts enabled" value={form.alerts_enabled} disabled={!editable}
+        onChange={(v) => setForm({ ...form, alerts_enabled: v })}
+        hint="Master switch. Off: no rule opens alerts or sends reminders, escalations or digests. Rules and item settings are kept." />
+      {!form.alerts_enabled && <Banner tone="warning" message="Stock alerts are switched off for the whole system." />}
+      <Toggle label="Critical and out-of-stock emails ignore business hours" value={form.critical_ignores_business_hours}
+        disabled={!editable} onChange={(v) => setForm({ ...form, critical_ignores_business_hours: v })}
+        hint="For rules limited to business hours: low-stock email still waits, critical goes out at once." />
+      <Toggle label="Allow snoozing critical and out-of-stock alerts" value={form.allow_snooze_critical}
+        disabled={!editable} onChange={(v) => setForm({ ...form, allow_snooze_critical: v })}
+        hint="Off: only low-stock alerts can be snoozed. A worse stock level always ends a snooze." />
+      <Field label="Longest snooze (hours)" editable={editable} value={form.max_snooze_hours} keyboardType="number-pad"
+        onChangeText={(v) => setForm({ ...form, max_snooze_hours: v.replace(/[^0-9]/g, '') })} />
       <Field label="Timezone (IANA name)" value={form.timezone} editable={editable} onChangeText={(v) => setForm({ ...form, timezone: v })} />
       <View style={[styles.row, styles.gap8]}>
         <Field label="Business hours start" value={form.business_start} editable={editable} style={{ flex: 1 }}

@@ -1,8 +1,15 @@
 import React, { useState } from 'react';
-import { Text as RNText, View } from 'react-native';
+import { View } from 'react-native';
+import { nativeFamily } from './fonts';
+import { Text as RNText } from './text';
 import Svg, { Circle, G, Line, Path, Polyline, Rect, Text as SvgText } from 'react-native-svg';
-
 import { CHART_COLORS, COLORS, compact, styles } from './theme';
+
+/** Work Sans for chart labels on iOS / Android (the web gets it from CSS). */
+function svgFont(weight = 400) {
+  const family = nativeFamily(weight);
+  return family ? { fontFamily: family } : {};
+}
 
 function niceMax(value) {
   if (!value || value <= 0) return 10;
@@ -61,7 +68,7 @@ function BarChartBase({ data = [], height = 220, width = 340, color = COLORS.pri
         return (
           <G key={tick}>
             <Line x1={padLeft} y1={y} x2={width - 8} y2={y} stroke={COLORS.border} strokeWidth={1} />
-            <SvgText x={padLeft - 6} y={y + 4} fontSize="11" fill={COLORS.muted} textAnchor="end">
+            <SvgText {...svgFont()} x={padLeft - 6} y={y + 4} fontSize="11" fill={COLORS.muted} textAnchor="end">
               {format(max * tick)}
             </SvgText>
           </G>
@@ -75,7 +82,7 @@ function BarChartBase({ data = [], height = 220, width = 340, color = COLORS.pri
         return (
           <G key={index}>
             <Rect x={x} y={y} width={barWidth} height={barHeight} rx={3} fill={item.color || color} />
-            <SvgText
+            <SvgText {...svgFont()}
               x={x + barWidth / 2}
               y={height - padBottom + 15}
               fontSize="11"
@@ -85,7 +92,7 @@ function BarChartBase({ data = [], height = 220, width = 340, color = COLORS.pri
               {String(item.label).slice(0, labelChars)}
             </SvgText>
             {value > 0 && (
-              <SvgText x={x + barWidth / 2} y={y - 5} fontSize="11" fill={COLORS.text} textAnchor="middle">
+              <SvgText {...svgFont()} x={x + barWidth / 2} y={y - 5} fontSize="11" fill={COLORS.text} textAnchor="middle">
                 {format(value)}
               </SvgText>
             )}
@@ -114,7 +121,7 @@ function RankBarChartBase({ data = [], width = 340, rowHeight = 30, format = com
         const y = index * rowHeight + 8;
         return (
           <G key={index}>
-            <SvgText x={0} y={y + 15} fontSize="12" fill={COLORS.text}>
+            <SvgText {...svgFont()} x={0} y={y + 15} fontSize="12" fill={COLORS.text}>
               {String(item.label).slice(0, labelChars)}
             </SvgText>
             <Rect
@@ -125,7 +132,7 @@ function RankBarChartBase({ data = [], width = 340, rowHeight = 30, format = com
               x={labelWidth} y={y + 3} width={barWidth} height={rowHeight - 12}
               rx={4} fill={item.color || CHART_COLORS[index % CHART_COLORS.length]}
             />
-            <SvgText x={labelWidth + plotWidth + 8} y={y + 15} fontSize="12" fill={COLORS.muted}>
+            <SvgText {...svgFont()} x={labelWidth + plotWidth + 8} y={y + 15} fontSize="12" fill={COLORS.muted}>
               {format(value)}
             </SvgText>
           </G>
@@ -160,7 +167,7 @@ function LineChartBase({ data = [], height = 220, width = 340, target = null, fo
         return (
           <G key={tick}>
             <Line x1={padLeft} y1={y} x2={width - 10} y2={y} stroke={COLORS.border} strokeWidth={1} />
-            <SvgText x={padLeft - 6} y={y + 4} fontSize="11" fill={COLORS.muted} textAnchor="end">
+            <SvgText {...svgFont()} x={padLeft - 6} y={y + 4} fontSize="11" fill={COLORS.muted} textAnchor="end">
               {format(max * tick)}
             </SvgText>
           </G>
@@ -177,7 +184,7 @@ function LineChartBase({ data = [], height = 220, width = 340, target = null, fo
             strokeWidth={1.5}
             strokeDasharray="5 4"
           />
-          <SvgText
+          <SvgText {...svgFont()}
             x={width - 12}
             y={padTop + plotHeight - (target / max) * plotHeight - 5}
             fontSize="11"
@@ -196,7 +203,7 @@ function LineChartBase({ data = [], height = 220, width = 340, target = null, fo
       {data.map((item, index) => {
         if (data.length > 8 && index % Math.ceil(data.length / 6) !== 0) return null;
         return (
-          <SvgText
+          <SvgText {...svgFont()}
             key={index}
             x={padLeft + stepX * index}
             y={height - padBottom + 16}
@@ -243,7 +250,7 @@ export function DonutChart({ data = [], size = 168, format = compact }) {
           angle += sweep;
           return <Path key={index} d={path} fill={CHART_COLORS[index % CHART_COLORS.length]} />;
         })}
-        <SvgText
+        <SvgText {...svgFont(600)}
           x={size / 2} y={size / 2 + 5} fontSize="14" fontWeight="600"
           fill={COLORS.text} textAnchor="middle"
         >

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Pressable, ScrollView, Text, View } from 'react-native';
+import { Pressable, ScrollView, View } from 'react-native';
+import { Text } from '../text';
 
 import { api, cached, enqueueSale, orderRef, saveDutyGroup, writeCache } from '../api';
 import { confirm, notify } from '../dialog';

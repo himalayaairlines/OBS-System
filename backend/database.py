@@ -48,7 +48,7 @@ ROLE_PERMISSIONS = {
         "inventory", "warehouse", "warehouse_approve", "bundles",
         "groups", "stock_add", "reconcile_approve", "sync",
         "sales_view", "sales_edit",
-        "comms_view", "comms_rules", "comms_groups",
+        "comms_view", "comms_rules", "comms_groups", "comms_item_settings",
     },
     # Management oversee and correct; they do not sell, so no crew sales screen.
     # `groups_manage` is the post-lock amendment of a duty group, with remarks.
@@ -57,14 +57,16 @@ ROLE_PERMISSIONS = {
         "stock_add", "dashboard", "sync", "logs", "rates", "rates_edit",
         "sales_view", "sales_edit", "reports", "warehouse_approve",
         "reconcile_approve", "reconcile_submit", "flight_reports", "reports_review",
-        "comms_view", "comms_rules", "comms_rules_all", "comms_groups", "comms_admin",
+        "comms_view", "comms_rules", "comms_rules_all", "comms_groups", "comms_admin", "comms_item_settings",
         "comms_templates", "smtp_view",
     },
     # Finance set rates and read performance. No sales, commission or sync.
     "finance": {"rates", "rates_edit", "dashboard", "reports"},
     # The administrator owns system configuration, including SMTP credentials.
     "admin": {"users", "crew_members", "smtp_view", "smtp_manage", "smtp_test",
-              "comms_admin", "comms_templates"},
+              "comms_admin", "comms_templates",
+              # Stock Alert Settings: see and configure alerts (7.4).
+              "comms_view", "comms_rules", "comms_rules_all", "comms_groups", "comms_item_settings"},
 }
 
 # --------------------------------------------------------------------------- #

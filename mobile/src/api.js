@@ -6,7 +6,7 @@ import { Platform } from 'react-native';
 
 // The oldest backend this app can talk to. Bump both this and API_VERSION in
 // backend/main.py whenever endpoints are added.
-export const REQUIRED_API_VERSION = '7.3';
+export const REQUIRED_API_VERSION = '7.4';
 
 export const KEYS = {
   session: 'obs.session',
@@ -105,6 +105,26 @@ export async function api(endpoint, { method = 'GET', body, auth = true, timeout
 
   if (verb === 'GET') inFlight.set(key, run);
   return run;
+}
+
+/** GET a text resource (CSV export). Errors come back as ApiError like api(). */
+export async function apiText(endpoint, { timeout = 30000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const headers = sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {};
+    const response = await fetch(`${API_BASE}${endpoint}`, { headers, signal: controller.signal });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new ApiError(payload.detail || `Request failed (${response.status})`, response.status);
+    }
+    return await response.text();
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(`Could not reach the API at ${API_BASE}.`, 0);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /* ------------------------------------------------------------------ */

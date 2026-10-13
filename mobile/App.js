@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  Image, Modal, Platform, Pressable, ScrollView, StatusBar, Text, View,
-} from 'react-native';
+import { Image, Modal, Platform, Pressable, ScrollView, StatusBar, View } from 'react-native';
+import { Text } from './src/text';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import NetInfo from '@react-native-community/netinfo';
@@ -263,17 +262,12 @@ function AppContent() {
       }}>
         <View style={[styles.rowBetween, { width: '100%', maxWidth: CONTENT_MAX_WIDTH, alignSelf: 'center' }]}>
           <View style={[styles.flex1, { flexDirection: 'row', alignItems: 'center' }]}>
-          <View style={{
-            width: 38, height: 38, borderRadius: 10, backgroundColor: '#FFFFFF', marginRight: 10,
-            alignItems: 'center', justifyContent: 'center',
-          }}>
-            <Image
-              source={require('./assets/himalaya-logo.png')}
-              style={{ width: 30, height: 30 }}
-              resizeMode="contain"
-              accessibilityLabel="Himalaya Airlines logo"
-            />
-          </View>
+          <Image
+            source={require('./assets/app-icon.png')}
+            style={{ width: 38, height: 38, borderRadius: 10, marginRight: 10, borderWidth: 1, borderColor: 'rgba(255,255,255,0.4)' }}
+            resizeMode="contain"
+            accessibilityLabel="Himalaya Airlines OBS"
+          />
           <View style={styles.flex1}>
             <Text style={{ color: '#FFFFFF', fontSize: 16, fontWeight: '600' }} numberOfLines={1}>
               Himalaya Airlines OBS

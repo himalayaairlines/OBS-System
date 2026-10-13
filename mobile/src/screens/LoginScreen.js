@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Image, Platform, Pressable, ScrollView, StatusBar, Text, TextInput, View, useWindowDimensions,
+  Image, Platform, Pressable, ScrollView, StatusBar, View, useWindowDimensions,
 } from 'react-native';
+import { Text, TextInput } from '../text';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Svg, { Defs, LinearGradient, Path, RadialGradient, Rect, Stop } from 'react-native-svg';
@@ -61,21 +62,16 @@ function HeroBackground() {
   );
 }
 
-const HIMALAYA_LOGO = require('../../assets/himalaya-logo.png');
+const APP_ICON = require('../../assets/app-icon.png');
 
 function BrandLogo({ size = 52 }) {
   return (
-    <View style={{
-      width: size, height: size, borderRadius: 14, alignItems: 'center', justifyContent: 'center',
-      backgroundColor: '#FFFFFF', borderWidth: 1, borderColor: 'rgba(255,255,255,0.18)',
-    }}>
-      <Image
-        source={HIMALAYA_LOGO}
-        style={{ width: size * 0.78, height: size * 0.78 }}
-        resizeMode="contain"
-        accessibilityLabel="Himalaya Airlines logo"
-      />
-    </View>
+    <Image
+      source={APP_ICON}
+      style={{ width: size, height: size, borderRadius: Math.round(size * 0.24), borderWidth: 1, borderColor: 'rgba(255,255,255,0.35)' }}
+      resizeMode="contain"
+      accessibilityLabel="Himalaya Airlines OBS"
+    />
   );
 }
 

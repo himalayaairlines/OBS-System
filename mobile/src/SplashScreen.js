@@ -5,13 +5,14 @@
  * Works on web, iOS and Android; no extra packages needed.
  */
 import React, { useEffect, useRef } from 'react';
-import { ActivityIndicator, Animated, Image, StatusBar, Text, View } from 'react-native';
+import { ActivityIndicator, Animated, Image, StatusBar, View } from 'react-native';
+import { Text } from './text';
 import Svg, { Defs, LinearGradient, RadialGradient, Rect, Stop } from 'react-native-svg';
 
 import { ws } from './fonts';
 
 const LOGO = require('../assets/splash-logo.png');
-const LOGO_RATIO = 600 / 594; // width / height of splash-logo.png
+const LOGO_RATIO = 1; // splash-logo.png is square (the app icon)
 
 export default function SplashScreen() {
   const fade = useRef(new Animated.Value(0)).current;

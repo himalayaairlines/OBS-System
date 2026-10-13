@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { Pressable, View } from 'react-native';
+import { Text } from '../../text';
 
 import { api } from '../../api';
 import { confirm } from '../../dialog';
@@ -18,6 +19,7 @@ export default function Rules({ user, options, reloadOptions }) {
   const [simulation, setSimulation] = useState(null);
   const [message, setMessage] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [versions, setVersions] = useState(null);
 
   const load = useCallback(async () => {
     try {
@@ -34,6 +36,7 @@ export default function Rules({ user, options, reloadOptions }) {
     try {
       setSelected(await api(`/communication/rules/${rule.id}`));
       setSimulation(null);
+      setVersions(null);
     } catch (e) {
       setMessage({ tone: 'danger', text: e.message });
     }
@@ -120,6 +123,27 @@ export default function Rules({ user, options, reloadOptions }) {
             {r.can_edit && <Button title="Delete" tone="danger" small onPress={() => remove(r)} />}
           </View>
           {simulation && <SimulationResult result={simulation} />}
+        </Card>
+        <Card>
+          <SectionTitle title="Version history"
+            description="Every saved state of this rule. Each alert records the version that opened it."
+            right={!versions && (
+              <Button title="Show" tone="ghost" small onPress={async () => {
+                try { setVersions(await api(`/communication/rules/${r.id}/versions`)); } catch (e) { setMessage({ tone: 'danger', text: e.message }); }
+              }} />
+            )} />
+          {versions && versions.length === 0 && <Text style={styles.empty}>No versions recorded.</Text>}
+          {versions && versions.map((v) => (
+            <View key={v.version} style={styles.listRow}>
+              <View style={styles.rowBetween}>
+                <Text style={{ fontWeight: '600', color: COLORS.text }}>v{v.version} · {v.action.replace(/_/g, ' ').toLowerCase()}</Text>
+                <StatusPill status={v.status} />
+              </View>
+              <Text style={styles.mono}>{when(v.changed_at)} by {v.changed_by || '—'}</Text>
+              <Text style={styles.mono}>{v.condition_text} · {v.scope_text} · {FREQUENCY_LABELS[v.frequency] || v.frequency}</Text>
+              <Text style={styles.mono}>Recipients: {(v.recipients || []).map((x) => recipientLabel(x, options)).join(', ') || '—'}</Text>
+            </View>
+          ))}
         </Card>
         <Card>
           <SectionTitle title="Recent alerts from this rule" />

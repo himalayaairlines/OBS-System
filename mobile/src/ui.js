@@ -1,7 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import {
-  ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View, useWindowDimensions,
+  ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, View, useWindowDimensions,
 } from 'react-native';
+import { Text, TextInput } from './text';
 
 import { registerDialogHandler } from './dialog';
 import {

@@ -8,6 +8,7 @@ import Alerts from './Alerts';
 import Deliveries from './Deliveries';
 import Escalation from './Escalation';
 import Groups from './Groups';
+import ItemAlerts from './ItemAlerts';
 import Overview from './Overview';
 import Rules from './Rules';
 import Settings from './Settings';
@@ -16,6 +17,7 @@ import { has } from './shared';
 
 const TABS = [
   { key: 'overview', label: 'Overview', any: ['comms_view'] },
+  { key: 'items', label: 'Stock alert settings', any: ['comms_view'] },
   { key: 'rules', label: 'Alert rules', any: ['comms_view'] },
   { key: 'alerts', label: 'Alerts', any: ['comms_view'] },
   { key: 'groups', label: 'Recipients & groups', any: ['comms_view'] },
@@ -71,6 +73,7 @@ export default function CommsScreen({ user, online, initialAlertId, onHandled })
         </View>
       </ScrollView>
       {online && tab === 'overview' && <Overview {...props} goTo={setTab} />}
+      {online && tab === 'items' && <ItemAlerts {...props} />}
       {online && tab === 'rules' && <Rules {...props} />}
       {online && tab === 'alerts' && <Alerts {...props} focusId={alertId} clearFocus={() => setAlertId(null)} />}
       {online && tab === 'groups' && <Groups {...props} />}

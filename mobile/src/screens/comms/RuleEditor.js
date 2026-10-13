@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
-import { Text, View } from 'react-native';
+import { View } from 'react-native';
+import { Text } from '../../text';
 
 import { api } from '../../api';
 import { COLORS, ROLE_LABELS, styles } from '../../theme';

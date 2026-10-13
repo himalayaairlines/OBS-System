@@ -178,3 +178,52 @@ These parts of the original brief are deliberately left for later increments:
 - **Microsoft Teams, SMS and push channels.** In-app and email are the only channels.
 - **OAuth email delivery** for Microsoft 365 tenants that block SMTP AUTH.
 - **Live updates.** The bell polls every 30 seconds; there is no WebSocket.
+
+## Stock Alert Settings (API 7.4)
+
+Communication Manager → **Stock alert settings** shows every item with the alert values that actually apply to it, and lets authorised users change them per item. Nothing is hardcoded: every threshold, recipient, interval and escalation step comes from the database and takes effect at once (the change is re-evaluated immediately and also queued through the outbox).
+
+### What decides an item's alerts (precedence)
+
+1. **Master switch** (Settings → *Stock alerts enabled*). Off: no new incidents, reminders, escalations or digests. Existing incidents are left as they are.
+2. **Item setting – Disabled**: no stock alerts for that item from any rule. Open incidents for it are resolved.
+3. **Item setting – Override**: each value set on the item (alert threshold, critical threshold, recovery level) replaces that value in every rule that reaches the item. Empty boxes keep the rule's value. Recipients, channels, frequency and escalation always come from the rule.
+4. **Rules**: an *exclusive* rule naming the item explicitly takes over from rules reaching it only by category or "every product"; otherwise each matching rule evaluates on its own.
+
+An item no rule reaches never alerts, even with an override (shown as *Needs attention*). There is one stock location (the main warehouse), so there is no warehouse or department level. Stock is counted in whole units, so thresholds are whole numbers; **0 is a real threshold and is never the same as "not set"**.
+
+### Recovery
+
+An incident resolves when stock reaches the item's *recovery level* (stock ≥ value) or, without one, the rule's threshold plus its recovery margin. Between the alert threshold and the recovery level the incident stays open, so stock bouncing around the threshold does not produce repeated alerts. Acknowledging never resolves a shortage.
+
+### Item table, coverage, simulation
+
+* Search, category, status and below-threshold filters; server-side paging. ● marks values set on the item itself.
+* **Alert coverage**: configured, inheriting, disabled, missing and invalid counts, so gaps are visible before they cause a missed alert.
+* Item page: where each value comes from (rule, item override, reorder level), the rule versions, alert history, and **Test the configuration**: enter a stock figure to see the outcome per rule (would alert, severity rises, no duplicate, stays open, would resolve), the recipients and the email text. A simulation changes nothing and sends nothing.
+* **Usage-based suggestion**: average daily usage from trolley loads minus returns (last 90 days; needs at least 3 loads over 14 days) and supplier lead time from received purchase orders. Shown only when the data exists, and only applied if you put it in the form and save.
+* **Bulk edit** (select rows): preview before/after for every item, then apply. Contradictory results block the whole change.
+* **Export CSV / Import**: columns `product_code, product_name, category, mode, low_threshold, critical_threshold, recovery_threshold, note`. Import is dry-run first; duplicates, unknown codes and invalid values are reported and nothing is applied until the file is clean.
+
+### Snooze, versions, quiet hours
+
+* **Snooze** (alert page, reason required): pauses reminders and escalation for up to *Longest snooze* hours. Critical/out-of-stock alerts can be snoozed only if Settings allow it. A worse stock level always ends a snooze and notifies as usual.
+* **Rule versions**: every create/edit/activate/disable stores a snapshot. Each incident records the rule version that opened it (Alert rules → rule → Version history).
+* **Critical ignores business hours** (Settings): for business-hours rules, critical and out-of-stock email goes out at once.
+
+### Permissions
+
+| Permission | Who | Allows |
+|---|---|---|
+| `comms_view` | inventory, inventory supervisor, management, admin | item table, coverage, simulation, suggestions, export |
+| `comms_item_settings` | inventory supervisor, management, admin | change item settings, bulk edit, import |
+
+The administrator role now also has `comms_view`, `comms_rules`, `comms_rules_all` and `comms_groups`, so the administrator can configure alerts. A rule's owner must still be someone who can see warehouse stock (for example an inventory supervisor).
+
+### Endpoints (all under `/communication`)
+
+`GET /items`, `GET /items/{id}`, `PUT /items/{id}/alert-settings`, `POST /items/{id}/simulate`, `POST /items/bulk`, `GET /items-export`, `POST /items-import`, `GET /coverage`, `GET /rules/{id}/versions`, `POST /alerts/{id}/snooze`, `POST /alerts/{id}/unsnooze`. Settings gain `alerts_enabled`, `max_snooze_hours`, `allow_snooze_critical`, `critical_ignores_business_hours`.
+
+### Database (added automatically on start, nothing removed)
+
+`stock_alert_item_settings` (one row per item with its own settings; no row = inherit), `comm_rule_versions`, and on `alert_incidents`: `rule_version`, `snoozed_until`, `snooze_reason`, `snoozed_by`.

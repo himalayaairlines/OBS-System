@@ -297,6 +297,39 @@ CREATE TABLE IF NOT EXISTS worker_leases (
     owner TEXT,
     expires_at TEXT
 );
+
+-- Per-item alert settings (Stock Alert Settings > Items). No row = the item
+-- simply inherits whatever ACTIVE rules reach it.
+--   OVERRIDE  replaces individual threshold values for this item in every rule
+--             that reaches it; a NULL column keeps the rule's own value.
+--   DISABLED  no stock alerts at all for this item, whatever the rules say.
+-- NULL means "not set" and is never the same as 0.
+CREATE TABLE IF NOT EXISTS stock_alert_item_settings (
+    product_id INTEGER PRIMARY KEY,
+    mode TEXT NOT NULL CHECK (mode IN ('OVERRIDE','DISABLED')),
+    low_threshold REAL CHECK (low_threshold IS NULL OR low_threshold >= 0),
+    critical_threshold REAL CHECK (critical_threshold IS NULL OR critical_threshold >= 0),
+    recovery_threshold REAL CHECK (recovery_threshold IS NULL OR recovery_threshold >= 0),
+    note TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    updated_by TEXT,
+    updated_at TEXT,
+    FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+);
+
+-- Every saved state of a rule, so an incident can be traced to the exact
+-- thresholds and recipients that were in force when it opened.
+CREATE TABLE IF NOT EXISTS comm_rule_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    snapshot TEXT NOT NULL,
+    changed_by TEXT,
+    changed_at TEXT NOT NULL,
+    UNIQUE (rule_id, version),
+    FOREIGN KEY (rule_id) REFERENCES comm_rules(id) ON DELETE CASCADE
+);
 """
 
 DEFAULT_SETTINGS = {
@@ -312,6 +345,16 @@ DEFAULT_SETTINGS = {
     # means rules can only address registered users.
     "external_email_domains": "",
     "sweep_minutes": "5",
+    # Master switch for stock alerts. Off = no new incidents or messages from
+    # any rule; existing incidents stay as they are until switched back on.
+    "alerts_enabled": "1",
+    # Snooze: longest allowed, and whether critical / out-of-stock alerts may
+    # be snoozed at all.
+    "max_snooze_hours": "72",
+    "allow_snooze_critical": "0",
+    # Critical and out-of-stock emails go out at once even for rules limited
+    # to business hours.
+    "critical_ignores_business_hours": "0",
 }
 
 TEMPLATE_PLACEHOLDERS = {
@@ -388,12 +431,32 @@ def initialize_comms(connection, add_column):
     """Create the communication tables and seed defaults. Never overwrites edits."""
     add_column(connection, "users", "email", "TEXT")
     connection.executescript(COMMS_SCHEMA)
+    # 7.4: rule version at open, and incident snooze.
+    for column, kind in (("rule_version", "INTEGER"), ("snoozed_until", "TEXT"),
+                         ("snooze_reason", "TEXT"), ("snoozed_by", "TEXT")):
+        add_column(connection, "alert_incidents", column, kind)
     connection.execute("INSERT OR IGNORE INTO smtp_settings(id) VALUES (1)")
     for key, value in DEFAULT_SETTINGS.items():
         connection.execute(
             "INSERT OR IGNORE INTO app_settings(key,value,updated_by) VALUES (?,?,'SYSTEM')",
             (key, value),
         )
+    # 7.4: give every existing rule a first version snapshot.
+    import json as _json
+    for rule in connection.execute(
+            "SELECT * FROM comm_rules r WHERE NOT EXISTS "
+            "(SELECT 1 FROM comm_rule_versions v WHERE v.rule_id = r.id)").fetchall():
+        rule = dict(rule)
+        rule["scopes"] = [dict(x) for x in connection.execute(
+            "SELECT scope_type, scope_value, include FROM comm_rule_scopes WHERE rule_id=?", (rule["id"],))]
+        rule["recipients"] = [dict(x) for x in connection.execute(
+            "SELECT recipient_type, recipient_value, level FROM comm_rule_recipients WHERE rule_id=?",
+            (rule["id"],))]
+        connection.execute(
+            "INSERT OR IGNORE INTO comm_rule_versions(rule_id,version,action,snapshot,changed_by,changed_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (rule["id"], rule["version"], "BASELINE", _json.dumps(rule, default=str),
+             rule.get("updated_by") or "SYSTEM", rule.get("updated_at") or rule.get("created_at") or "1970-01-01T00:00:00Z"))
     for key, (subject, body) in DEFAULT_TEMPLATES.items():
         inserted = connection.execute(
             "INSERT OR IGNORE INTO email_templates(key,subject,body,version,updated_by) "

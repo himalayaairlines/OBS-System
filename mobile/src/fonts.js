@@ -56,6 +56,20 @@ export async function loadFonts(timeoutMs = 4000) {
   return Promise.race([load, timeout]);
 }
 
+/**
+ * Native only: the registered Work Sans family for a fontWeight value
+ * ('bold', '600', 700 ...), or null when the font is not loaded.
+ * Used by src/text.js so every <Text> / <TextInput> gets Work Sans.
+ */
+export function nativeFamily(fontWeight) {
+  if (Platform.OS === 'web' || !nativeLoaded) return null;
+  let w = fontWeight === 'bold' ? 700 : fontWeight === 'normal' || fontWeight == null ? 400 : Number(fontWeight);
+  if (!Number.isFinite(w)) w = 400;
+  const pick = WEIGHTS.reduce((best, x) => (Math.abs(x - w) < Math.abs(best - w) ? x : best), 400);
+  const family = `WorkSans-${pick}`;
+  return Font.isLoaded(family) ? family : null;
+}
+
 /** Text style for a Work Sans weight: `{ ...ws(600) }`. */
 export function ws(weight = 400) {
   const w = WEIGHTS.includes(weight) ? weight : 400;

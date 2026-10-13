@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Text, View } from 'react-native';
+import { View } from 'react-native';
+import { Text } from '../../text';
 
 import { api } from '../../api';
 import { BarChart, RankBarChart } from '../../charts';
@@ -33,6 +34,9 @@ export default function Overview({ goTo }) {
 
   return (
     <>
+      {data.alerts_enabled === false && (
+        <Banner tone="warning" message="Stock alerts are switched off for the whole system (Settings). No new alerts, reminders or escalations are raised." />
+      )}
       {!data.smtp_enabled && (
         <Banner tone="warning" message="Outgoing email is switched off. In-app alerts still work, and emails wait in the queue until SMTP is enabled in Settings." />
       )}
@@ -44,17 +48,25 @@ export default function Overview({ goTo }) {
           <Metric label="Out of stock" value={a.out} tone={a.out ? 'danger' : 'default'} width={120} />
           <Metric label="Unacknowledged" value={a.unacknowledged} tone={a.unacknowledged ? 'danger' : 'default'} width={120} />
           <Metric label="Escalated" value={a.escalated} width={120} />
+          {a.snoozed !== undefined && <Metric label="Snoozed" value={a.snoozed} width={120} />}
           <Metric label="Awaiting escalation" value={a.awaiting_escalation} width={120} />
           <Metric label="Resolved (30 days)" value={a.resolved_30d} tone="success" width={120} />
         </View>
       </Card>
 
       <Card>
-        <SectionTitle title="Rules" right={<Button title="Manage rules" tone="secondary" small onPress={() => goTo('rules')} />} />
+        <SectionTitle title="Rules" right={(
+          <View style={[styles.row, styles.gap8]}>
+            <Button title="Stock alert settings" tone="secondary" small onPress={() => goTo('items')} />
+            <Button title="Manage rules" tone="secondary" small onPress={() => goTo('rules')} />
+          </View>
+        )} />
         <View style={styles.wrap}>
           <Metric label="Active" value={data.rules.active} tone="success" width={100} />
           <Metric label="Draft" value={data.rules.draft} width={100} />
           <Metric label="Disabled" value={data.rules.disabled} width={100} />
+          {data.item_overrides !== undefined && <Metric label="Item overrides" value={data.item_overrides} width={100} />}
+          {data.items_disabled !== undefined && <Metric label="Items switched off" value={data.items_disabled} width={100} />}
         </View>
       </Card>
 

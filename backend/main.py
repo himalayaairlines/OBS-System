@@ -17,13 +17,13 @@ from fastapi.responses import JSONResponse
 from database import DB_PATH, ROLE_PERMISSIONS, initialize_database
 from routers import (
     admin, analytics, auth, catalog, communication, flight_reports, flights, notifications,
-    obs, rates, register, reports, sales, settings_smtp, warehouse,
+    obs, rates, register, reports, sales, settings_smtp, stock_alert_settings, warehouse,
 )
 import comms_worker
 
 # Bumped whenever endpoints are added. The app compares it on login and warns
 # if it is talking to an older server, which otherwise shows up as bare 404s.
-API_VERSION = "7.3"
+API_VERSION = "7.4"
 
 app = FastAPI(
     title="Himalaya Airlines OBS Revenue Management System",
@@ -77,7 +77,8 @@ async def unhandled_error(request: Request, exc: Exception):
 initialize_database()
 
 for module in (auth, admin, flights, catalog, warehouse, obs, register, sales, rates,
-               analytics, reports, flight_reports, settings_smtp, communication, notifications):
+               analytics, reports, flight_reports, settings_smtp, communication, stock_alert_settings,
+               notifications):
     app.include_router(module.router)
 
 

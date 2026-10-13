@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { Pressable, View } from 'react-native';
+import { Text } from '../../text';
 
 import { api } from '../../api';
 import { usePaged } from '../../paging';
@@ -67,6 +68,10 @@ export default function Alerts({ options, focusId, clearFocus }) {
           {!!d.acknowledged_at && <KeyValue label="Acknowledged" value={`${when(d.acknowledged_at)} by ${d.acknowledged_by}`} />}
           {!!d.assigned_to_name && <KeyValue label="Assigned to" value={d.assigned_to_name} />}
           {!!d.escalation_step && <KeyValue label="Escalation step" value={String(d.escalation_step)} />}
+          {!!d.snoozed_until && new Date(d.snoozed_until) > new Date() && (
+            <KeyValue label="Snoozed until" value={`${when(d.snoozed_until)} by ${d.snoozed_by} · ${d.snooze_reason || ''}`} />
+          )}
+          {!!d.rule_version && <KeyValue label="Rule version at opening" value={`v${d.rule_version}`} />}
           {!!d.resolved_at && <KeyValue label="Resolved" value={`${when(d.resolved_at)} · ${d.resolution || ''}`} />}
           <Text style={[styles.mono, { marginTop: 6 }]}>
             Acknowledging means someone is handling it. The alert resolves by itself when stock recovers.
@@ -80,12 +85,22 @@ export default function Alerts({ options, focusId, clearFocus }) {
                 )}
                 <Button title="Add comment" tone="secondary" small disabled={!text.trim()} onPress={() => act('comment', { comment: text }, 'Comment added.')} />
                 <Button title="Assign" tone="secondary" small onPress={() => setPicker('assign')} />
+                {['OPEN', 'ACKNOWLEDGED', 'ESCALATED'].includes(d.status)
+                  && !(d.snoozed_until && new Date(d.snoozed_until) > new Date()) && [4, 24].map((h) => (
+                  <Button key={h} title={`Snooze ${h} h`} tone="secondary" small disabled={text.trim().length < 3}
+                    onPress={() => act('snooze', { hours: h, reason: text.trim() }, `Snoozed for ${h} hours. Reminders and escalation pause; a worse stock level ends the snooze.`)} />
+                ))}
+                {!!d.snoozed_until && new Date(d.snoozed_until) > new Date() && (
+                  <Button title="End snooze" tone="secondary" small onPress={() => act('unsnooze', undefined, 'Snooze ended.')} />
+                )}
                 {d.status !== 'SUPPRESSED' && (
                   <Button title="Suppress" tone="warning" small disabled={text.trim().length < 3}
                     onPress={() => act('suppress', { remarks: text }, 'Suppressed. No more messages until stock recovers.')} />
                 )}
               </View>
-              <Text style={[styles.mono, { marginTop: 6 }]}>Suppress needs remarks and stops all further messages for this alert.</Text>
+              <Text style={[styles.mono, { marginTop: 6 }]}>
+                Snooze and suppress need a reason in the box. Snooze pauses reminders and escalation for a while; suppress stops all further messages for this alert.
+              </Text>
             </View>
           )}
           {!d.can_act && live && (

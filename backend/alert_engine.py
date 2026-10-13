@@ -16,7 +16,22 @@ How it fits together
 
 Products with no matching ACTIVE rule never produce outbound communication,
 whatever the warehouse dashboard shows as low stock.
+
+Precedence (Stock Alert Settings)
+---------------------------------
+1. The master switch (app_settings.alerts_enabled). Off: nothing is evaluated.
+2. Item setting DISABLED: no stock alerts for that item from any rule.
+3. Item setting OVERRIDE: each value it sets (alert / critical / recovery
+   threshold) replaces that value in every rule reaching the item. Values it
+   leaves empty come from the rule. Recipients, channels, frequency and
+   escalation always come from the rule.
+4. Rules: an `exclusive` rule naming the item explicitly takes over from rules
+   that reach it only through a category or "every product". Otherwise every
+   matching rule evaluates on its own (each with its own incident).
+There is one stock location (the main warehouse), so there is no warehouse or
+department level.
 """
+import json
 
 from contextlib import contextmanager
 from datetime import timedelta
@@ -125,23 +140,67 @@ def effective_rules(rules: list[dict], product: dict) -> list[tuple[dict, str, i
     return [(r, how, owner if (owner and how != "PRODUCT") else None) for r, how in matched]
 
 
-def thresholds(rule: dict, product: dict):
-    """Return (low, critical, comparator) or None when the rule cannot be applied."""
+def threshold_details(rule: dict, product: dict) -> dict | None:
+    """Effective thresholds for one rule and item, with where each value came from.
+
+    Returns {"low", "critical", "op", "recovery", "sources": {...}, "warnings": [...]}
+    or None when the rule cannot be applied to this item (no threshold).
+    """
     trigger = rule["trigger_type"]
     reorder = product.get("reorder_level")
+    override = product.get("alert_override") or {}
+    sources, warnings = {}, []
     if trigger == "OUT_OF_STOCK":
-        return 0.0, None, "<="
+        return {"low": 0.0, "critical": None, "op": "<=", "recovery": None,
+                "sources": {"low": "RULE_OUT_OF_STOCK"}, "warnings": warnings}
     if trigger == "PERCENT_OF_REORDER":
         if reorder is None or rule.get("percent") is None:
-            return None
-        return float(reorder) * float(rule["percent"]) / 100.0, _crit(rule), "<"
-    if rule.get("threshold_source") == "REORDER_LEVEL":
-        low = reorder
+            low = None
+        else:
+            low = float(reorder) * float(rule["percent"]) / 100.0
+            sources["low"] = "RULE_PERCENT_OF_REORDER"
+        op = "<"
     else:
-        low = rule.get("threshold")
+        if rule.get("threshold_source") == "REORDER_LEVEL":
+            low = reorder
+            sources["low"] = "ITEM_REORDER_LEVEL"
+        else:
+            low = rule.get("threshold")
+            sources["low"] = "RULE"
+        op = "<=" if trigger == "AT_OR_BELOW" else "<"
+    if override.get("low_threshold") is not None:
+        low, sources["low"] = override["low_threshold"], "ITEM_OVERRIDE"
     if low is None:
         return None
-    return float(low), _crit(rule), ("<=" if trigger == "AT_OR_BELOW" else "<")
+    critical = _crit(rule)
+    if critical is not None:
+        sources["critical"] = "RULE"
+    if override.get("critical_threshold") is not None:
+        critical, sources["critical"] = float(override["critical_threshold"]), "ITEM_OVERRIDE"
+    if critical is not None and critical >= float(low):
+        warnings.append(f"Critical threshold {format_qty(critical)} is not below the alert threshold "
+                        f"{format_qty(low)}, so it is ignored.")
+        critical = None
+        sources.pop("critical", None)
+    recovery = None
+    if override.get("recovery_threshold") is not None:
+        recovery, sources["recovery"] = float(override["recovery_threshold"]), "ITEM_OVERRIDE"
+    else:
+        margin = float(rule.get("recovery_margin") or 0)
+        # Shown as "recovers when stock reaches": with "at or below" stock must
+        # rise past low + margin, i.e. reach it plus one whole unit.
+        recovery = float(low) + margin + (1 if op == "<=" else 0)
+        sources["recovery"] = "RULE_MARGIN"
+    return {"low": float(low), "critical": critical, "op": op, "recovery": recovery,
+            "sources": sources, "warnings": warnings}
+
+
+def thresholds(rule: dict, product: dict):
+    """Return (low, critical, comparator) or None when the rule cannot be applied."""
+    detail = threshold_details(rule, product)
+    if detail is None:
+        return None
+    return detail["low"], detail["critical"], detail["op"]
 
 
 def _crit(rule):
@@ -170,22 +229,55 @@ def classify(qty: float, rule: dict, product: dict):
     return True, severity, low, critical, op
 
 
-def recovered(qty: float, low: float, op: str, margin: float) -> bool:
-    """Hysteresis: stock must clear the threshold by `margin` to resolve."""
+def recovered(qty: float, low: float, op: str, margin: float, recovery_threshold=None) -> bool:
+    """Hysteresis: stock must clear the threshold by `margin` to resolve, or
+    reach the item's own recovery threshold when one is set."""
+    if recovery_threshold is not None:
+        # Recovery can never happen while the alert condition itself still holds.
+        return qty >= float(recovery_threshold) and not _cmp(qty, low, op)
     margin = float(margin or 0)
     return qty > low + margin if op == "<=" else qty >= low + margin
 
 
 # --------------------------------------------------------------------------- #
+# Item alert settings
+# --------------------------------------------------------------------------- #
+def load_item_setting(connection, product_id: int) -> dict | None:
+    row = connection.execute("SELECT * FROM stock_alert_item_settings WHERE product_id=?",
+                             (product_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def attach_item_setting(connection, product: dict) -> dict:
+    """Put the item's OVERRIDE values on the product dict the engine passes around."""
+    setting = load_item_setting(connection, product["id"])
+    product["alert_setting"] = setting
+    product["alert_override"] = setting if setting and setting["mode"] == "OVERRIDE" else None
+    return product
+
+
+def alerts_enabled(settings: dict) -> bool:
+    return str(settings.get("alerts_enabled", "1")) != "0"
+
+
+def is_snoozed(incident: dict, now) -> bool:
+    until = parse_iso(incident.get("snoozed_until"))
+    return bool(until and until > now)
+
+
+# --------------------------------------------------------------------------- #
 # Products
 # --------------------------------------------------------------------------- #
-def load_product(connection, product_id: int) -> dict | None:
+def load_product(connection, product_id: int, with_setting: bool = False) -> dict | None:
     row = connection.execute(
         """SELECT p.id, p.product_code, p.product_name, p.category, p.unit,
                   p.reorder_level, p.active, COALESCE(m.quantity, 0) AS quantity
            FROM products p LEFT JOIN main_inventory m ON m.product_id = p.id
            WHERE p.id=?""", (product_id,)).fetchone()
-    return dict(row) if row else None
+    if not row:
+        return None
+    product = dict(row)
+    return attach_item_setting(connection, product) if with_setting else product
 
 
 def products_in_scope(connection, rules: list[dict]) -> list[int]:
@@ -234,10 +326,13 @@ def evaluate_product(connection, product_id: int, now=None, settings=None, rules
     now = now or utc_now()
     settings = settings or load_settings(connection)
     rules = rules if rules is not None else active_rules(connection, now, settings)
-    product = load_product(connection, product_id)
     actions: list[dict] = []
+    if not alerts_enabled(settings):
+        return actions
+    product = load_product(connection, product_id)
     if not product:
         return actions
+    attach_item_setting(connection, product)
     qty = float(product["quantity"])
 
     placeholders = ",".join("?" * len(ACTIVE_STATUSES))
@@ -245,9 +340,11 @@ def evaluate_product(connection, product_id: int, now=None, settings=None, rules
         f"SELECT * FROM alert_incidents WHERE product_id=? AND status IN ({placeholders})",
         (product_id, *ACTIVE_STATUSES)).fetchall()]
 
-    if not product["active"]:
+    item_disabled = bool(product["alert_setting"] and product["alert_setting"]["mode"] == "DISABLED")
+    if not product["active"] or item_disabled:
+        reason = "Product deactivated." if not product["active"] else "Stock alerts disabled for this item."
         for incident in live:
-            _resolve(connection, incident, now, "Product deactivated.", qty)
+            _resolve(connection, incident, now, reason, qty)
             actions.append({"incident_id": incident["id"], "action": "RESOLVED"})
         connection.execute("DELETE FROM alert_breach_watch WHERE product_id=?", (product_id,))
         return actions
@@ -290,10 +387,11 @@ def evaluate_product(connection, product_id: int, now=None, settings=None, rules
                     incident_id = connection.execute(
                         """INSERT INTO alert_incidents
                            (rule_id,product_id,status,severity,opened_at,breach_started_at,
-                            last_evaluated_at,opening_quantity,last_quantity,threshold_at_open)
-                           VALUES (?,?,'OPEN',?,?,?,?,?,?,?)""",
+                            last_evaluated_at,opening_quantity,last_quantity,threshold_at_open,
+                            rule_version)
+                           VALUES (?,?,'OPEN',?,?,?,?,?,?,?,?)""",
                         (rule["id"], product_id, severity, iso(now), iso(breach_started),
-                         iso(now), qty, qty, low)).lastrowid
+                         iso(now), qty, qty, low, rule.get("version"))).lastrowid
                 except sqlite3.IntegrityError:
                     continue  # another worker opened it first
                 event_id = add_event(connection, incident_id, "OPENED", now, severity, qty,
@@ -309,7 +407,8 @@ def evaluate_product(connection, product_id: int, now=None, settings=None, rules
             incident["last_quantity"] = qty
             old_rank, new_rank = SEVERITY_RANK[incident["severity"]], SEVERITY_RANK[severity]
             if new_rank > old_rank:
-                connection.execute("UPDATE alert_incidents SET severity=? WHERE id=?",
+                # A worse condition always cancels a snooze.
+                connection.execute("UPDATE alert_incidents SET severity=?, snoozed_until=NULL WHERE id=?",
                                    (severity, incident["id"]))
                 event_id = add_event(connection, incident["id"], "SEVERITY_UP", now, severity, qty,
                                      detail=f"{incident['severity']} -> {severity}")
@@ -329,7 +428,9 @@ def evaluate_product(connection, product_id: int, now=None, settings=None, rules
                            (rule["id"], product_id))
         if not incident:
             continue
-        if low is not None and recovered(qty, low, op, rule["recovery_margin"]):
+        override = product.get("alert_override") or {}
+        if low is not None and recovered(qty, low, op, rule["recovery_margin"],
+                                         override.get("recovery_threshold")):
             event_id = _resolve(connection, incident, now, "Stock recovered above threshold.", qty)
             if rule["notify_on_recovery"] and incident["status"] != "SUPPRESSED":
                 incident["last_quantity"] = qty
@@ -410,7 +511,9 @@ def notify(connection, rule, incident, product, kind, severity, event_id, now, s
     digest_only = rule["frequency"] in DIGEST_FREQUENCIES and kind in ("ALERT", "REMINDER")
     if rule["channel_email"] and not digest_only:
         template = SEVERITY_TEMPLATE[severity] if kind == "ALERT" else KIND_TEMPLATE[kind]
-        due = next_business_start(now, settings) if rule["business_hours_only"] else now
+        bypass = (str(settings.get("critical_ignores_business_hours", "0")) == "1"
+                  and severity in ("CRITICAL", "OUT"))
+        due = next_business_start(now, settings) if rule["business_hours_only"] and not bypass else now
         max_attempts = _smtp_max_attempts(connection)
         for r in recipients:
             if not r["email"]:
@@ -448,6 +551,8 @@ def run_reminders(connection, now, settings) -> int:
              AND r.frequency IN ('REPEAT_HOURS','DAILY')""").fetchall()
     for row in rows:
         incident = dict(row)
+        if is_snoozed(incident, now):
+            continue
         rule = load_rule(connection, incident["rule_id"])
         if incident["reminders_sent"] >= rule["max_reminders"]:
             continue
@@ -460,7 +565,7 @@ def run_reminders(connection, now, settings) -> int:
             due = local_date(last, settings) != local_date(now, settings)
         if not due:
             continue
-        product = load_product(connection, incident["product_id"])
+        product = load_product(connection, incident["product_id"], with_setting=True)
         event_id = add_event(connection, incident["id"], "REMINDER", now, incident["severity"],
                              incident["last_quantity"])
         connection.execute("UPDATE alert_incidents SET reminders_sent=reminders_sent+1 WHERE id=?",
@@ -479,6 +584,8 @@ def run_escalations(connection, now, settings) -> int:
            WHERE i.status IN ('OPEN','ESCALATED') AND r.status='ACTIVE'""").fetchall()
     for row in rows:
         incident = dict(row)
+        if is_snoozed(incident, now):
+            continue
         rule = load_rule(connection, incident["rule_id"])
         step_no = incident["escalation_step"] + 1
         steps = [dict(s) for s in connection.execute(
@@ -489,7 +596,7 @@ def run_escalations(connection, now, settings) -> int:
         wait = min(s["after_minutes"] for s in steps)
         if now - parse_iso(incident["opened_at"]) < timedelta(minutes=wait):
             continue
-        product = load_product(connection, incident["product_id"])
+        product = load_product(connection, incident["product_id"], with_setting=True)
         event_id = add_event(connection, incident["id"], "ESCALATED", now, incident["severity"],
                              incident["last_quantity"], detail=f"Escalation step {step_no}")
         connection.execute("UPDATE alert_incidents SET escalation_step=?, status='ESCALATED' WHERE id=?",
@@ -561,6 +668,8 @@ def simulate(connection, rule: dict, settings=None) -> dict:
         how = match_kind(rule, product)
         if not how:
             continue
+        attach_item_setting(connection, product)
+        item_disabled = bool(product["alert_setting"] and product["alert_setting"]["mode"] == "DISABLED")
         overriding = None
         if how != "PRODUCT":
             for other in others:
@@ -576,8 +685,10 @@ def simulate(connection, rule: dict, settings=None) -> dict:
             "threshold": low, "critical_threshold": critical, "matched_by": how,
             "breached": breached, "severity": severity,
             "overridden_by": overriding,
+            "item_disabled": item_disabled,
+            "item_override": bool(product["alert_override"]),
             "existing_incident_id": existing["id"] if existing else None,
-            "would_notify": bool(breached and not overriding and not existing),
+            "would_notify": bool(breached and not overriding and not existing and not item_disabled),
         })
     preview = {}
     for level in ("LOW", "CRITICAL"):
@@ -592,3 +703,149 @@ def simulate(connection, rule: dict, settings=None) -> dict:
         "recipients": preview,
         "note": "Simulation only. Nothing was saved and no message was sent.",
     }
+
+
+# --------------------------------------------------------------------------- #
+# Effective configuration and per-item simulation (no writes)
+# --------------------------------------------------------------------------- #
+SOURCE_LABELS = {
+    "RULE": "Rule threshold",
+    "RULE_OUT_OF_STOCK": "Rule (out of stock)",
+    "RULE_PERCENT_OF_REORDER": "Rule (% of reorder level)",
+    "ITEM_REORDER_LEVEL": "Item reorder level",
+    "ITEM_OVERRIDE": "Item override",
+    "RULE_MARGIN": "Rule recovery margin",
+}
+MATCH_LABELS = {"PRODUCT": "Item named in rule", "CATEGORY": "Category", "ALL": "Every product"}
+
+
+def effective_configuration(connection, product: dict, settings=None, rules=None, now=None) -> dict:
+    """Everything that decides alerts for one item, and where each value comes from."""
+    now = now or utc_now()
+    settings = settings or load_settings(connection)
+    rules = rules if rules is not None else active_rules(connection, now, settings)
+    if "alert_setting" not in product:
+        attach_item_setting(connection, product)
+    setting = product.get("alert_setting")
+    entries = []
+    for rule, how, suppressed_by in effective_rules(rules, product):
+        detail = threshold_details(rule, product)
+        entries.append({
+            "rule_id": rule["id"], "rule_name": rule["name"], "rule_version": rule.get("version"),
+            "priority": rule["priority"], "matched_by": how, "matched_label": MATCH_LABELS.get(how, how),
+            "applies": suppressed_by is None and detail is not None,
+            "overridden_by_rule_id": suppressed_by,
+            "trigger_type": rule["trigger_type"],
+            "low": detail["low"] if detail else None,
+            "critical": detail["critical"] if detail else None,
+            "recovery": detail["recovery"] if detail else None,
+            "comparison": detail["op"] if detail else None,
+            "sources": {k: {"code": v, "label": SOURCE_LABELS.get(v, v)}
+                        for k, v in (detail["sources"] if detail else {}).items()},
+            "warnings": (detail["warnings"] if detail else
+                         ["This rule has no threshold for this item (no reorder level or percentage)."]),
+            "frequency": rule["frequency"], "repeat_hours": rule.get("repeat_hours"),
+            "channel_email": bool(rule["channel_email"]), "channel_in_app": bool(rule["channel_in_app"]),
+            "business_hours_only": bool(rule["business_hours_only"]),
+            "notify_on_critical": bool(rule["notify_on_critical"]),
+            "notify_on_recovery": bool(rule["notify_on_recovery"]),
+            "escalation_policy_id": rule.get("escalation_policy_id"),
+        })
+    applying = [e for e in entries if e["applies"]]
+    mode = setting["mode"] if setting else "INHERIT"
+    if not alerts_enabled(settings):
+        status, explanation = "GLOBAL_OFF", "Stock alerts are switched off for the whole system."
+    elif not product.get("active", 1):
+        status, explanation = "INACTIVE", "The item is inactive."
+    elif mode == "DISABLED":
+        status, explanation = "DISABLED", "Alerts are disabled for this item."
+    elif not entries:
+        status = "INVALID" if mode == "OVERRIDE" else "NOT_CONFIGURED"
+        explanation = ("The item has its own thresholds but no active rule reaches it, so nobody would be told."
+                       if mode == "OVERRIDE" else "No active rule reaches this item. It never sends alerts.")
+    elif not applying:
+        status, explanation = "INVALID", "Rules reach this item but none can be applied to it."
+    elif mode == "OVERRIDE" or any(e["matched_by"] == "PRODUCT" for e in applying):
+        status, explanation = "CONFIGURED", "Explicitly configured for this item."
+    else:
+        status, explanation = "INHERITED", "Inherits from a category or every-product rule."
+    if status in ("CONFIGURED", "INHERITED") and any(e["warnings"] for e in applying):
+        explanation += " Some values are ignored; see the warnings."
+    # The headline figures: the most sensitive applying rule (highest alert threshold).
+    head = max(applying, key=lambda e: e["low"]) if applying else None
+    return {
+        "product_id": product["id"], "status": status, "explanation": explanation,
+        "item_setting": setting, "mode": mode,
+        "low": head["low"] if head else None, "critical": head["critical"] if head else None,
+        "recovery": head["recovery"] if head else None,
+        "source": ("Item override" if mode == "OVERRIDE" and head else
+                   (f"{head['matched_label']}: {head['rule_name']}" if head else None)),
+        "rules": entries,
+    }
+
+
+def simulate_item(connection, product_id: int, quantity: float, settings=None) -> dict:
+    """What would happen if this item's stock were `quantity` now. Writes nothing."""
+    settings = settings or load_settings(connection)
+    now = utc_now()
+    product = load_product(connection, product_id, with_setting=True)
+    if not product:
+        return {}
+    product["quantity"] = quantity
+    rules = active_rules(connection, now, settings)
+    config = effective_configuration(connection, product, settings, rules, now)
+    results = []
+    blocked = config["status"] in ("GLOBAL_OFF", "DISABLED", "INACTIVE")
+    for entry in config["rules"]:
+        rule = next(r for r in rules if r["id"] == entry["rule_id"])
+        breached, severity, low, critical, op = classify(float(quantity), rule, product)
+        incident = _active_incident(connection, rule["id"], product_id)
+        outcome, reason = "NONE", "Stock is above the alert threshold."
+        if not entry["applies"]:
+            outcome, reason = "SKIPPED", ("An exclusive rule for this item takes over."
+                                          if entry["overridden_by_rule_id"] else "Rule cannot be applied.")
+        elif blocked:
+            outcome, reason = "BLOCKED", config["explanation"]
+        elif breached and rule["trigger_type"] == "BELOW_FOR_DURATION" and not incident:
+            outcome = "WATCH"
+            reason = f"Opens only after stock stays low for {rule.get('duration_minutes')} minutes."
+        elif breached and not incident:
+            outcome, reason = "OPEN", "A new incident would open and notify recipients."
+        elif breached and incident:
+            if SEVERITY_RANK[severity] > SEVERITY_RANK[incident["severity"]]:
+                outcome = "SEVERITY_UP"
+                reason = ("Severity rises; recipients are notified." if rule["notify_on_critical"]
+                          else "Severity rises; this rule does not notify on severity changes.")
+            else:
+                outcome = "SUPPRESSED"
+                reason = (f"Incident #{incident['id']} is already open at {incident['severity'].lower()}; "
+                          f"frequency '{rule['frequency']}' prevents a duplicate message.")
+        elif incident:
+            override = product.get("alert_override") or {}
+            if recovered(float(quantity), low, op, rule["recovery_margin"], override.get("recovery_threshold")):
+                outcome = "RESOLVE"
+                reason = ("Incident would resolve and a recovery message would be sent."
+                          if rule["notify_on_recovery"] else "Incident would resolve (no recovery message).")
+            else:
+                outcome = "HOLD"
+                reason = "Above the alert threshold but not yet at the recovery level, so it stays open."
+        level = severity if severity in ("CRITICAL", "OUT") else "LOW"
+        people, excluded = resolve_recipients(connection, rule["recipients"], rule["owner_user_id"],
+                                              level, settings)
+        preview = None
+        if outcome in ("OPEN", "SEVERITY_UP", "RESOLVE") and rule["channel_email"]:
+            fake = {"id": incident["id"] if incident else "(new)", "last_quantity": quantity,
+                    "opened_at": iso(now)}
+            template = "recovery" if outcome == "RESOLVE" else SEVERITY_TEMPLATE[severity]
+            first = people[0] if people else {"name": "Recipient"}
+            subject, text, _html = render_email(
+                connection, template, _context(rule, fake, product, severity or "LOW", first, settings))
+            preview = {"subject": subject, "body": text}
+        results.append({**entry, "breached": breached, "severity": severity, "outcome": outcome,
+                        "reason": reason, "existing_incident_id": incident["id"] if incident else None,
+                        "recipients": [{"name": p["name"], "email": bool(p["email"]),
+                                        "in_app": p["user_id"] is not None} for p in people],
+                        "excluded": excluded, "email_preview": preview})
+    return {"product_id": product_id, "quantity": quantity, "status": config["status"],
+            "explanation": config["explanation"], "results": results,
+            "note": "Simulation only. Stock, incidents and delivery history are unchanged; nothing was sent."}

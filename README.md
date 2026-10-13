@@ -1,6 +1,6 @@
 # Himalaya Airlines OBS Revenue Management System
 
-![API version](https://img.shields.io/badge/API-v7.3-0B4F8A)
+![API version](https://img.shields.io/badge/API-v7.4-0B4F8A)
 ![Backend](https://img.shields.io/badge/backend-FastAPI%20%2B%20SQLite-009688)
 ![Mobile](https://img.shields.io/badge/mobile-Expo%2057%20%2F%20React%20Native-000020)
 ![Platforms](https://img.shields.io/badge/runs%20on-iPad%20%7C%20Android%20%7C%20web-lightgrey)
@@ -97,7 +97,7 @@ On first start, the server creates `backend/obs.db` and fills it with demo data.
 
 ```bash
 curl http://localhost:8000/health
-# {"status":"online","version":"7.3","routes":...}
+# {"status":"online","version":"7.4","routes":...}
 ```
 
 Open <http://localhost:8000/docs> for the interactive API reference.
@@ -139,6 +139,8 @@ The seed data creates one demo account for each role. Every password is `1234`; 
 | `MGT001` | Management User | Management |
 | `FIN001` | Finance Officer | Finance |
 | `ADMIN001` | Administrator | Admin |
+
+
 
 Each role sees only the screens its permissions allow. The permission sets are defined in `ROLE_PERMISSIONS` in [`backend/database.py`](backend/database.py), and the API serves them at `GET /permissions`.
 

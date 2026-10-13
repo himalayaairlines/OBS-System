@@ -151,7 +151,8 @@ class Base(unittest.TestCase):
     def setUp(self):
         connection = db()
         for table in ("user_notifications", "notification_jobs", "alert_events", "alert_breach_watch",
-                      "alert_incidents", "comm_rule_recipients", "comm_rule_scopes", "comm_rules",
+                      "alert_incidents", "stock_alert_item_settings", "comm_rule_versions",
+                      "comm_rule_recipients", "comm_rule_scopes", "comm_rules",
                       "comm_group_members", "comm_groups", "comm_escalation_steps",
                       "comm_escalation_policies", "stock_change_outbox", "worker_leases"):
             connection.execute(f"DELETE FROM {table}")
@@ -159,6 +160,9 @@ class Base(unittest.TestCase):
         connection.execute("UPDATE products SET active=1")
         connection.execute("UPDATE smtp_settings SET enabled=0 WHERE id=1")
         connection.execute("UPDATE app_settings SET value='' WHERE key='external_email_domains'")
+        for key, value in (("alerts_enabled", "1"), ("allow_snooze_critical", "0"),
+                           ("critical_ignores_business_hours", "0"), ("max_snooze_hours", "72")):
+            connection.execute("UPDATE app_settings SET value=? WHERE key=?", (value, key))
         connection.commit()
         connection.close()
 
@@ -690,7 +694,7 @@ class RegressionTests(Base):
         status, users = call("GET", "/users", "ADMIN001")
         self.assertIn("email", users[0])
         status, health = call("GET", "/health")
-        self.assertEqual(health["version"], "7.3")
+        self.assertEqual(health["version"], "7.4")
 
     def test_stock_movements_unchanged(self):
         before = q("SELECT quantity FROM main_inventory WHERE product_id=?", (self.p1,))[0]["quantity"]
@@ -834,6 +838,433 @@ class EndToEndTests(Base):
             self.assertEqual(call("PUT", f"/communication/rules/{rule['id']}", "INV001",
                                   rule_body(products=[self.p1]))[0], 403)
             self.assertEqual(len(smtp.messages), 1)  # the unrelated product never emailed anyone
+        finally:
+            smtp.stop()
+
+
+
+# --------------------------------------------------------------------------- #
+# 7.4 Stock Alert Settings
+# --------------------------------------------------------------------------- #
+def item_setting(product_id, who="ISUP001", expect=200, **body):
+    current = q("SELECT version FROM stock_alert_item_settings WHERE product_id=?", (product_id,))
+    body.setdefault("expected_version", current[0]["version"] if current else None)
+    status, result = call("PUT", f"/communication/items/{product_id}/alert-settings", who, body)
+    assert status == expect, (status, result)
+    return result
+
+
+def raw(method, path, who, body=None):
+    headers = {"Authorization": f"Bearer {token(who)}", "Content-Type": "application/json"}
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(f"{BASE}{path}", data=data, method=method, headers=headers)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.status, response.headers.get("Content-Type"), response.read().decode()
+
+
+class ItemSettingsTests(Base):
+    def test_override_replaces_rule_threshold_and_resets(self):
+        make_rule(categories=[self.category], threshold=10)
+        item_setting(self.cat_a, mode="OVERRIDE", low_threshold=20)
+        set_stock(self.cat_a, 15)
+        set_stock(self.cat_b, 15)
+        cycle()
+        self.assertEqual([i["product_id"] for i in self.incidents()], [self.cat_a])
+        self.assertEqual(self.incidents()[0]["threshold_at_open"], 20)
+        detail = call("GET", f"/communication/items/{self.cat_a}", "ISUP001")[1]
+        self.assertEqual(detail["configuration"]["status"], "CONFIGURED")
+        self.assertEqual(detail["configuration"]["rules"][0]["sources"]["low"]["code"], "ITEM_OVERRIDE")
+        other = call("GET", f"/communication/items/{self.cat_b}", "ISUP001")[1]
+        self.assertEqual(other["configuration"]["status"], "INHERITED")
+        self.assertEqual(other["configuration"]["rules"][0]["sources"]["low"]["code"], "RULE")
+        # Reset to inherit: back to the rule's 10, so 15 recovers.
+        item_setting(self.cat_a, mode="INHERIT")
+        self.assertEqual(self.incidents()[0]["status"], "RESOLVED")
+
+    def test_zero_is_not_unset(self):
+        make_rule(products=[self.p1], trigger_type="AT_OR_BELOW", threshold=10)
+        item_setting(self.p1, mode="OVERRIDE", low_threshold=0)
+        row = q("SELECT low_threshold, critical_threshold FROM stock_alert_item_settings WHERE product_id=?",
+                (self.p1,))[0]
+        self.assertEqual(row["low_threshold"], 0)
+        self.assertIsNone(row["critical_threshold"])
+        set_stock(self.p1, 1)
+        cycle()
+        self.assertEqual(self.incidents(), [])  # 1 is not at or below 0
+        set_stock(self.p1, 0)
+        cycle()
+        self.assertEqual(self.incidents()[0]["severity"], "OUT")
+        items = call("GET", "/communication/items?mode=OVERRIDE", "ISUP001")[1]["items"]
+        self.assertEqual(items[0]["low"], 0)
+        self.assertTrue(items[0]["low_is_override"])
+
+    def test_validation(self):
+        make_rule(products=[self.p1], threshold=10, critical_threshold=5)
+        for body, text in (
+                ({"mode": "OVERRIDE", "low_threshold": 5, "critical_threshold": 5}, "lower than"),
+                ({"mode": "OVERRIDE", "low_threshold": 10, "recovery_threshold": 10}, "recovery"),
+                ({"mode": "OVERRIDE", "low_threshold": 2.5}, "whole number"),
+                ({"mode": "OVERRIDE"}, "at least one"),
+                ({"mode": "DISABLED", "low_threshold": 4}, "only be set"),
+                ({"mode": "OVERRIDE", "low_threshold": 4}, "not below"),  # rule critical 5 >= new low 4
+                ({"mode": "OVERRIDE", "low_threshold": -1}, "")):
+            status, result = call("PUT", f"/communication/items/{self.p1}/alert-settings", "ISUP001",
+                                  {**body, "expected_version": None})
+            self.assertIn(status, (400, 422), (body, result))
+            if text:
+                self.assertIn(text, json.dumps(result), body)
+        self.assertEqual(q("SELECT * FROM stock_alert_item_settings"), [])
+
+    def test_optimistic_locking_and_permissions(self):
+        item_setting(self.p1, mode="DISABLED")
+        status, _ = call("PUT", f"/communication/items/{self.p1}/alert-settings", "ISUP001",
+                         {"mode": "INHERIT", "expected_version": None})
+        self.assertEqual(status, 409)
+        self.assertEqual(call("PUT", f"/communication/items/{self.p1}/alert-settings", "INV001",
+                              {"mode": "INHERIT", "expected_version": 1})[0], 403)
+        self.assertEqual(call("GET", "/communication/items", "FIN001")[0], 403)
+        self.assertEqual(call("GET", "/communication/items", "CREW001")[0], 403)
+        self.assertEqual(call("GET", "/communication/items", "INV001")[0], 200)
+        item_setting(self.p1, who="ADMIN001", mode="INHERIT")
+        self.assertEqual(q("SELECT * FROM stock_alert_item_settings"), [])
+        logs = q("SELECT action FROM audit_logs WHERE action='ITEM_ALERT_SETTINGS'")
+        self.assertGreaterEqual(len(logs), 2)
+
+    def test_disabled_item_is_silent_and_resolves(self):
+        make_rule(categories=[self.category], threshold=10)
+        set_stock(self.cat_a, 3)
+        cycle()
+        self.assertEqual(self.incidents()[0]["status"], "OPEN")
+        item_setting(self.cat_a, mode="DISABLED")
+        self.assertEqual(self.incidents()[0]["status"], "RESOLVED")
+        jobs_before = len(self.jobs())
+        set_stock(self.cat_a, 1)
+        set_stock(self.cat_a, 0)
+        cycle()
+        comms_worker.run_scheduled(force_sweep=True, owner="t")
+        self.assertEqual(len(self.incidents()), 1)
+        self.assertEqual(len(self.jobs()), jobs_before)
+        self.assertEqual(call("GET", f"/communication/items/{self.cat_a}", "ISUP001")[1]["item"]["status"],
+                         "DISABLED")
+
+    def test_item_recovery_threshold(self):
+        make_rule(products=[self.p1], threshold=10)
+        item_setting(self.p1, mode="OVERRIDE", recovery_threshold=12)
+        set_stock(self.p1, 8)
+        cycle()
+        set_stock(self.p1, 11)
+        cycle()
+        self.assertEqual(self.incidents()[0]["status"], "OPEN")
+        set_stock(self.p1, 12)
+        cycle()
+        self.assertEqual(self.incidents()[0]["status"], "RESOLVED")
+
+    def test_master_switch(self):
+        make_rule(products=[self.p1], threshold=10)
+        status, settings = call("GET", "/communication/settings", "MGT001")
+        settings.pop("last_sweep_at")
+        settings["alerts_enabled"] = False
+        self.assertEqual(call("PUT", "/communication/settings", "MGT001", settings)[0], 200)
+        set_stock(self.p1, 3)
+        cycle()
+        self.assertEqual(self.incidents(), [])
+        self.assertEqual(call("GET", f"/communication/items/{self.p1}", "MGT001")[1]["item"]["status"], "GLOBAL_OFF")
+        settings["alerts_enabled"] = True
+        call("PUT", "/communication/settings", "MGT001", settings)
+        comms_worker.run_scheduled(force_sweep=True, owner="t")
+        self.assertEqual(len(self.incidents()), 1)
+
+    def test_coverage_and_list_filters(self):
+        make_rule(products=[self.p1], threshold=10)
+        make_rule(categories=[self.category], threshold=10, exclude_products=[self.cat_b])
+        spare = q("SELECT id FROM products WHERE active=1 AND id NOT IN (?,?,?) LIMIT 1",
+                  (self.p1, self.cat_a, self.cat_b))[0]["id"]
+        item_setting(spare, mode="DISABLED")
+        set_stock(self.p1, 5)
+        cov = call("GET", "/communication/coverage", "INV001")[1]
+        total = len(q("SELECT id FROM products WHERE active=1"))
+        self.assertEqual(cov["total_items"], total)
+        self.assertEqual(cov["explicitly_configured"] + cov["inheriting"] + cov["excluded"]
+                         + cov["missing"] + cov["invalid"], total)
+        self.assertGreaterEqual(cov["missing"], 1)
+        self.assertIn(self.cat_b, [g["product_id"] for g in cov["gaps"]])
+        below = call("GET", "/communication/items?below=true", "INV001")[1]
+        self.assertEqual([i["product_id"] for i in below["items"]], [self.p1])
+        self.assertEqual(call("GET", f"/communication/items/{spare}", "INV001")[1]["item"]["status"], "DISABLED")
+        page = call("GET", "/communication/items?page=1&page_size=2", "INV001")[1]
+        self.assertEqual(len(page["items"]), 2)
+        self.assertEqual(page["total"], total)
+        code = q("SELECT product_code FROM products WHERE id=?", (self.p1,))[0]["product_code"]
+        found = call("GET", f"/communication/items?q={code}", "INV001")[1]
+        self.assertEqual(found["items"][0]["product_id"], self.p1)
+
+    def test_simulation_writes_nothing(self):
+        make_rule(products=[self.p1], threshold=10, critical_threshold=5,
+                  recipients=[{"recipient_type": "USER", "recipient_value": str(user_id("INV001")), "level": "LOW"},
+                              {"recipient_type": "USER", "recipient_value": str(user_id("ISUP001")),
+                               "level": "CRITICAL"}])
+        before = (q("SELECT quantity FROM main_inventory WHERE product_id=?", (self.p1,)),
+                  self.incidents(), self.jobs())
+        status, sim = call("POST", f"/communication/items/{self.p1}/simulate", "INV001", {"quantity": 4})
+        self.assertEqual(status, 200, sim)
+        result = sim["results"][0]
+        self.assertEqual((result["outcome"], result["severity"]), ("OPEN", "CRITICAL"))
+        self.assertEqual([r["name"] for r in result["recipients"]], ["Inventory Supervisor"])
+        self.assertIn("CRITICAL", result["email_preview"]["subject"])
+        self.assertEqual(before, (q("SELECT quantity FROM main_inventory WHERE product_id=?", (self.p1,)),
+                                  self.incidents(), self.jobs()))
+        set_stock(self.p1, 8)
+        cycle()
+        sim = call("POST", f"/communication/items/{self.p1}/simulate", "INV001", {"quantity": 7})[1]
+        self.assertEqual(sim["results"][0]["outcome"], "SUPPRESSED")
+        sim = call("POST", f"/communication/items/{self.p1}/simulate", "INV001", {"quantity": 20})[1]
+        self.assertEqual(sim["results"][0]["outcome"], "RESOLVE")
+        self.assertEqual(len(self.jobs()), 1)
+
+    def test_bulk_preview_and_apply(self):
+        make_rule(categories=[self.category], threshold=10)
+        body = {"product_ids": [self.cat_a, self.cat_b], "mode": "OVERRIDE", "low_threshold": 30,
+                "dry_run": True}
+        preview = call("POST", "/communication/items/bulk", "ISUP001", body)[1]
+        self.assertFalse(preview["applied"])
+        self.assertEqual(preview["items"][0]["after"]["low"], 30)
+        self.assertEqual(q("SELECT * FROM stock_alert_item_settings"), [])
+        body["dry_run"] = False
+        applied = call("POST", "/communication/items/bulk", "ISUP001", body)[1]
+        self.assertTrue(applied["applied"])
+        self.assertEqual(len(q("SELECT * FROM stock_alert_item_settings WHERE low_threshold=30")), 2)
+        bad = call("POST", "/communication/items/bulk", "ISUP001",
+                   {"product_ids": [self.cat_a], "mode": "OVERRIDE", "critical_threshold": 40, "dry_run": False})
+        self.assertEqual(bad[0], 200)
+        self.assertFalse(bad[1]["applied"])  # critical 40 is not below the rule's 10: reported, nothing written
+        self.assertTrue(bad[1]["errors"])
+        self.assertEqual(len(q("SELECT * FROM stock_alert_item_settings WHERE low_threshold=30")), 2)
+
+    def test_export_and_import(self):
+        make_rule(products=[self.p1, self.p2], threshold=10)
+        item_setting(self.p1, mode="OVERRIDE", low_threshold=15)
+        status, kind, text = raw("GET", "/communication/items-export", "ISUP001")
+        self.assertIn("text/csv", kind)
+        self.assertTrue(text.startswith("product_code,product_name,category,mode"))
+        codes = {r["id"]: r["product_code"] for r in q("SELECT id, product_code FROM products")}
+        csv_text = ("product_code,mode,low_threshold,critical_threshold,recovery_threshold,note\n"
+                    f"{codes[self.p1]},OVERRIDE,18,6,,\n{codes[self.p2]},DISABLED,,,,seasonal\n")
+        dry = call("POST", "/communication/items-import", "ISUP001", {"csv": csv_text, "dry_run": True})[1]
+        self.assertEqual((len(dry["changes"]), dry["errors"], dry["applied"]), (2, [], False))
+        self.assertEqual(q("SELECT low_threshold FROM stock_alert_item_settings WHERE product_id=?",
+                           (self.p1,))[0]["low_threshold"], 15)
+        broken = csv_text + f"{codes[self.p1]},OVERRIDE,5,,,\nNOPE,DISABLED,,,,\n"
+        bad = call("POST", "/communication/items-import", "ISUP001", {"csv": broken, "dry_run": False})[1]
+        self.assertFalse(bad["applied"])
+        self.assertEqual(len(bad["errors"]), 2)  # duplicate code + unknown code; nothing applied
+        self.assertEqual(q("SELECT low_threshold FROM stock_alert_item_settings WHERE product_id=?",
+                           (self.p1,))[0]["low_threshold"], 15)
+        done = call("POST", "/communication/items-import", "ISUP001", {"csv": csv_text, "dry_run": False})[1]
+        self.assertTrue(done["applied"])
+        self.assertEqual(q("SELECT mode FROM stock_alert_item_settings WHERE product_id=?",
+                           (self.p2,))[0]["mode"], "DISABLED")
+
+    def test_suggestion_needs_real_history(self):
+        detail = call("GET", f"/communication/items/{self.p1}", "INV001")[1]
+        self.assertFalse(detail["suggestion"]["available"])
+        self.assertIn("Not enough usage history", detail["suggestion"]["reason"])
+
+
+class ItemQuickAlertTests(Base):
+    def test_set_up_update_and_disable_from_item_page(self):
+        officer, manager = user_id("INV001"), user_id("ISUP001")
+        detail = call("GET", f"/communication/items/{self.p1}", "ADMIN001")[1]
+        self.assertEqual(detail["item"]["status"], "NOT_CONFIGURED")
+        self.assertIsNone(detail["item_rule"])
+        body = {"low_threshold": 10, "critical_threshold": 5, "recovery_threshold": 12,
+                "low_recipient_user_ids": [officer], "critical_recipient_user_ids": [manager]}
+        status, detail = call("PUT", f"/communication/items/{self.p1}/alert-rule", "ADMIN001", body)
+        self.assertEqual(status, 200, detail)
+        self.assertEqual(detail["item"]["status"], "CONFIGURED")
+        self.assertEqual((detail["item"]["low"], detail["item"]["critical"], detail["item"]["recovery"]), (10, 5, 12))
+        rule = detail["item_rule"]
+        self.assertEqual((rule["status"], rule["owner_user_id"]), ("ACTIVE", officer))  # admin cannot own; first recipient does
+        self.assertEqual((rule["low_recipient_user_ids"], rule["critical_recipient_user_ids"]), ([officer], [manager]))
+        configured = call("GET", "/communication/items?status=CONFIGURED", "ADMIN001")[1]
+        self.assertEqual([i["product_id"] for i in configured["items"]], [self.p1])
+        set_stock(self.p1, 9)
+        cycle()
+        self.assertEqual(len(self.inbox("INV001")), 1)
+        self.assertEqual(self.inbox("ISUP001"), [])
+        set_stock(self.p1, 4)
+        cycle()
+        self.assertEqual(len(self.inbox("ISUP001")), 1)
+        # Update: same rule, new version, no duplicate rule.
+        body["low_threshold"] = 15
+        body["recovery_threshold"] = 16
+        detail = call("PUT", f"/communication/items/{self.p1}/alert-rule", "ADMIN001", body)[1]
+        self.assertEqual(detail["item_rule"]["rule_id"], rule["rule_id"])
+        self.assertEqual(detail["item_rule"]["low_threshold"], 15)
+        self.assertGreater(detail["item_rule"]["version"], rule["version"])
+        self.assertEqual(len(q("SELECT id FROM comm_rules")), 1)
+        # Switch off.
+        body["active"] = False
+        detail = call("PUT", f"/communication/items/{self.p1}/alert-rule", "ADMIN001", body)[1]
+        self.assertEqual(detail["item_rule"]["status"], "DISABLED")
+        self.assertEqual(detail["item"]["status"], "NOT_CONFIGURED")
+        self.assertEqual(self.incidents(status="OPEN"), [])
+
+    def test_at_or_below_recovers_exactly_at_level(self):
+        officer = user_id("INV001")
+        detail = call("PUT", f"/communication/items/{self.p1}/alert-rule", "ADMIN001",
+                      {"low_threshold": 10, "recovery_threshold": 12, "comparison": "AT_OR_BELOW",
+                       "low_recipient_user_ids": [officer]})[1]
+        self.assertEqual((detail["item"]["recovery"], detail["item_rule"]["recovery_threshold"]), (12, 12))
+        set_stock(self.p1, 10)
+        cycle()
+        set_stock(self.p1, 11)
+        cycle()
+        self.assertEqual(self.incidents()[0]["status"], "OPEN")
+        set_stock(self.p1, 12)
+        cycle()
+        self.assertEqual(self.incidents()[0]["status"], "RESOLVED")
+
+    def test_quick_alert_validation_and_permission(self):
+        officer = user_id("INV001")
+        for body, text in (({"low_threshold": 10, "low_recipient_user_ids": []}, "at least one person"),
+                           ({"low_threshold": 10, "critical_threshold": 10, "low_recipient_user_ids": [officer]}, "lower"),
+                           ({"low_threshold": 10, "critical_recipient_user_ids": [officer]}, "critical threshold"),
+                           ({"low_threshold": 10, "recovery_threshold": 9, "low_recipient_user_ids": [officer]}, "recovery"),
+                           ({"low_threshold": 10, "low_recipient_user_ids": [user_id("FIN001")]}, "cannot")):
+            status, result = call("PUT", f"/communication/items/{self.p1}/alert-rule", "ADMIN001", body)
+            self.assertEqual(status, 400, (body, result))
+            self.assertIn(text, result["detail"])
+        self.assertEqual(call("PUT", f"/communication/items/{self.p1}/alert-rule", "FIN001",
+                              {"low_threshold": 10, "low_recipient_user_ids": [officer]})[0], 403)
+        self.assertEqual(q("SELECT id FROM comm_rules"), [])
+
+
+class SnoozeAndVersionTests(Base):
+    def test_snooze_pauses_reminders_until_severity_rises(self):
+        make_rule(products=[self.p1], threshold=10, critical_threshold=5, frequency="REPEAT_HOURS", repeat_hours=1)
+        set_stock(self.p1, 8)
+        cycle()
+        incident = self.incidents()[0]
+        status, detail = call("POST", f"/communication/alerts/{incident['id']}/snooze", "INV001",
+                              {"hours": 6, "reason": "Delivery booked for tomorrow"})
+        self.assertEqual(status, 200, detail)
+        connection = db()
+        try:
+            with alert_engine.immediate(connection):
+                sent = alert_engine.run_reminders(connection, utc_now() + timedelta(hours=2),
+                                                  load_settings(connection))
+        finally:
+            connection.close()
+        self.assertEqual(sent, 0)
+        self.assertEqual(call("POST", f"/communication/alerts/{incident['id']}/snooze", "INV001",
+                              {"hours": 500, "reason": "too long"})[0], 400)
+        set_stock(self.p1, 3)  # critical: ends the snooze and notifies
+        cycle()
+        incident = self.incidents()[0]
+        self.assertIsNone(incident["snoozed_until"])
+        self.assertEqual(incident["severity"], "CRITICAL")
+        self.assertEqual(len(self.jobs()), 2)
+        status, result = call("POST", f"/communication/alerts/{incident['id']}/snooze", "INV001",
+                              {"hours": 2, "reason": "Please be quiet"})
+        self.assertEqual(status, 400)
+        self.assertIn("cannot be snoozed", result["detail"])
+        events = [e["event_type"] for e in q("SELECT event_type FROM alert_events WHERE incident_id=?",
+                                             (incident["id"],))]
+        self.assertIn("SNOOZED", events)
+
+    def test_rule_versions_and_incident_version(self):
+        rule = make_rule(products=[self.p1], threshold=10)
+        body = rule_body(products=[self.p1], threshold=15)
+        self.assertEqual(call("PUT", f"/communication/rules/{rule['id']}", "INV001", body)[0], 200)
+        call("POST", f"/communication/rules/{rule['id']}/disable", "INV001")
+        call("POST", f"/communication/rules/{rule['id']}/activate", "INV001")
+        versions = call("GET", f"/communication/rules/{rule['id']}/versions", "INV001")[1]
+        self.assertEqual([v["action"] for v in versions], ["ACTIVATE_RULE", "DISABLE_RULE", "UPDATE", "CREATE"])
+        self.assertEqual(versions[-1]["threshold"], 10)
+        self.assertEqual(versions[-2]["threshold"], 15)
+        set_stock(self.p1, 12)
+        cycle()
+        self.assertEqual(self.incidents()[0]["rule_version"], versions[0]["version"])
+
+    def test_critical_can_skip_business_hours(self):
+        make_rule(products=[self.p1], threshold=10, critical_threshold=5, business_hours_only=True)
+        connection = db()
+        connection.execute("UPDATE app_settings SET value='1' WHERE key='critical_ignores_business_hours'")
+        connection.commit()
+        connection.close()
+        set_stock(self.p1, 2)
+        cycle()
+        job = self.jobs()[0]
+        self.assertLessEqual(job["next_attempt_at"], job["created_at"])
+
+
+class StockAlertAcceptanceTests(Base):
+    """Section 21 of the Stock Alert Settings brief, through the real APIs and a fake SMTP server."""
+
+    def test_business_acceptance(self):
+        smtp = FakeSMTP().start()
+        try:
+            self.assertEqual(call("PUT", "/settings/smtp", "ADMIN001", {
+                "enabled": True, "host": "127.0.0.1", "port": smtp.port, "security": "none",
+                "auth_enabled": True, "username": "obs", "password": "secret",
+                "sender_email": "obs@himalaya-airlines.com"})[0], 200)
+            officer, manager = user_id("INV001"), user_id("ISUP001")
+            # The administrator searches the item in Stock Alert Settings.
+            code = q("SELECT product_code FROM products WHERE id=?", (self.p1,))[0]["product_code"]
+            found = call("GET", f"/communication/items?q={code}", "ADMIN001")[1]["items"]
+            self.assertEqual(found[0]["status"], "NOT_CONFIGURED")
+            # Low 10 / critical 5, officer for low, manager for critical, once, email + in-app.
+            status, rule = call("POST", "/communication/rules", "ADMIN001", rule_body(
+                name="Acceptance", owner_user_id=officer, products=[self.p1], threshold=10, critical_threshold=5,
+                recipients=[{"recipient_type": "USER", "recipient_value": str(officer), "level": "LOW"},
+                            {"recipient_type": "USER", "recipient_value": str(manager), "level": "CRITICAL"}],
+                frequency="ONCE", channel_email=True, channel_in_app=True, notify_on_recovery=False))
+            self.assertEqual(status, 200, rule)
+            # Recovery threshold 12 on the item.
+            item_setting(self.p1, who="ADMIN001", mode="OVERRIDE", recovery_threshold=12)
+            self.assertEqual(q("SELECT recovery_threshold FROM stock_alert_item_settings WHERE product_id=?",
+                               (self.p1,))[0]["recovery_threshold"], 12)
+            set_stock(self.p1, 20)
+            comms_worker.run_cycle(owner="acc")
+            self.assertEqual(smtp.messages, [])
+
+            set_stock(self.p1, 9)
+            comms_worker.run_cycle(owner="acc")
+            self.assertEqual(self.incidents()[0]["severity"], "LOW", self.jobs())
+            self.assertEqual([m["to"] for m in smtp.messages], [["inv@himalaya-airlines.com"]])
+            self.assertEqual(len(self.inbox("INV001")), 1)
+            self.assertEqual(self.inbox("MGT001"), [])
+
+            set_stock(self.p1, 4)
+            comms_worker.run_cycle(owner="acc")
+            self.assertEqual(self.incidents()[0]["severity"], "CRITICAL")
+            self.assertEqual([m["to"] for m in smtp.messages],
+                             [["inv@himalaya-airlines.com"], ["isup@himalaya-airlines.com"]])
+
+            set_stock(self.p1, 11)
+            comms_worker.run_cycle(owner="acc")
+            self.assertEqual(self.incidents()[0]["status"], "OPEN")
+            set_stock(self.p1, 12)
+            comms_worker.run_cycle(owner="acc")
+            self.assertEqual(self.incidents()[0]["status"], "RESOLVED")
+            self.assertEqual(len(smtp.messages), 2)  # no recovery message configured
+
+            # Threshold changed to 15 in the UI: used at once, no deployment.
+            item_setting(self.p1, who="ADMIN001", mode="OVERRIDE", low_threshold=15, recovery_threshold=16)
+            set_stock(self.p1, 14)
+            comms_worker.run_cycle(owner="acc")
+            self.assertEqual(len(self.incidents(status="OPEN")), 1)
+            self.assertEqual(self.incidents(status="OPEN")[0]["threshold_at_open"], 15)
+            self.assertEqual(len(smtp.messages), 3)
+
+            # Alerts disabled for the item: nothing new goes out.
+            item_setting(self.p1, who="ADMIN001", mode="DISABLED")
+            set_stock(self.p1, 3)
+            set_stock(self.p1, 0)
+            comms_worker.run_cycle(owner="acc")
+            comms_worker.run_scheduled(force_sweep=True, owner="acc")
+            self.assertEqual(len(smtp.messages), 3)
+            self.assertEqual(self.incidents(status="OPEN"), [])
         finally:
             smtp.stop()
 

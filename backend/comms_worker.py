@@ -104,6 +104,9 @@ def run_scheduled(connect=get_connection, owner: str = "local", force_sweep: boo
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
                     (iso(now), iso(now)))
             summary["swept"] = len(products)
+        if not alert_engine.alerts_enabled(settings):
+            summary["alerts_enabled"] = False  # master switch off: no reminders, escalation or digests
+            return summary
         with alert_engine.immediate(connection):
             summary["reminders"] = alert_engine.run_reminders(connection, now, settings)
         with alert_engine.immediate(connection):

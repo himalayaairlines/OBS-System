@@ -13,6 +13,7 @@ address in an allowed external domain. Anyone else is dropped and reported.
 """
 
 from datetime import date, timedelta
+import json
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -164,6 +165,11 @@ class SettingsIn(BaseModel):
     digest_weekday: int = Field(ge=0, le=6)
     external_email_domains: list[str] = []
     sweep_minutes: int = Field(ge=1, le=60)
+    # 7.4 (optional so older apps can still save the other settings)
+    alerts_enabled: bool | None = None
+    max_snooze_hours: int | None = Field(default=None, ge=1, le=24 * 30)
+    allow_snooze_critical: bool | None = None
+    critical_ignores_business_hours: bool | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -346,6 +352,15 @@ def _require_edit(user, rule):
         raise HTTPException(status_code=403, detail="You can only change rules you own.")
 
 
+def _snapshot(connection, rule_id: int, action: str, user: dict):
+    """Keep the saved state of a rule. Call inside the transaction that changed it."""
+    rule = alert_engine.load_rule(connection, rule_id)
+    connection.execute(
+        "INSERT OR REPLACE INTO comm_rule_versions(rule_id,version,action,snapshot,changed_by,changed_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (rule_id, rule["version"], action, json.dumps(rule, default=str), user["employee_id"], iso(utc_now())))
+
+
 def reevaluate_rule_products(rule_id: int):
     """Apply a rule change at once instead of waiting for the next sweep."""
     connection = get_connection()
@@ -501,6 +516,9 @@ def dashboard(user: dict = Depends(requires("comms_view"))):
                 "unacknowledged": sum(1 for r in active if r["status"] in ("OPEN", "ESCALATED")),
                 "escalated": sum(1 for r in active if r["status"] == "ESCALATED"),
                 "suppressed": sum(1 for r in active if r["status"] == "SUPPRESSED"),
+                "snoozed": connection.execute(
+                    f"SELECT COUNT(*) c FROM alert_incidents WHERE status IN ({marks}) AND snoozed_until > ?",
+                    (*ACTIVE_STATUSES, iso(utc_now()))).fetchone()["c"],
                 "resolved_30d": resolved,
                 "awaiting_escalation": awaiting,
             },
@@ -514,6 +532,11 @@ def dashboard(user: dict = Depends(requires("comms_view"))):
                 "cancelled": jobs.get("CANCELLED", 0),
             },
             "smtp_enabled": bool(smtp and smtp["enabled"]),
+            "alerts_enabled": alert_engine.alerts_enabled(settings),
+            "item_overrides": connection.execute(
+                "SELECT COUNT(*) c FROM stock_alert_item_settings WHERE mode='OVERRIDE'").fetchone()["c"],
+            "items_disabled": connection.execute(
+                "SELECT COUNT(*) c FROM stock_alert_item_settings WHERE mode='DISABLED'").fetchone()["c"],
             "last_sweep_at": settings.get("_last_sweep_at"),
             "timezone": settings.get("timezone"),
         }
@@ -580,6 +603,7 @@ def create_rule(data: RuleIn, user: dict = Depends(requires("comms_rules"))):
         status = "ACTIVE" if data.activate else "DRAFT"
         with connection:
             rule_id = _write_rule(connection, None, data, clean, owner_id, user, status)
+            _snapshot(connection, rule_id, "CREATE", user)
     finally:
         connection.close()
     log_action(user, "COMMUNICATION", "CREATE_RULE", f"Created alert rule '{data.name}' ({status}).",
@@ -603,6 +627,7 @@ def update_rule(rule_id: int, data: RuleIn, user: dict = Depends(requires("comms
         clean = _validate_rule(connection, data, user, owner_id)
         with connection:
             _write_rule(connection, rule_id, data, clean, owner_id, user, status)
+            _snapshot(connection, rule_id, "UPDATE", user)
     finally:
         connection.close()
     before = {k: existing.get(k) for k in ("name", "status", "trigger_type", "threshold",
@@ -626,6 +651,7 @@ def _set_status(rule_id, user, status, action):
             connection.execute(
                 "UPDATE comm_rules SET status=?, updated_by=?, updated_at=?, version=version+1 WHERE id=?",
                 (status, user["employee_id"], iso(utc_now()), rule_id))
+            _snapshot(connection, rule_id, action, user)
     finally:
         connection.close()
     log_action(user, "COMMUNICATION", action, f"{action.title().replace('_', ' ')}: '{rule['name']}'.",
@@ -669,6 +695,7 @@ def duplicate_rule(rule_id: int, user: dict = Depends(requires("comms_rules"))):
             connection.executemany(
                 "INSERT INTO comm_rule_recipients(rule_id,recipient_type,recipient_value,level) VALUES (?,?,?,?)",
                 [(new_id, r["recipient_type"], r["recipient_value"], r["level"]) for r in rule["recipients"]])
+            _snapshot(connection, new_id, "DUPLICATE", user)
     finally:
         connection.close()
     log_action(user, "COMMUNICATION", "DUPLICATE_RULE", f"Duplicated rule '{rule['name']}' as a draft.",
@@ -692,6 +719,33 @@ def delete_rule(rule_id: int, user: dict = Depends(requires("comms_rules"))):
         connection.close()
     log_action(user, "COMMUNICATION", "DELETE_RULE", f"Deleted rule '{rule['name']}'.", "comm_rule", rule_id)
     return {"status": "success"}
+
+
+@router.get("/rules/{rule_id}/versions")
+def rule_versions(rule_id: int, user: dict = Depends(requires("comms_view"))):
+    """Saved states of a rule, newest first, each with a summary of what it did."""
+    connection = get_connection()
+    try:
+        _rule_or_404(connection, rule_id)
+        rows = connection.execute(
+            "SELECT version, action, snapshot, changed_by, changed_at FROM comm_rule_versions "
+            "WHERE rule_id=? ORDER BY version DESC", (rule_id,)).fetchall()
+        result = []
+        for row in rows:
+            snap = json.loads(row["snapshot"])
+            snap.setdefault("scopes", [])
+            snap.setdefault("recipients", [])
+            result.append({
+                "version": row["version"], "action": row["action"], "changed_by": row["changed_by"],
+                "changed_at": row["changed_at"], "status": snap.get("status"),
+                "condition_text": _describe_condition(snap), "scope_text": _describe_scope(connection, snap),
+                "threshold": snap.get("threshold"), "critical_threshold": snap.get("critical_threshold"),
+                "recovery_margin": snap.get("recovery_margin"), "frequency": snap.get("frequency"),
+                "recipients": snap.get("recipients"), "escalation_policy_id": snap.get("escalation_policy_id"),
+            })
+        return result
+    finally:
+        connection.close()
 
 
 @router.post("/rules/simulate")
@@ -1105,6 +1159,54 @@ def suppress(incident_id: int, data: RemarksIn, user: dict = Depends(requires("c
     return get_alert(incident_id, user)
 
 
+class SnoozeIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    hours: float = Field(gt=0, le=24 * 30)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+@router.post("/alerts/{incident_id}/snooze")
+def snooze(incident_id: int, data: SnoozeIn, user: dict = Depends(requires("comms_view"))):
+    """Pause reminders and escalation for a while. The incident stays open, and a
+    worse stock level always ends the snooze and notifies as usual."""
+    def run(connection, incident):
+        settings = load_settings(connection)
+        if incident["status"] not in ("OPEN", "ACKNOWLEDGED", "ESCALATED"):
+            raise HTTPException(status_code=400, detail=f"This alert is {incident['status'].lower()}.")
+        limit = float(settings.get("max_snooze_hours") or 72)
+        if data.hours > limit:
+            raise HTTPException(status_code=400, detail=f"Alerts can be snoozed for at most {limit:g} hours.")
+        if incident["severity"] in ("CRITICAL", "OUT") and str(settings.get("allow_snooze_critical", "0")) != "1":
+            raise HTTPException(status_code=400,
+                                detail="Critical and out-of-stock alerts cannot be snoozed (Communication settings).")
+        now = utc_now()
+        until = now + timedelta(hours=data.hours)
+        connection.execute(
+            "UPDATE alert_incidents SET snoozed_until=?, snooze_reason=?, snoozed_by=? WHERE id=?",
+            (iso(until), data.reason.strip(), user["employee_id"], incident_id))
+        alert_engine.add_event(connection, incident_id, "SNOOZED", now, incident["severity"],
+                               incident["last_quantity"], user["employee_id"],
+                               f"Until {iso(until)}: {data.reason.strip()}")
+    _act(incident_id, user, run)
+    log_action(user, "COMMUNICATION", "SNOOZE_ALERT",
+               f"Snoozed alert #{incident_id} for {data.hours:g} h: {data.reason}", "alert_incident", incident_id)
+    return get_alert(incident_id, user)
+
+
+@router.post("/alerts/{incident_id}/unsnooze")
+def unsnooze(incident_id: int, user: dict = Depends(requires("comms_view"))):
+    def run(connection, incident):
+        if not incident.get("snoozed_until"):
+            raise HTTPException(status_code=400, detail="This alert is not snoozed.")
+        connection.execute("UPDATE alert_incidents SET snoozed_until=NULL WHERE id=?", (incident_id,))
+        alert_engine.add_event(connection, incident_id, "UNSNOOZED", utc_now(), incident["severity"],
+                               incident["last_quantity"], user["employee_id"], None)
+    _act(incident_id, user, run)
+    log_action(user, "COMMUNICATION", "UNSNOOZE_ALERT", f"Ended snooze on alert #{incident_id}.",
+               "alert_incident", incident_id)
+    return get_alert(incident_id, user)
+
+
 # --------------------------------------------------------------------------- #
 # Delivery log
 # --------------------------------------------------------------------------- #
@@ -1277,6 +1379,10 @@ def get_settings(user: dict = Depends(requires_any("comms_view", "comms_admin"))
         "external_email_domains": sorted(allowed_email_domains(settings)),
         "sweep_minutes": int(settings["sweep_minutes"]),
         "last_sweep_at": settings.get("_last_sweep_at"),
+        "alerts_enabled": alert_engine.alerts_enabled(settings),
+        "max_snooze_hours": int(float(settings.get("max_snooze_hours") or 72)),
+        "allow_snooze_critical": str(settings.get("allow_snooze_critical", "0")) == "1",
+        "critical_ignores_business_hours": str(settings.get("critical_ignores_business_hours", "0")) == "1",
     }
 
 
@@ -1307,6 +1413,11 @@ def update_settings(data: SettingsIn, user: dict = Depends(requires("comms_admin
         "digest_time": data.digest_time, "digest_weekday": str(data.digest_weekday),
         "external_email_domains": ",".join(sorted(set(domains))), "sweep_minutes": str(data.sweep_minutes),
     }
+    for key in ("alerts_enabled", "allow_snooze_critical", "critical_ignores_business_hours"):
+        if getattr(data, key) is not None:
+            values[key] = "1" if getattr(data, key) else "0"
+    if data.max_snooze_hours is not None:
+        values["max_snooze_hours"] = str(data.max_snooze_hours)
     connection = get_connection()
     try:
         before = load_settings(connection)

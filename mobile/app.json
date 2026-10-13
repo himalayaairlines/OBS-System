@@ -16,7 +16,7 @@
       "package": "com.himalaya.obs",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#12387A"
+        "backgroundColor": "#D7EAFF"
       }
     },
     "web": {
