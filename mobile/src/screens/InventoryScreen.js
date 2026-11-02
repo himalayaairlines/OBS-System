@@ -272,6 +272,7 @@ function LoadTab({ notify }) {
         <SectionTitle
           title="Load the trolley"
           description="Quantities are drawn from main inventory as soon as you save."
+          right={<Button title="Save load" onPress={save} disabled={!flightId} />}
         />
         <Select
           label="Trip"
@@ -321,7 +322,6 @@ function LoadTab({ notify }) {
         {!stock.filter((i) => i.product_name.toLowerCase().includes(search.trim().toLowerCase())).length && (
           <Text style={styles.empty}>No product matches “{search}”.</Text>
         )}
-        <Button title="Save load" style={{ marginTop: 12 }} onPress={save} disabled={!flightId} />
       </Card>
 
       <OptionModal

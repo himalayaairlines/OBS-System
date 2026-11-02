@@ -38,9 +38,15 @@ def _row(r) -> dict:
             "details": {k: v for k, v in meta.items() if v not in (None, "", [], {})}}
 
 
-def _where(event, outcome, q, since, until):
-    conditions = [f"module IN ({','.join('?' * len(SECURITY_MODULES))})"]
-    params: list = list(SECURITY_MODULES)
+def _where(event, outcome, q, since, until, module=None, scope="all"):
+    conditions: list = []
+    params: list = []
+    if module:
+        conditions.append("module=?")
+        params.append(module)
+    elif scope == "security":
+        conditions.append(f"module IN ({','.join('?' * len(SECURITY_MODULES))})")
+        params.extend(SECURITY_MODULES)
     if event:
         conditions.append("action=?")
         params.append(event)
@@ -58,7 +64,7 @@ def _where(event, outcome, q, since, until):
     if until:
         conditions.append("substr(timestamp,1,10) <= ?")
         params.append(until)
-    return " AND ".join(conditions), params
+    return " AND ".join(conditions) or "1=1", params
 
 
 @router.get("/audit")
@@ -67,9 +73,13 @@ def audit_log(event: str | None = Query(None, max_length=60),
               q: str | None = Query(None, max_length=100),
               date_from: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
               date_to: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+              module: str | None = Query(None, max_length=40),
+              scope: str = Query("all", pattern="^(all|security)$"),
               page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=MAX_PAGE_SIZE),
               user: dict = Depends(requires("security_view"))):
-    where, params = _where(event, outcome, q, date_from, date_to)
+    """Every recorded action: sign-ins and account changes, and also sales,
+    stock returns, products, orders, approvals and corrections."""
+    where, params = _where(event, outcome, q, date_from, date_to, module, scope)
     connection = get_connection()
     try:
         total = connection.execute(f"SELECT COUNT(*) c FROM audit_logs WHERE {where}", params).fetchone()["c"]
@@ -79,12 +89,15 @@ def audit_log(event: str | None = Query(None, max_length=60),
             f"SELECT * FROM audit_logs WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
             (*params, page_size, (page - 1) * page_size)).fetchall()
         events = [r["action"] for r in connection.execute(
-            f"SELECT DISTINCT action FROM audit_logs WHERE module IN ({','.join('?' * len(SECURITY_MODULES))}) "
-            "ORDER BY action", SECURITY_MODULES).fetchall()]
+            "SELECT DISTINCT action FROM audit_logs WHERE (?='' OR module=?) ORDER BY action",
+            (module or "", module or "")).fetchall()]
+        modules = [r["module"] for r in connection.execute(
+            "SELECT DISTINCT module FROM audit_logs WHERE module IS NOT NULL ORDER BY module").fetchall()]
     finally:
         connection.close()
     return {"items": [_row(r) for r in rows], "total": total, "page": page, "page_size": page_size,
-            "pages": pages, "has_prev": page > 1, "has_next": page < pages, "events": events}
+            "pages": pages, "has_prev": page > 1, "has_next": page < pages, "events": events,
+            "modules": modules}
 
 
 @router.get("/overview")

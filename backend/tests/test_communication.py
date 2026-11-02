@@ -1106,7 +1106,7 @@ class ItemQuickAlertTests(Base):
         self.assertEqual(detail["item"]["status"], "CONFIGURED")
         self.assertEqual((detail["item"]["low"], detail["item"]["critical"], detail["item"]["recovery"]), (10, 5, 12))
         rule = detail["item_rule"]
-        self.assertEqual((rule["status"], rule["owner_user_id"]), ("ACTIVE", officer))  # admin cannot own; first recipient does
+        self.assertEqual((rule["status"], rule["owner_user_id"]), ("ACTIVE", user_id("ADMIN001")))  # admin sees stock (7.5), so owns it
         self.assertEqual((rule["low_recipient_user_ids"], rule["critical_recipient_user_ids"]), ([officer], [manager]))
         configured = call("GET", "/communication/items?status=CONFIGURED", "ADMIN001")[1]
         self.assertEqual([i["product_id"] for i in configured["items"]], [self.p1])

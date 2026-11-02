@@ -17,6 +17,8 @@ import { when } from './comms/shared';
 
 export default function AuditLogScreen({ online }) {
   const [event, setEvent] = useState('');
+  const [module, setModule] = useState('');
+  const [modules, setModules] = useState([]);
   const [outcome, setOutcome] = useState('');
   const [search, setSearch] = useState('');
   const [term, setTerm] = useState('');
@@ -32,6 +34,7 @@ export default function AuditLogScreen({ online }) {
   }, [search]);
 
   const query = new URLSearchParams();
+  if (module) query.set('module', module);
   if (event) query.set('event', event);
   if (outcome) query.set('outcome', outcome);
   if (term) query.set('q', term);
@@ -41,14 +44,22 @@ export default function AuditLogScreen({ online }) {
   const pager = usePaged(`/security/audit${qs ? `?${qs}` : ''}`, { pageSize: 10, enabled: online });
 
   useEffect(() => {
-    if (pager.raw?.events?.length) setEvents(pager.raw.events);
+    if (pager.raw?.events) setEvents(pager.raw.events);
+    if (pager.raw?.modules?.length) setModules(pager.raw.modules);
   }, [pager.raw]);
 
-  const filtered = event || outcome || term || from || to;
+  const filtered = module || event || outcome || term || from || to;
 
   const columns = [
     { key: 'time', label: 'Time', flex: 1.1, render: (r) => <Text style={[TYPE.small, { color: COLORS.text }]}>{when(r.timestamp)}</Text> },
-    { key: 'event', label: 'Event', flex: 1.4, render: (r) => <Text style={TYPE.bodyStrong} numberOfLines={2}>{eventLabel(r.event)}</Text> },
+    {
+      key: 'event', label: 'Event', flex: 1.4, render: (r) => (
+        <View>
+          <Text style={TYPE.bodyStrong} numberOfLines={2}>{eventLabel(r.event)}</Text>
+          <Text style={[TYPE.caption, { color: COLORS.muted }]}>{titleCase(r.module)}</Text>
+        </View>
+      ),
+    },
     { key: 'status', label: 'Result', flex: 0.7, render: (r) => <ResultPill status={r.status} /> },
     { key: 'account', label: 'Account', flex: 0.9, render: (r) => <Mono value={r.account} /> },
     { key: 'by', label: 'By', flex: 0.8, render: (r) => <Mono value={r.by} /> },
@@ -60,13 +71,19 @@ export default function AuditLogScreen({ online }) {
     <ScrollView style={styles.screen} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
       <PageHeader
         title="Audit Log"
-        description="Sign-ins, password and account changes, refused access and mail-server changes. Codes and passwords are never recorded."
+        description="Every recorded action: sign-ins and account changes, sales, stock returns, products, orders, approvals, corrections and settings. Codes and passwords are never recorded."
       />
       {!online && <Banner tone="warning" message="The audit log needs a connection." />}
       {!!pager.error && <Banner tone="danger" message={pager.error} />}
 
       <Card>
         <View style={[styles.wrap, { gap: 10, alignItems: 'flex-end' }]}>
+          <Select
+            label="Area"
+            valueLabel={module ? titleCase(module) : 'All areas'}
+            onPress={() => setPicker('module')}
+            style={{ minWidth: 180, flexGrow: 1, flexBasis: 180 }}
+          />
           <Select
             label="Event"
             valueLabel={event ? eventLabel(event) : 'All events'}
@@ -87,7 +104,7 @@ export default function AuditLogScreen({ online }) {
             title="Clear filters"
             tone="ghost"
             small
-            onPress={() => { setEvent(''); setOutcome(''); setSearch(''); setFrom(null); setTo(null); }}
+            onPress={() => { setModule(''); setEvent(''); setOutcome(''); setSearch(''); setFrom(null); setTo(null); }}
           />
         )}
       </Card>
@@ -116,6 +133,14 @@ export default function AuditLogScreen({ online }) {
       </Card>
 
       <OptionModal
+        visible={picker === 'module'}
+        title="Area"
+        options={[{ value: '', label: 'All areas' }, ...modules.map((m) => ({ value: m, label: titleCase(m) }))]}
+        selectedValue={module}
+        onSelect={(v) => { setModule(v); setEvent(''); setPicker(null); }}
+        onClose={() => setPicker(null)}
+      />
+      <OptionModal
         visible={picker === 'event'}
         title="Event"
         options={[{ value: '', label: 'All events' }, ...events.map((e) => ({ value: e, label: eventLabel(e), sub: e }))]}
@@ -142,6 +167,10 @@ export default function AuditLogScreen({ online }) {
       />
     </ScrollView>
   );
+}
+
+function titleCase(text) {
+  return String(text || '').toLowerCase().replace(/(^|\s)\S/g, (c) => c.toUpperCase());
 }
 
 function ResultPill({ status }) {

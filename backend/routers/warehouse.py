@@ -430,8 +430,7 @@ def review_order(order_id: int, data: OrderReview, user: dict = Depends(requires
         order = _order(connection, order_id)
         if order["status"] != "PENDING":
             raise HTTPException(status_code=400, detail=f"This order is already {order['status'].lower()}.")
-        if order["requested_by"] == user["employee_id"] and user["role"] != "management":
-            raise HTTPException(status_code=403, detail="You cannot approve an order you raised yourself.")
+        # An approver may approve their own request (7.5); the audit log records who did both.
         if not data.approve and not (data.review_remarks or "").strip():
             raise HTTPException(status_code=400, detail="Remarks are required when rejecting an order.")
 

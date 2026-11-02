@@ -100,7 +100,18 @@ export default function DashboardScreen({ user }) {
       <PageHeader
         title="Revenue Dashboard"
         description={`${periodLabel}${filter.destination ? ` · ${filter.destination}` : ' · all destinations'}`}
-        right={<Pill label={`${data.flight_count} flights`} tone="info" />}
+        right={(
+          <View style={[styles.row, styles.gap8]}>
+            <Pill label={`${data.flight_count} flights`} tone="info" />
+            <Button
+              title={exporting ? 'Preparing…' : 'Export to Excel'}
+              small
+              onPress={exportExcel}
+              disabled={exporting}
+              accessibilityLabel="Export to Excel: summary, sales, flights, products, commission and reconciliation"
+            />
+          </View>
+        )}
       />
       {message && <Notice message={message} />}
 
@@ -301,19 +312,6 @@ export default function DashboardScreen({ user }) {
         {!data.flights.length && <Text style={styles.empty}>No flights in this period.</Text>}
       </Card>
 
-      <Card>
-        <SectionTitle title="Export" description="Six sheets: summary, sales with remarks, flights, products, commission and reconciliation." />
-        <Button
-          title={exporting ? 'Preparing…' : 'Download Excel workbook'}
-          onPress={exportExcel}
-          disabled={exporting}
-        />
-        <Text style={[styles.mono, { marginTop: 8 }]}>
-          {Platform.OS === 'web'
-            ? 'The file downloads straight through the browser.'
-            : 'The file opens in the share sheet so you can save it or send it on.'}
-        </Text>
-      </Card>
 
       <OptionModal
         visible={picker === 'year'}

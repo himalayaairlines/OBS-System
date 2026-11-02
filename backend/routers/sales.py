@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from database import AIRCRAFT_TYPES, COMMISSION_RATE, get_connection
+import trip_flow
 from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from security import (
     current_user, log_action, now_iso, permissions_for, rate_for, requires, trip_root,
@@ -176,6 +177,8 @@ def _record(connection, transaction: SaleTransaction, user: dict):
         )
     if flight["status"] != "OPEN":
         raise PermanentError("This flight has been closed and reconciled.")
+    if not trip_flow.leg_started(flight):
+        raise PermanentError("Start the second flight on the Sales page before selling on it.")
     if not flight["passengers"]:
         raise PermanentError("The PAX load has not been entered for this flight.")
     if not valid_seat(seat, flight["aircraft_type"]):
@@ -186,10 +189,11 @@ def _record(connection, transaction: SaleTransaction, user: dict):
     assignment = connection.execute(
         "SELECT * FROM flight_assignments WHERE flight_id=?", (transaction.flight_id,)
     ).fetchone()
-    if not assignment:
-        raise PermanentError("No OBS device is assigned to this flight.")
-    if user["employee_id"] != assignment["crew_account"]:
-        raise PermanentError("This device is not assigned to that flight.")
+    if "sell_any_flight" not in permissions_for(user["role"]):
+        if not assignment:
+            raise PermanentError("No OBS device is assigned to this flight.")
+        if user["employee_id"] != assignment["crew_account"]:
+            raise PermanentError("This device is not assigned to that flight.")
 
     # The seller must be one of the people the crew put in this sector's duty
     # group. Without a group there is nobody to attribute a sale to, so selling

@@ -81,6 +81,16 @@ def _tls_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=cafile)
 
 
+class SmtpLoginClosed(smtplib.SMTPException):
+    """The server hung up while we were signing in (Gmail does this for some
+    rejected logins instead of replying 535)."""
+
+
+def _is_google(host: str) -> bool:
+    host = (host or "").lower().strip()
+    return host.endswith("gmail.com") or host.endswith("googlemail.com") or host.endswith("google.com")
+
+
 def open_smtp(cfg: dict, password: str | None, stages: list | None = None):
     """Connect, negotiate TLS and authenticate. Records each stage reached."""
     validate_config(cfg)
@@ -103,7 +113,14 @@ def open_smtp(cfg: dict, password: str | None, stages: list | None = None):
         if password is None:
             server.close()
             raise SmtpConfigError("Authentication is enabled but no password is stored.")
-        server.login(cfg["username"], password)
+        if _is_google(host):
+            # Google shows app passwords as four groups of four letters;
+            # pasted with the spaces they are not accepted.
+            password = "".join(password.split())
+        try:
+            server.login(cfg["username"].strip(), password)
+        except smtplib.SMTPServerDisconnected as exc:
+            raise SmtpLoginClosed(host) from exc
         stages.append("AUTHENTICATED")
     return server
 
@@ -122,7 +139,18 @@ def classify_error(exc: Exception) -> tuple[str, str]:
         return "TEMP", str(exc)
     if isinstance(exc, secret_box.SecretUnavailable):
         return "TEMP", str(exc)
+    if isinstance(exc, SmtpLoginClosed):
+        if _is_google(str(exc)):
+            return "TEMP", ("Gmail closed the connection while signing in, so the login was refused. Gmail does not "
+                            "accept the normal account password here: turn on 2-Step Verification for the mailbox, "
+                            "create an App Password (Google Account > Security > App passwords), paste its 16 letters "
+                            "into Password, save, and test again. The username must be the full Gmail address.")
+        return "TEMP", ("The mail server closed the connection while signing in. Check the username and password, "
+                        "and that the mailbox allows SMTP sign-in.")
     if isinstance(exc, smtplib.SMTPAuthenticationError):
+        if exc.smtp_code == 534 or b"Application-specific password" in (exc.smtp_error or b""):
+            return "TEMP", ("Gmail needs an App Password for this mailbox (Google Account > Security > App passwords). "
+                            "The normal account password is not accepted.")
         return "TEMP", f"Authentication failed ({exc.smtp_code}). Check the username and password."
     if isinstance(exc, smtplib.SMTPRecipientsRefused):
         codes = [code for code, _ in exc.recipients.values()]

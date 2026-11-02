@@ -21,6 +21,7 @@ import AdminScreen from './src/screens/AdminScreen';
 import AuditLogScreen from './src/screens/AuditLogScreen';
 import OverviewScreen from './src/screens/OverviewScreen';
 import SmtpScreen from './src/screens/SmtpScreen';
+import QrMenuScreen from './src/screens/QrMenuScreen';
 import LoginScreen from './src/screens/LoginScreen';
 import { loadFonts } from './src/fonts';
 import SplashScreen from './src/SplashScreen';
@@ -47,7 +48,7 @@ const NAV = [
   { key: 'sync', label: 'Sync', icon: 'sync', permission: 'sync' },
   // Management see the whole screen; the inventory supervisor reaches it for
   // the sales ledger alone, so the tab is labelled for what they actually get.
-  { key: 'logs', label: 'Logs', icon: 'ledger', permission: 'sales_view', fullPermission: 'logs', altLabel: 'Sales' },
+  { key: 'logs', label: 'Performance & Sales Logs', icon: 'ledger', permission: 'sales_view', fullPermission: 'logs', altLabel: 'Sales' },
   { key: 'rates', label: 'Rates', icon: 'rates', permission: 'rates' },
   // Crew file the post-flight cabin reports here; management read and correct them.
   { key: 'reports', label: 'Reports', icon: 'reports', permission: 'flight_reports' },
@@ -55,6 +56,8 @@ const NAV = [
   { key: 'smtp', label: 'SMTP Settings', icon: 'smtp', permission: 'smtp_view' },
   { key: 'admin', label: 'Users & Access', icon: 'users', permission: 'users' },
   { key: 'audit', label: 'Audit Log', icon: 'audit', permission: 'security_view' },
+  // Passenger menu opened by QR code; administrators only.
+  { key: 'qrmenu', label: 'QR Menu', icon: 'qr', permission: 'qr_menu' },
   // Everyone; reached from the account menu (and the sidebar on laptops).
   { key: 'account', label: 'My Account', icon: 'account', always: true, menuOnly: true },
 ];
@@ -64,7 +67,7 @@ const GROUPS = [
   { title: 'Overview', keys: ['overview', 'dashboard'] },
   { title: 'Operations', keys: ['crew', 'inventory', 'warehouse', 'sync', 'logs', 'rates', 'reports'] },
   { title: 'Communication', keys: ['comms', 'smtp'] },
-  { title: 'Administration', keys: ['admin', 'audit', 'account'] },
+  { title: 'Administration', keys: ['admin', 'audit', 'qrmenu', 'account'] },
 ];
 
 const EXTRA_PAGES = { notifications: { label: 'Notifications', icon: 'bell' } };
@@ -104,6 +107,21 @@ function AppContent() {
   const desktop = useSidebarLayout(user?.role);
   const [resetToken, setResetToken] = useState(readResetToken);
   const [menuOpen, setMenuOpen] = useState(false);
+  // Laptop sidebar: collapsed to an icon rail, and which sections are folded.
+  // Remembered per browser; storage may be unavailable, so failures are ignored.
+  const [sidebarState, setSidebarState] = useState(() => {
+    try {
+      const raw = Platform.OS === 'web' && window.localStorage.getItem('obs.sidebar');
+      return raw ? JSON.parse(raw) : { collapsed: false, folded: {} };
+    } catch {
+      return { collapsed: false, folded: {} };
+    }
+  });
+  const updateSidebar = (patch) => setSidebarState((current) => {
+    const next = { ...current, ...patch };
+    try { if (Platform.OS === 'web') window.localStorage.setItem('obs.sidebar', JSON.stringify(next)); } catch { /* ignore */ }
+    return next;
+  });
   const [booting, setBooting] = useState(true);
   // Keep the splash up briefly so it doesn't just flash on fast starts.
   const [splashShown, setSplashShown] = useState(false);
@@ -404,6 +422,7 @@ function AppContent() {
       {page === 'admin' && <AdminScreen {...screenProps} />}
       {page === 'audit' && <AuditLogScreen {...screenProps} />}
       {page === 'smtp' && <SmtpScreen {...screenProps} />}
+      {page === 'qrmenu' && <QrMenuScreen {...screenProps} />}
       {page === 'account' && <AccountScreen {...screenProps} onLogout={logout} />}
       {page === 'comms' && (
         <CommsScreen
@@ -426,7 +445,14 @@ function AppContent() {
   if (desktop) {
     return (
       <View style={{ flex: 1, flexDirection: 'row', backgroundColor: COLORS.background }}>
-        <Sidebar items={allowed} page={page} onSelect={setPage} />
+        <Sidebar
+          items={allowed}
+          page={page}
+          onSelect={setPage}
+          collapsed={sidebarState.collapsed}
+          folded={sidebarState.folded || {}}
+          onFold={(title) => updateSidebar({ folded: { ...(sidebarState.folded || {}), [title]: !(sidebarState.folded || {})[title] } })}
+        />
         <View style={{ flex: 1, minWidth: 0 }}>
           <TopBar
             meta={pageMeta}
@@ -436,6 +462,8 @@ function AppContent() {
             unread={unread}
             onBell={() => setPage('notifications')}
             onMenu={() => setMenuOpen(true)}
+            sidebarCollapsed={sidebarState.collapsed}
+            onToggleSidebar={() => updateSidebar({ collapsed: !sidebarState.collapsed })}
           />
           {banners}
           {content}
@@ -649,37 +677,53 @@ function ProfileModal({ visible, user, onClose, onLogout, onAccount }) {
 }
 
 /* ------------------------- laptop shell (≥ 1024 px) ------------------------- */
-function Sidebar({ items, page, onSelect }) {
+function Sidebar({ items, page, onSelect, collapsed, folded, onFold }) {
   const byKey = Object.fromEntries(items.map((i) => [i.key, i]));
   // Two "Dashboard" entries only if someone has both; name them apart then.
   const both = byKey.overview && byKey.dashboard;
   return (
-    <View style={{ width: 248, backgroundColor: SIDEBAR.bg, borderRightWidth: 1, borderRightColor: SIDEBAR.border }}>
-      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: 18, height: 64, borderBottomWidth: 1, borderBottomColor: SIDEBAR.border }}>
+    <View style={{ width: collapsed ? 68 : 248, backgroundColor: SIDEBAR.bg, borderRightWidth: 1, borderRightColor: SIDEBAR.border }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10, paddingHorizontal: collapsed ? 17 : 18, height: 64, borderBottomWidth: 1, borderBottomColor: SIDEBAR.border }}>
         <Image
           source={require('./assets/app-icon.png')}
           style={{ width: 34, height: 34, borderRadius: 8 }}
           resizeMode="contain"
           accessibilityLabel="Himalaya Airlines OBS"
         />
-        <View style={{ flex: 1 }}>
-          <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: '600' }} numberOfLines={1}>Himalaya Airlines</Text>
-          <Text style={{ color: SIDEBAR.muted, fontSize: 12 }} numberOfLines={1}>Onboard Sales (OBS)</Text>
-        </View>
+        {!collapsed && (
+          <View style={{ flex: 1 }}>
+            <Text style={{ color: '#FFFFFF', fontSize: 15, fontWeight: '600' }} numberOfLines={1}>Himalaya Airlines</Text>
+            <Text style={{ color: SIDEBAR.muted, fontSize: 12 }} numberOfLines={1}>Onboard Sales (OBS)</Text>
+          </View>
+        )}
       </View>
       <ScrollView contentContainerStyle={{ paddingVertical: 12 }} accessibilityRole="menu">
         {GROUPS.map((group) => {
           const entries = group.keys.map((k) => byKey[k]).filter(Boolean);
           if (!entries.length) return null;
+          const isFolded = !collapsed && !!folded[group.title];
           return (
-            <View key={group.title} style={{ marginBottom: 10 }}>
-              <Text style={{
-                color: SIDEBAR.muted, fontSize: 11, fontWeight: '600', letterSpacing: 0.8,
-                paddingHorizontal: 20, paddingTop: 8, paddingBottom: 6,
-              }}>
-                {group.title.toUpperCase()}
-              </Text>
-              {entries.map((item) => {
+            <View key={group.title} style={{ marginBottom: collapsed ? 6 : 10 }}>
+              {collapsed ? (
+                <View style={{ height: 1, backgroundColor: SIDEBAR.border, marginHorizontal: 14, marginVertical: 6 }} />
+              ) : (
+                <Pressable
+                  onPress={() => onFold(group.title)}
+                  accessibilityRole="button"
+                  accessibilityState={{ expanded: !isFolded }}
+                  accessibilityLabel={`${group.title} section, ${isFolded ? 'show' : 'hide'}`}
+                  style={({ hovered }) => ({
+                    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+                    paddingHorizontal: 20, paddingTop: 8, paddingBottom: 6, opacity: hovered ? 1 : 0.9,
+                  })}
+                >
+                  <Text style={{ color: SIDEBAR.muted, fontSize: 11, fontWeight: '600', letterSpacing: 0.8 }}>
+                    {group.title.toUpperCase()}
+                  </Text>
+                  <Icon name={isFolded ? 'chevronRight' : 'chevronDown'} size={14} color={SIDEBAR.muted} />
+                </Pressable>
+              )}
+              {!isFolded && entries.map((item) => {
                 const active = page === item.key;
                 const label = both && item.key === 'dashboard' ? 'Sales dashboard' : item.label;
                 return (
@@ -687,10 +731,11 @@ function Sidebar({ items, page, onSelect }) {
                     key={item.key}
                     onPress={() => onSelect(item.key)}
                     accessibilityRole="menuitem"
+                    accessibilityLabel={label}
                     accessibilityState={{ selected: active }}
                     style={({ hovered }) => ({
                       flexDirection: 'row', alignItems: 'center', gap: 12, marginHorizontal: 10,
-                      paddingHorizontal: 12, height: 40, borderRadius: 8,
+                      paddingHorizontal: collapsed ? 13 : 12, height: 40, borderRadius: 8,
                       backgroundColor: active ? SIDEBAR.active : hovered ? SIDEBAR.hover : 'transparent',
                     })}
                   >
@@ -698,12 +743,12 @@ function Sidebar({ items, page, onSelect }) {
                       <View style={{ position: 'absolute', left: -10, top: 8, bottom: 8, width: 3, borderRadius: 2, backgroundColor: SIDEBAR.accent }} />
                     )}
                     <Icon name={item.icon} size={18} color={active ? '#FFFFFF' : SIDEBAR.text} />
-                    <Text
+                    {!collapsed && <Text
                       style={{ color: active ? '#FFFFFF' : SIDEBAR.text, fontSize: 14, fontWeight: active ? '600' : '500', flex: 1 }}
                       numberOfLines={1}
                     >
                       {label}
-                    </Text>
+                    </Text>}
                   </Pressable>
                 );
               })}
@@ -711,19 +756,32 @@ function Sidebar({ items, page, onSelect }) {
           );
         })}
       </ScrollView>
-      <Text style={{ color: SIDEBAR.muted, fontSize: 11, paddingHorizontal: 20, paddingVertical: 12, borderTopWidth: 1, borderTopColor: SIDEBAR.border }}>
-        Onboard Sales Revenue System
-      </Text>
+      {!collapsed && (
+        <Text style={{ color: SIDEBAR.muted, fontSize: 11, paddingHorizontal: 20, paddingVertical: 12, borderTopWidth: 1, borderTopColor: SIDEBAR.border }}>
+          Onboard Sales Revenue System
+        </Text>
+      )}
     </View>
   );
 }
 
-function TopBar({ meta, user, online, queueCount, unread, onBell, onMenu }) {
+function TopBar({ meta, user, online, queueCount, unread, onBell, onMenu, sidebarCollapsed, onToggleSidebar }) {
   return (
     <View style={{
       height: 64, backgroundColor: COLORS.surface, borderBottomWidth: 1, borderBottomColor: COLORS.border,
-      flexDirection: 'row', alignItems: 'center', paddingHorizontal: 24, gap: 12,
+      flexDirection: 'row', alignItems: 'center', paddingHorizontal: 16, gap: 12,
     }}>
+      <Pressable
+        onPress={onToggleSidebar}
+        accessibilityRole="button"
+        accessibilityLabel={sidebarCollapsed ? 'Show the side menu' : 'Hide the side menu'}
+        style={({ hovered }) => ({
+          width: 38, height: 38, borderRadius: 8, alignItems: 'center', justifyContent: 'center',
+          backgroundColor: hovered ? COLORS.surfaceAlt : 'transparent',
+        })}
+      >
+        <Icon name="menu" size={20} color={COLORS.muted} />
+      </Pressable>
       <View style={{ width: 34, height: 34, borderRadius: 8, backgroundColor: COLORS.primarySoft, alignItems: 'center', justifyContent: 'center' }}>
         <Icon name={meta?.icon || 'dashboard'} size={18} color={COLORS.primary} />
       </View>

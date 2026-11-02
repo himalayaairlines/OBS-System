@@ -20,11 +20,13 @@ import json
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from database import REPORT_UNSUBMIT_LIMIT, get_connection
 from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from report_forms import REPORT_FORMS, REPORT_TYPES, field_index, form_for
+import trip_flow
 from security import (
     current_user, log_action, now_iso, permissions_for, requires, today_iso,
     validate_date,
@@ -270,6 +272,9 @@ def reports_for_flight(flight_id: int, user: dict = Depends(requires("flight_rep
             "duty_group_id": flight["duty_group_id"],
             "duty_group_label": flight["duty_group_label"],
             "flight_status": flight["status"],
+            "trip_type": flight["trip_type"],
+            "segment": 2 if flight["direction"] == "RETURN" else 1,
+            "locked": bool(flight["reports_locked_at"] or flight["trip_completed_at"]),
             "reports": entries,
             "outstanding": [e["report_type"] for e in entries if e["status"] != "SUBMITTED"],
         }
@@ -293,6 +298,7 @@ def file_report(data: ReportIn, user: dict = Depends(requires("flight_reports"))
     try:
         flight = _flight(connection, data.flight_id)
         _assert_device(connection, flight, user)
+        trip_flow.assert_reports_open(connection, flight["id"], _may_review(user))
         if flight["status"] == "OPEN":
             raise HTTPException(
                 status_code=400,
@@ -315,8 +321,8 @@ def file_report(data: ReportIn, user: dict = Depends(requires("flight_reports"))
             if existing["status"] == "SUBMITTED":
                 raise HTTPException(
                     status_code=400,
-                    detail=("This report has already been filed. Pull it back first if it "
-                            "needs correcting."),
+                    detail=("This form has already been saved. To change it, edit it and give "
+                            "remarks for the change."),
                 )
             report_id = existing["id"]
             rev_no = int(existing["rev_no"])
@@ -407,6 +413,7 @@ def unsubmit_report(report_id: int, user: dict = Depends(requires("flight_report
             raise HTTPException(status_code=404, detail="Report not found.")
         flight = _flight(connection, row["flight_id"])
         _assert_device(connection, flight, user)
+        trip_flow.assert_reports_open(connection, flight["id"], _may_review(user))
         if row["status"] != "SUBMITTED":
             raise HTTPException(status_code=400, detail="This report has not been filed yet.")
         if int(row["unsubmit_count"]) >= REPORT_UNSUBMIT_LIMIT:
@@ -449,12 +456,16 @@ def unsubmit_report(report_id: int, user: dict = Depends(requires("flight_report
 
 @router.put("/flight-reports/{report_id}")
 def edit_report(report_id: int, data: ReportEdit,
-                user: dict = Depends(requires("reports_review"))):
-    """Management correction of a filed report. Remarks are mandatory."""
+                user: dict = Depends(requires("flight_reports"))):
+    """Change a saved report. Remarks are mandatory.
+
+    Management may correct any report. The crew may change their own sector's
+    saved forms until they lock (next flight started, or whole flight finished).
+    """
     remarks = (data.remarks or "").strip()
     if not remarks:
         raise HTTPException(
-            status_code=400, detail="Remarks are mandatory when correcting a filed report.",
+            status_code=400, detail="Remarks are mandatory when changing a saved report.",
         )
     connection = get_connection()
     try:
@@ -463,6 +474,12 @@ def edit_report(report_id: int, data: ReportEdit,
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Report not found.")
+        reviewer = _may_review(user)
+        if not reviewer:
+            _assert_device(connection, _flight(connection, row["flight_id"]), user)
+            trip_flow.assert_reports_open(connection, row["flight_id"], False)
+            if row["status"] != "SUBMITTED":
+                raise HTTPException(status_code=400, detail="Save the form first.")
         payload = _clean_payload(row["report_type"], data.payload)
         rev_no = int(row["rev_no"]) + 1
         now = now_iso()
@@ -477,9 +494,9 @@ def edit_report(report_id: int, data: ReportEdit,
         connection.execute(
             """INSERT INTO flight_report_revisions
                    (report_id,rev_no,payload,action,changed_by,changed_at,remarks)
-               VALUES (?,?,?,'CORRECTED',?,?,?)""",
+               VALUES (?,?,?,?,?,?,?)""",
             (report_id, rev_no, json.dumps(payload, ensure_ascii=False),
-             user["employee_id"], now, remarks),
+             "CORRECTED" if reviewer else "AMENDED", user["employee_id"], now, remarks),
         )
         connection.commit()
         result = _render(connection, connection.execute(
@@ -499,6 +516,26 @@ def edit_report(report_id: int, data: ReportEdit,
                   "rev_no": rev_no},
     )
     return result
+
+
+@router.get("/flight-reports/{report_id}/pdf")
+def report_pdf(report_id: int, user: dict = Depends(requires("flight_reports"))):
+    """The report laid out like the paper form, for printing or e-mailing."""
+    from report_pdf import build_pdf
+    connection = get_connection()
+    try:
+        row = connection.execute(f"{REPORT_SELECT} WHERE r.id=?", (report_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Report not found.")
+        if not _may_review(user):
+            _assert_device(connection, _flight(connection, row["flight_id"]), user)
+        report = _render(connection, row)
+    finally:
+        connection.close()
+    pdf = build_pdf(report)
+    name = f"{report['report_type'].lower()}-{report['flight_number']}-{report['flight_date']}-rev{report['rev_no']:02d}.pdf"
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @router.get("/flight-reports/{report_id}/revisions")

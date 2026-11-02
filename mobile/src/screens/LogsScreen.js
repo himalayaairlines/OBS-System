@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { ScrollView, View } from 'react-native';
+import { Pressable, ScrollView, View } from 'react-native';
 import { Text } from '../text';
 
 import * as FileSystem from 'expo-file-system/legacy';
@@ -8,10 +8,10 @@ import * as Sharing from 'expo-sharing';
 import { api, downloadReport } from '../api';
 import { BarChart, RankBarChart } from '../charts';
 import { COLORS, MONTHS, compact, npr, styles } from '../theme';
-import { usePaged } from '../paging';
+import { usePaged, usePagedArray } from '../paging';
 import {
-  Banner, Button, Card, Chip, Field, KeyValue, Notice, OptionModal, PageHeader, Pagination, Pill,
-  SectionTitle, Select,
+  Banner, Button, Card, Chip, DataTable, Field, KeyValue, Metric, Notice, OptionModal, PageHeader,
+  Pagination, Pill, SearchBar, SectionTitle, Select,
 } from '../ui';
 
 const YEARS = Array.from({ length: 6 }, (_, i) => new Date().getFullYear() - i);
@@ -41,6 +41,13 @@ export default function LogsScreen({ user }) {
   const [editRemarks, setEditRemarks] = useState('');
   const [editPicker, setEditPicker] = useState(false);
   const [exporting, setExporting] = useState(false);
+  // Crew ranking table: searchable, five a page, top to bottom.
+  const [crewSearch, setCrewSearch] = useState('');
+  const [historyFor, setHistoryFor] = useState(null);   // { id, name }
+  const crewTerm = crewSearch.trim().toLowerCase();
+  const rankingRows = (ranking?.ranking || []).filter((e) => !crewTerm
+    || e.name.toLowerCase().includes(crewTerm) || String(e.crew_code || '').toLowerCase().includes(crewTerm));
+  const rankingPager = usePagedArray(rankingRows, { pageSize: 5, resetKey: `${crewTerm}|${ranking ? ranking.ranking.length : 0}` });
 
   const query = useCallback(() => {
     const parts = [`year=${filter.year}`];
@@ -83,7 +90,7 @@ export default function LogsScreen({ user }) {
     if (!canOversee) return;
     try {
       const [r, t, m, d] = await Promise.all([
-        api(`/crew-ranking?${query()}`),
+        api(`/crew-ranking?${query()}&all_crew=true`),
         api(`/top-products?${query()}&limit=10`),
         api('/logs/modules'),
         api(`/dashboard?${query()}`),
@@ -136,10 +143,21 @@ export default function LogsScreen({ user }) {
     ...(canSeeSales ? [{ key: 'sales', label: canEdit ? 'Edit sales' : 'Sales' }] : []),
   ];
 
+  if (historyFor) {
+    return (
+      <CrewHistory
+        member={historyFor}
+        filter={filter}
+        query={query}
+        onBack={() => setHistoryFor(null)}
+      />
+    );
+  }
+
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
       <PageHeader
-        title={canOversee ? 'Performance & Logs' : 'Onboard Sales'}
+        title={canOversee ? 'Performance & Sales Logs' : 'Onboard Sales'}
         description={canOversee
           ? 'Commission ranking, best sellers and the full activity trail.'
           : 'Every sale recorded on board. Correct a mis-keyed line with remarks.'}
@@ -179,7 +197,7 @@ export default function LogsScreen({ user }) {
               description={`Each flight pays ${(ranking.commission_rate * 100).toFixed(0)}% of its sales into the group pool, split equally between the group's members.`}
             />
             <RankBarChart
-              data={ranking.ranking.slice(0, 10).map((entry) => ({
+              data={ranking.ranking.filter((e) => e.commission_npr > 0).slice(0, 10).map((entry) => ({
                 label: entry.name, value: entry.commission_npr,
               }))}
               format={compact}
@@ -187,25 +205,48 @@ export default function LogsScreen({ user }) {
           </Card>
 
           <Card>
-            <SectionTitle title="Ranking table" />
-            {ranking.ranking.map((entry) => (
-              <View key={entry.crew_member_id} style={styles.listRow}>
-                <View style={styles.rowBetween}>
-                  <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>
-                    {entry.rank}. {entry.name}
+            <SectionTitle
+              title="Ranking table"
+              description="Every crew member, highest commission first. Click a name to see their full sales history."
+            />
+            <SearchBar value={crewSearch} onChangeText={setCrewSearch} placeholder="Search crew name or code…" />
+            <DataTable
+              breakpoint={760}
+              rows={rankingPager.items}
+              rowKey={(e) => String(e.crew_member_id)}
+              emptyText={crewTerm ? 'No crew member matches.' : 'No crew members yet.'}
+              columns={[
+                { key: 'rank', label: '#', flex: 0.4, render: (e) => String(e.rank) },
+                {
+                  key: 'name', label: 'Crew member', flex: 2.2, render: (e) => (
+                    <CrewLink entry={e} onPress={() => setHistoryFor({ id: e.crew_member_id, name: e.name })} />
+                  ),
+                },
+                { key: 'sectors', label: 'Sectors', flex: 0.8, align: 'right', render: (e) => String(e.flights) },
+                { key: 'tx', label: 'Transactions', flex: 1, align: 'right', render: (e) => String(e.transactions) },
+                { key: 'sales', label: 'Own sales', flex: 1.2, align: 'right', render: (e) => npr(e.attributed_sales_npr) },
+                {
+                  key: 'commission', label: 'Commission', flex: 1.2, align: 'right', render: (e) => (
+                    <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.success }}>{npr(e.commission_npr)}</Text>
+                  ),
+                },
+              ]}
+              renderStacked={(e) => (
+                <>
+                  <View style={styles.rowBetween}>
+                    <View style={[styles.row, { gap: 6, flex: 1 }]}>
+                      <Text style={{ fontSize: 14, fontWeight: '600' }}>{e.rank}.</Text>
+                      <CrewLink entry={e} onPress={() => setHistoryFor({ id: e.crew_member_id, name: e.name })} />
+                    </View>
+                    <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.success }}>{npr(e.commission_npr)}</Text>
+                  </View>
+                  <Text style={styles.mono}>
+                    {e.flights} sector(s) · {e.transactions} transaction(s) · own sales {npr(e.attributed_sales_npr)}
                   </Text>
-                  <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.success }}>
-                    {npr(entry.commission_npr)}
-                  </Text>
-                </View>
-                <Text style={styles.mono}>
-                  {entry.crew_code} · {entry.position} · {entry.flights} sector(s)
-                  {' · '}{entry.transactions} transaction(s)
-                  {' · '}own sales {npr(entry.attributed_sales_npr)}
-                </Text>
-              </View>
-            ))}
-            {!ranking.ranking.length && <Text style={styles.empty}>No commission earned in this period.</Text>}
+                </>
+              )}
+            />
+            <Pagination pager={rankingPager} label="crew members" sizes={[5, 10, 25]} />
           </Card>
 
           <Card>
@@ -306,7 +347,16 @@ export default function LogsScreen({ user }) {
               </View>
               <Text style={styles.mono}>
                 {sale.flight_number} · {sale.flight_date} · seat {sale.seat_number}
-                {' · '}{sale.seller_name || 'unattributed'} · {sale.sale_type}
+                {' · '}
+                {sale.sold_by_crew_member_id && canOversee ? (
+                  <Text
+                    style={{ color: COLORS.primary, fontWeight: '600' }}
+                    onPress={() => setHistoryFor({ id: sale.sold_by_crew_member_id, name: sale.seller_name })}
+                  >
+                    {sale.seller_name}
+                  </Text>
+                ) : (sale.seller_name || 'unattributed')}
+                {' · '}{sale.sale_type}
               </Text>
               {!!sale.edited_by && (
                 <Text style={{ fontSize: 12, color: COLORS.warning, marginTop: 2 }}>
@@ -395,6 +445,155 @@ export default function LogsScreen({ user }) {
         onSelect={(value) => { setEditProduct(value); setEditPicker(false); }}
         onClose={() => setEditPicker(false)}
       />
+    </ScrollView>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* A crew member's name that opens their history                       */
+/* ------------------------------------------------------------------ */
+function CrewLink({ entry, onPress }) {
+  return (
+    <Pressable onPress={onPress} accessibilityRole="link" hitSlop={4}>
+      {({ hovered }) => (
+        <View>
+          <Text style={{
+            fontSize: 14, fontWeight: '600', color: COLORS.primary,
+            textDecorationLine: hovered ? 'underline' : 'none',
+          }}
+          >
+            {entry.name}
+          </Text>
+          <Text style={[styles.mono, { marginTop: 0 }]}>{entry.crew_code} · {entry.position}</Text>
+        </View>
+      )}
+    </Pressable>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Everything one crew member sold                                     */
+/* ------------------------------------------------------------------ */
+function CrewHistory({ member, filter, query, onBack }) {
+  const [scope, setScope] = useState('all');   // 'all' | 'period'
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [itemSearch, setItemSearch] = useState('');
+
+  useEffect(() => {
+    (async () => {
+      try {
+        setData(await api(`/crew-members/${member.id}/history${scope === 'period' ? `?${query()}` : ''}`));
+        setError(null);
+      } catch (e) {
+        setError(e.message);
+      }
+    })();
+  }, [member.id, scope, query]);
+
+  const term = itemSearch.trim().toLowerCase();
+  const lines = (data?.sales || []).filter((l) => !term
+    || `${l.item_name} ${l.flight_number} ${l.seat_number} ${l.order_ref}`.toLowerCase().includes(term));
+  const salesPager = usePagedArray(lines, { pageSize: 10, resetKey: `${term}|${scope}` });
+  const sectorPager = usePagedArray(data?.sectors || [], { pageSize: 10, resetKey: scope });
+  const periodLabel = [filter.day, filter.month ? MONTHS[filter.month - 1] : '', filter.year].filter(Boolean).join(' ');
+
+  return (
+    <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
+      <PageHeader
+        title={data?.crew_member?.name || member.name || 'Crew member'}
+        description={data ? `${data.crew_member.crew_code} · ${data.crew_member.position}`
+          + (data.crew_member.active ? '' : ' · inactive') : 'Loading…'}
+        right={<Button title="Back to ranking" tone="ghost" small onPress={onBack} />}
+      />
+      <View style={[styles.wrap, { marginBottom: 12 }]}>
+        <Chip label="Whole history" active={scope === 'all'} onPress={() => setScope('all')} />
+        <Chip label={`Selected period (${periodLabel || 'all'})`} active={scope === 'period'} onPress={() => setScope('period')} />
+      </View>
+      {!!error && <Banner tone="danger" message={error} />}
+
+      {data && (
+        <>
+          <View style={[styles.wrap, { gap: 12, marginBottom: 12 }]}>
+            <Metric label="Commission" value={npr(data.totals.commission_npr)} tone="success" />
+            <Metric label="Own sales" value={npr(data.totals.sales_npr)} />
+            <Metric label="Items sold" value={String(data.totals.items)} />
+            <Metric label="Transactions" value={String(data.totals.transactions)} />
+            <Metric label="Sectors worked" value={String(data.totals.sectors)} />
+          </View>
+
+          <Card>
+            <SectionTitle
+              title="Sectors worked"
+              description={data.commission_model === 'POOLED'
+                ? `Commission is ${(data.commission_rate * 100).toFixed(0)}% of each sector's sales, shared equally by its crew.`
+                : `Commission is ${(data.commission_rate * 100).toFixed(0)}% of their own sales.`}
+            />
+            <DataTable
+              rows={sectorPager.items}
+              rowKey={(r) => String(r.flight_id)}
+              emptyText="No sectors in this period."
+              columns={[
+                { key: 'date', label: 'Date', flex: 1, render: (r) => r.flight_date },
+                { key: 'flight', label: 'Flight', flex: 1, render: (r) => r.flight_number },
+                { key: 'sector', label: 'Sector', flex: 1, render: (r) => `${r.origin}–${r.destination}` },
+                { key: 'group', label: 'Crew group', flex: 1.3, render: (r) => r.duty_group_label || '—' },
+                { key: 'items', label: 'Items', flex: 0.6, align: 'right', render: (r) => String(r.items) },
+                { key: 'sales', label: 'Own sales', flex: 1, align: 'right', render: (r) => npr(r.sales_npr) },
+                { key: 'commission', label: 'Commission', flex: 1, align: 'right', render: (r) => npr(r.commission_npr) },
+              ]}
+              renderStacked={(r) => (
+                <>
+                  <View style={styles.rowBetween}>
+                    <Text style={{ fontSize: 14, fontWeight: '600' }}>{r.flight_number} · {r.origin}–{r.destination}</Text>
+                    <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.success }}>{npr(r.commission_npr)}</Text>
+                  </View>
+                  <Text style={styles.mono}>{r.flight_date} · {r.items} item(s) · own sales {npr(r.sales_npr)}</Text>
+                </>
+              )}
+            />
+            <Pagination pager={sectorPager} label="sectors" />
+          </Card>
+
+          <Card>
+            <SectionTitle title="Every sale" description="Newest first. Complementary and cancelled lines are shown but earn no commission." />
+            <SearchBar value={itemSearch} onChangeText={setItemSearch} placeholder="Search item, flight or seat…" />
+            <DataTable
+              breakpoint={820}
+              rows={salesPager.items}
+              rowKey={(l) => String(l.id)}
+              emptyText={term ? 'No sale matches.' : 'No sales in this period.'}
+              columns={[
+                { key: 'time', label: 'Date & time', flex: 1.3, render: (l) => String(l.transaction_time || '').replace('T', ' ').slice(0, 16) },
+                { key: 'flight', label: 'Flight', flex: 1.1, render: (l) => `${l.flight_number} ${l.origin}–${l.destination}` },
+                { key: 'seat', label: 'Seat', flex: 0.5, render: (l) => l.seat_number },
+                { key: 'item', label: 'Item', flex: 1.6, render: (l) => l.item_name || '—' },
+                { key: 'qty', label: 'Qty', flex: 0.4, align: 'right', render: (l) => String(l.quantity) },
+                { key: 'amount', label: 'Amount', flex: 1, align: 'right', render: (l) => npr(l.npr_amount) },
+                {
+                  key: 'type', label: 'Type', flex: 0.9, render: (l) => (
+                    <Pill label={l.sale_type} tone={l.sale_type === 'NORMAL' ? 'success' : 'warning'} />
+                  ),
+                },
+              ]}
+              renderStacked={(l) => (
+                <>
+                  <View style={styles.rowBetween}>
+                    <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>{l.item_name} × {l.quantity}</Text>
+                    <Text style={{ fontSize: 13, fontWeight: '600' }}>{npr(l.npr_amount)}</Text>
+                  </View>
+                  <Text style={styles.mono}>
+                    {String(l.transaction_time || '').replace('T', ' ').slice(0, 16)} · {l.flight_number}
+                    {' '}{l.origin}–{l.destination} · seat {l.seat_number} · {l.sale_type}
+                  </Text>
+                  {!!l.edit_remarks && <Text style={[styles.mono, { color: COLORS.warning }]}>Edited by {l.edited_by}: {l.edit_remarks}</Text>}
+                </>
+              )}
+            />
+            <Pagination pager={salesPager} label="sales" />
+          </Card>
+        </>
+      )}
     </ScrollView>
   );
 }

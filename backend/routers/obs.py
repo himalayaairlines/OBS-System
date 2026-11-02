@@ -456,6 +456,14 @@ def submit_reconciliation(
                 status_code=400,
                 detail="This stock return has been approved and can no longer be changed.",
             )
+        # Submitted once, it waits for the Inventory Supervisor (7.5). The crew
+        # count again only if it is sent back.
+        if header and header["status"] == "PENDING" \
+                and "reconcile_approve" not in permissions_for(user["role"]):
+            raise HTTPException(
+                status_code=400,
+                detail="The stock return has already been submitted and is waiting for approval.",
+            )
 
         now = now_iso()
         if header:

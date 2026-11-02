@@ -376,7 +376,8 @@ def _render_sector(sector):
 
 @router.get("/crew-ranking")
 def crew_ranking(year: int | None = None, month: int | None = None, day: int | None = None,
-                 destination: str | None = None, user: dict = Depends(requires("logs"))):
+                 destination: str | None = None, all_crew: bool = False,
+                 user: dict = Depends(requires("logs"))):
     """Individual performance, built from the seller recorded on each sale."""
     conditions, params = _flight_conditions(year, month, day, destination)
     connection = get_connection()
@@ -385,7 +386,20 @@ def crew_ranking(year: int | None = None, month: int | None = None, day: int | N
     finally:
         connection.close()
 
-    ranking = sorted(entries.values(), key=lambda e: e["commission_npr"], reverse=True)
+    ranking = sorted(entries.values(), key=lambda e: (-e["commission_npr"], e["name"]))
+    # Everyone on the active roster appears, including those with nothing this
+    # period, so the table is the whole crew rather than only the earners.
+    if all_crew:
+        connection = get_connection()
+        try:
+            for m in connection.execute(
+                    "SELECT id, crew_code, name, position FROM crew_members WHERE active=1 ORDER BY name").fetchall():
+                if m["id"] not in entries:
+                    ranking.append({"crew_member_id": m["id"], "crew_code": m["crew_code"], "name": m["name"],
+                                    "position": m["position"], "sales_npr": 0.0, "commission_npr": 0.0,
+                                    "transactions": 0, "sectors": set()})
+        finally:
+            connection.close()
     result = [{
         "rank": position,
         "crew_member_id": entry["crew_member_id"],
@@ -407,6 +421,82 @@ def crew_ranking(year: int | None = None, month: int | None = None, day: int | N
             (_render_sector(s) for s in sectors.values()),
             key=lambda s: s["revenue_npr"], reverse=True,
         ),
+    }
+
+
+@router.get("/crew-members/{member_id}/history")
+def crew_history(member_id: int, year: int | None = None, month: int | None = None, day: int | None = None,
+                 destination: str | None = None, user: dict = Depends(requires("logs"))):
+    """Everything one crew member sold, sector by sector, with what they earned.
+
+    Without a year the whole history is returned.
+    """
+    connection = get_connection()
+    try:
+        member = connection.execute("SELECT * FROM crew_members WHERE id=?", (member_id,)).fetchone()
+        if not member:
+            raise HTTPException(status_code=404, detail="Crew member not found.")
+        conditions, params = _flight_conditions(year, month, day, destination)
+        entries, sectors = _commission_entries(connection, conditions, params)
+        mine = entries.get(member_id)
+        where = " AND ".join(conditions + ["s.sold_by_crew_member_id=?"])
+        lines = [dict(r) for r in connection.execute(
+            f"""SELECT s.id, s.order_ref, s.transaction_time, s.seat_number, s.quantity, s.unit_price,
+                       s.npr_amount, s.transaction_currency, s.transaction_currency_amount, s.sale_type,
+                       s.remarks, s.edited_by, s.edit_remarks,
+                       f.id AS flight_id, f.flight_number, f.flight_date, f.origin, f.destination,
+                       COALESCE(p.product_name, b.bundle_name) AS item_name
+                FROM sales s
+                JOIN flights f ON f.id = s.flight_id
+                LEFT JOIN products p ON p.id = s.product_id
+                LEFT JOIN bundles b ON b.id = s.bundle_id
+                WHERE {where}
+                ORDER BY s.transaction_time DESC, s.id DESC""",
+            (*params, member_id)).fetchall()]
+        # Sectors they worked, including ones where they sold nothing.
+        worked = [dict(r) for r in connection.execute(
+            f"""SELECT f.id AS flight_id, f.flight_number, f.flight_date, f.origin, f.destination,
+                       d.label AS duty_group_label
+                FROM duty_group_members dm
+                JOIN duty_groups d ON d.id = dm.duty_group_id
+                JOIN flights f ON f.id = d.flight_id
+                WHERE dm.crew_member_id=? {('AND ' + ' AND '.join(conditions)) if conditions else ''}
+                ORDER BY f.flight_date DESC, f.flight_number""",
+            (member_id, *params)).fetchall()]
+    finally:
+        connection.close()
+
+    roster_size = {fid: s.get("member_count", 0) for fid, s in sectors.items()}
+    by_flight = defaultdict(lambda: {"sales_npr": 0.0, "items": 0, "transactions": set()})
+    for line in lines:
+        if line["sale_type"] != "NORMAL":
+            continue
+        agg = by_flight[line["flight_id"]]
+        agg["sales_npr"] += float(line["npr_amount"] or 0)
+        agg["items"] += int(line["quantity"] or 0)
+        agg["transactions"].add(line["order_ref"])
+    sector_rows = []
+    for w in worked:
+        agg = by_flight.get(w["flight_id"], {"sales_npr": 0.0, "items": 0, "transactions": set()})
+        pool = sectors.get(w["flight_id"], {}).get("revenue_npr", 0.0) * COMMISSION_RATE
+        size = roster_size.get(w["flight_id"]) or 0
+        commission = (pool / size if size else 0.0) if COMMISSION_MODEL == "POOLED" \
+            else agg["sales_npr"] * COMMISSION_RATE
+        sector_rows.append({**w, "sales_npr": round(agg["sales_npr"], 2), "items": agg["items"],
+                            "transactions": len(agg["transactions"]), "commission_npr": round(commission, 2)})
+    return {
+        "crew_member": {"id": member["id"], "crew_code": member["crew_code"], "name": member["name"],
+                        "position": member["position"], "active": bool(member["active"])},
+        "totals": {
+            "sales_npr": round(mine["sales_npr"], 2) if mine else 0.0,
+            "commission_npr": round(mine["commission_npr"], 2) if mine else 0.0,
+            "transactions": mine["transactions"] if mine else 0,
+            "sectors": len(worked),
+            "items": sum(int(l["quantity"] or 0) for l in lines if l["sale_type"] == "NORMAL"),
+        },
+        "commission_model": COMMISSION_MODEL, "commission_rate": COMMISSION_RATE,
+        "sectors": sector_rows,
+        "sales": lines,
     }
 
 

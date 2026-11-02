@@ -2,7 +2,10 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Pressable, ScrollView, View } from 'react-native';
 import { Text, TextInput } from '../text';
 
-import { api, cached } from '../api';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
+
+import { api, cached, downloadReport } from '../api';
 import { usePaged } from '../paging';
 import { confirm, notify } from '../dialog';
 import { COLORS, styles, todayString } from '../theme';
@@ -27,7 +30,7 @@ const STATUS_TONE = {
 };
 
 const STATUS_LABEL = {
-  SUBMITTED: 'FILED',
+  SUBMITTED: 'SAVED',
   DRAFT: 'DRAFT',
   NOT_STARTED: 'NOT FILLED',
 };
@@ -226,7 +229,7 @@ function FormField({ field, value, onChange, readOnly, onPickDate }) {
 /* ------------------------------------------------------------------ */
 /* The screen                                                          */
 /* ------------------------------------------------------------------ */
-export default function ReportsScreen({ user, online, initialFlightId, onHandled }) {
+export default function ReportsScreen({ user, online, initialFlightId, onHandled, goTo }) {
   const canReview = user.permissions?.includes('reports_review');
 
   const [forms, setForms] = useState([]);
@@ -241,6 +244,8 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
   const [draft, setDraft] = useState({});
   const [editRemarks, setEditRemarks] = useState('');
   const [datePicker, setDatePicker] = useState(null);
+  // A report opened from Management's "Filed reports" list.
+  const [filedReport, setFiledReport] = useState(null);
 
   // Management filters
   const [filterDate, setFilterDate] = useState('');
@@ -252,7 +257,10 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
   const sectorReports = sector?.reports || [];
   const outstanding = sector?.outstanding || [];
   const entry = sectorReports.find((r) => r.report_type === openType) || null;
-  const report = entry?.report || null;
+  const report = (filedReport && filedReport.report_type === openType ? filedReport : null)
+    || entry?.report || null;
+  // Something was changed on screen compared with the saved version.
+  const dirty = !!report && JSON.stringify(draft || {}) !== JSON.stringify(report.payload || {});
 
   /* ------------------------------ data ------------------------------ */
   const loadForms = useCallback(async () => {
@@ -266,7 +274,9 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     setFlights(list);
     setFlightId((current) => {
       if (current && list.some((f) => f.id === current)) return current;
-      // The crew care about the sector they have just finished.
+      // The crew care about the sector they have just finished and can still fill in.
+      const open = list.filter((f) => f.status === 'FLOWN' && !f.reports_locked_at && !f.trip_completed_at);
+      if (!canReview) return open[0]?.id ?? null;
       const finished = list.filter((f) => f.status === 'FLOWN');
       return finished[0]?.id ?? list[0]?.id ?? null;
     });
@@ -277,6 +287,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     try {
       const result = await cached(`sectorReports.${id}`, `/flights/${id}/reports`, null);
       setSector(result.data || null);
+      return result.data || null;
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -322,11 +333,15 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     setOpenType(reportType);
   }
 
+  // The crew may fill in and change their sector's forms until they lock
+  // (second flight started, or whole flight finished). Changing a saved form
+  // needs remarks. Management may always correct, with remarks.
+  const locked = !!sector?.locked;
+  const crewEditingSaved = !canReview && report?.status === 'SUBMITTED';
   const readOnly = useMemo(() => {
-    if (!report) return false;                 // new report: fill it in
-    if (report.status === 'DRAFT') return false;
-    return !canReview;                         // filed: only management may change it
-  }, [report, canReview]);
+    if (canReview) return false;
+    return locked;
+  }, [canReview, locked]);
 
   function setValue(key, value) {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -335,11 +350,11 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
   /* --------------------------- submitting --------------------------- */
   async function submitForm() {
     const sure = await confirm({
-      title: 'Submit this report?',
-      message: `${form.title} will be filed for ${sector.flight_number} `
-        + `${sector.sector}.\n\nYou may pull it back once if you spot a mistake. `
-        + 'After that only Management can change it.',
-      confirmText: 'Submit',
+      title: 'Save this form?',
+      message: `${form.title} for ${sector.flight_number} ${sector.sector} is saved and sent to `
+        + 'Management.\n\nYou can still change it until the next flight is started or the whole '
+        + 'flight is finished; each change needs remarks.',
+      confirmText: 'Save',
     });
     if (!sure) return;
 
@@ -355,14 +370,29 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
           client_ref: `RPT-${sector.flight_id}-${openType}-${Date.now().toString(36)}`,
         },
       });
-      setMessage({
-        tone: 'success',
-        text: `${form.title} filed — ${saved.issue_label}, ${saved.rev_label}, ${saved.report_date}.`,
-      });
       setOpenType(null);
-      await loadSector(sector.flight_id);
+      const fresh = await loadSector(sector.flight_id);
       await loadFiled();
       onHandled?.();
+      const left = (fresh?.outstanding || []).length;
+      if (!canReview && fresh && left === 0) {
+        const next = fresh.trip_type === 'ROUND_TRIP' && fresh.segment === 1
+          ? 'Go to the Sales page and press \u201cStart second flight\u201d.'
+          : 'Next: submit the stock return on the Sync page, then press \u201cFinish whole flight\u201d on the Sales page.';
+        const go = await confirm({
+          title: 'All forms saved',
+          message: `All forms for ${fresh.sector} are saved and sent to Management.\n\n${next}`,
+          confirmText: fresh.trip_type === 'ROUND_TRIP' && fresh.segment === 1 ? 'Go to Sales' : 'Go to Sync',
+          cancelText: 'Later',
+        });
+        if (go) goTo?.(fresh.trip_type === 'ROUND_TRIP' && fresh.segment === 1 ? 'crew' : 'sync');
+      } else {
+        setMessage({
+          tone: 'success',
+          text: `${form.title} saved and sent to Management — ${saved.issue_label}, ${saved.rev_label}.`
+            + (left ? ` ${left} form(s) still to fill in for this sector.` : ''),
+        });
+      }
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -402,8 +432,11 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
         method: 'PUT',
         body: { payload: draft, remarks: editRemarks.trim() },
       });
-      setMessage({ tone: 'success', text: `Corrected — now ${saved.rev_label}.` });
+      setMessage({ tone: 'success', text: canReview
+        ? `Correction saved — now ${saved.rev_label}.`
+        : `Changes saved — now ${saved.rev_label}. Management can see them.` });
       setOpenType(null);
+      setFiledReport(null);
       setEditRemarks('');
       await loadSector(flightId);
       await loadFiled();
@@ -411,6 +444,28 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
       setMessage({ tone: 'danger', text: error.message });
     }
     setBusy(false);
+  }
+
+  function openFiled(r) {
+    setFiledReport(r);
+    setFlightId(r.flight_id);
+    setDraft(r.payload || {});
+    setEditRemarks('');
+    setOpenType(r.report_type);
+  }
+
+  function closeForm() {
+    setOpenType(null);
+    setFiledReport(null);
+    setEditRemarks('');
+  }
+
+  async function downloadPdf() {
+    try {
+      await downloadReport('', FileSystem, Sharing, `/flight-reports/${report.id}/pdf`);
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
   }
 
   /* ------------------------------ view ------------------------------ */
@@ -421,7 +476,14 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
         <PageHeader
           title={form.title}
           description={`${form.manual} · ${form.appendix}`}
-          right={<Pill label={form.form_code} tone="muted" />}
+          right={(
+            <View style={[styles.row, styles.gap8]}>
+              <Pill label={form.form_code} tone="muted" />
+              {!!report && report.status === 'SUBMITTED' && (
+                <Button title="Download PDF" tone="secondary" small onPress={downloadPdf} disabled={!online} />
+              )}
+            </View>
+          )}
         />
         {message && <Notice message={message} />}
 
@@ -485,11 +547,11 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
           )}
         </Card>
 
-        {canReview && report && report.status === 'SUBMITTED' && (
+        {report && report.status === 'SUBMITTED' && (canReview ? dirty : !locked) && (
           <Card>
             <SectionTitle
-              title="Correct this report"
-              description="The version as filed is kept. Remarks are mandatory and stay with the report."
+              title={canReview ? 'Correct this report' : 'Change this saved form'}
+              description="The saved version is kept. Remarks are mandatory and stay with the report."
             />
             <Field
               label="Remarks (mandatory)"
@@ -498,50 +560,66 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
               multiline
               placeholder="Why is this being corrected?"
             />
-            <Button
-              title={busy ? 'Saving…' : 'Save correction'}
-              onPress={() => saveCorrection(report)}
-              disabled={busy || !online}
-            />
+            {!canReview && (
+              <Button
+                title={busy ? 'Saving…' : 'Save changes'}
+                onPress={() => saveCorrection(report)}
+                disabled={busy || !online || !dirty}
+              />
+            )}
           </Card>
         )}
 
         <Card>
           <View style={[styles.row, styles.gap8]}>
-            <Button
-              title="Cancel"
-              tone="ghost"
-              style={styles.flex1}
-              onPress={() => { setOpenType(null); setEditRemarks(''); }}
-            />
-            {!readOnly && (
+            {canReview && report?.status === 'SUBMITTED' ? (
+              dirty ? (
+                <>
+                  <Button
+                    title="Discard changes"
+                    tone="ghost"
+                    style={styles.flex1}
+                    onPress={() => { setDraft(report.payload || {}); setEditRemarks(''); }}
+                  />
+                  <Button
+                    title={busy ? 'Saving…' : 'Save correction'}
+                    tone="primary"
+                    style={styles.flex1}
+                    onPress={() => saveCorrection(report)}
+                    disabled={busy || !online || !editRemarks.trim()}
+                  />
+                </>
+              ) : (
+                <Button title="Close" tone="ghost" style={styles.flex1} onPress={closeForm} />
+              )
+            ) : (
               <Button
-                title={busy ? 'Submitting…' : 'Submit'}
+                title={dirty ? 'Discard changes' : 'Cancel'}
+                tone="ghost"
+                style={styles.flex1}
+                onPress={closeForm}
+              />
+            )}
+            {!readOnly && !crewEditingSaved && !(canReview && report?.status === 'SUBMITTED') && (
+              <Button
+                title={busy ? 'Saving…' : 'Save'}
                 tone="primary"
                 style={styles.flex1}
                 onPress={submitForm}
                 disabled={busy || !online}
               />
             )}
-            {readOnly && report?.may_unsubmit && !canReview && (
-              <Button
-                title="Unsubmit"
-                tone="warning"
-                style={styles.flex1}
-                onPress={unsubmitForm}
-                disabled={busy || !online}
-              />
-            )}
+
           </View>
           {!online && (
             <Text style={[styles.mono, { marginTop: 8 }]}>
               Reports need a connection. Fill this in once the iPad is back on Wi-Fi.
             </Text>
           )}
-          {readOnly && !report?.may_unsubmit && !canReview && (
+          {locked && !canReview && (
             <Text style={[styles.mono, { marginTop: 8 }]}>
-              This report is filed and has used its one pull-back. Ask Management if it
-              still needs changing.
+              These forms are locked because the next flight was started or the whole flight
+              was finished. Ask Management if something still needs changing.
             </Text>
           )}
         </Card>
@@ -557,7 +635,14 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     );
   }
 
-  const sellable = flights.filter((f) => f.status !== 'OPEN');
+  // Management see every finished sector; the crew only the ones still open to them.
+  const sellable = canReview
+    ? flights.filter((f) => f.status !== 'OPEN')
+    : flights.filter((f) => f.status === 'FLOWN' && !f.reports_locked_at && !f.trip_completed_at);
+  const segmentTitle = !sector ? 'Forms'
+    : sector.trip_type === 'ROUND_TRIP'
+      ? `Forms (${sector.segment === 2 ? 'second' : 'first'} segment) · ${sector.sector}`
+      : `Forms · ${sector.sector}`;
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
@@ -569,6 +654,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
       />
       {message && <Notice message={message} />}
 
+      {!canReview && (
       <Card>
         <SectionTitle
           title="Sector"
@@ -577,7 +663,8 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
         <Select
           label="Flight"
           valueLabel={sector ? `${sector.flight_number} · ${sector.sector} · ${sector.flight_date}` : ''}
-          placeholder={sellable.length ? 'Select a finished sector' : 'No finished sector yet'}
+          placeholder={sellable.length ? 'Select a finished sector'
+            : canReview ? 'No finished sector yet' : 'No forms to fill in right now'}
           onPress={() => setFlightPicker(true)}
         />
         {!!sector && (
@@ -588,8 +675,8 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
               {!!sector.aircraft_type && <Pill label={sector.aircraft_type} tone="muted" />}
               <Pill
                 label={outstanding.length
-                  ? `${outstanding.length} still to file`
-                  : 'All reports filed'}
+                  ? `${outstanding.length} still to fill in`
+                  : 'All forms saved'}
                 tone={outstanding.length ? 'warning' : 'success'}
               />
             </View>
@@ -603,9 +690,16 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
         )}
       </Card>
 
-      {!!sector && !!sectorReports.length && (
+      )}
+
+      {!canReview && !!sector && !!sectorReports.length && (
         <Card>
-          <SectionTitle title="Forms" description="Tap a form to fill it in." />
+          <SectionTitle
+            title={segmentTitle}
+            description={sector.locked
+              ? 'Locked: the next flight was started or the whole flight was finished.'
+              : 'Tap a form to fill it in. Saved forms go to Management straight away.'}
+          />
           {sectorReports.map((item) => {
             const r = item.report;
             return (
@@ -670,7 +764,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
           {filed.map((r) => (
             <Pressable
               key={r.id}
-              onPress={() => { setFlightId(r.flight_id); setTimeout(() => openForm(r.report_type), 0); }}
+              onPress={() => openFiled(r)}
               style={[styles.listRow, { paddingVertical: 12 }]}
             >
               <View style={styles.rowBetween}>

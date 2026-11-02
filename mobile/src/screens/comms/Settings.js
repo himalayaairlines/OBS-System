@@ -113,6 +113,7 @@ export function SmtpSettings({ user }) {
   const canTest = has(user, 'smtp_test');
   const [cfg, setCfg] = useState(null);
   const [form, setForm] = useState(null);
+  const [saved, setSaved] = useState(null);
   const [password, setPassword] = useState('');
   const [testTo, setTestTo] = useState('');
   const [result, setResult] = useState(null);
@@ -123,12 +124,14 @@ export function SmtpSettings({ user }) {
     try {
       const c = await api('/settings/smtp');
       setCfg(c);
-      setForm({
+      const next = {
         enabled: !!c.enabled, host: c.host || '', port: String(c.port || 587), security: c.security || 'starttls',
         auth_enabled: !!c.auth_enabled, username: c.username || '', sender_email: c.sender_email || '',
         sender_name: c.sender_name || '', reply_to: c.reply_to || '', timeout_seconds: String(c.timeout_seconds || 20),
         max_attempts: String(c.max_attempts || 6), rate_limit_per_minute: String(c.rate_limit_per_minute || 30),
-      });
+      };
+      setForm(next);
+      setSaved(next);
     } catch (e) {
       setMessage({ tone: 'danger', text: e.message });
     }
@@ -136,22 +139,30 @@ export function SmtpSettings({ user }) {
 
   useEffect(() => { load(); }, [load]);
 
-  async function save(clearPassword = false) {
+  async function save(clearPassword = false, overrides = {}) {
     setBusy(true);
+    const values = { ...form, ...overrides };
     try {
       await api('/settings/smtp', {
         method: 'PUT',
         body: {
-          ...form, port: Number(form.port), timeout_seconds: Number(form.timeout_seconds),
-          max_attempts: Number(form.max_attempts), rate_limit_per_minute: Number(form.rate_limit_per_minute),
+          ...values, port: Number(values.port), timeout_seconds: Number(values.timeout_seconds),
+          max_attempts: Number(values.max_attempts), rate_limit_per_minute: Number(values.rate_limit_per_minute),
           password: password || null, clear_password: clearPassword,
         },
       });
       setPassword('');
-      setMessage({ tone: 'success', text: 'SMTP settings saved. The password is stored encrypted and cannot be shown again.' });
+      setMessage({
+        tone: 'success',
+        text: 'enabled' in overrides
+          ? `Sending e-mail is now ${overrides.enabled ? 'ON' : 'OFF'}. Other changes on this form were saved too.`
+          : 'SMTP settings saved. The password is stored encrypted and cannot be shown again.',
+      });
       load();
     } catch (e) {
       setMessage({ tone: 'danger', text: e.message });
+      // A refused switch-on leaves the switch where the server has it.
+      if ('enabled' in overrides) load();
     }
     setBusy(false);
   }
@@ -181,6 +192,8 @@ export function SmtpSettings({ user }) {
     setBusy(false);
   }
 
+  const dirty = !!form && !!saved && (!!password || JSON.stringify(form) !== JSON.stringify(saved));
+
   if (!form) return message ? <Notice message={message} /> : null;
   const set = (patch) => setForm({ ...form, ...patch });
   const securityOptions = [['starttls', 'STARTTLS (587)'], ['ssl', 'SSL/TLS (465)']];
@@ -194,8 +207,12 @@ export function SmtpSettings({ user }) {
         right={<StatusPill status={cfg.enabled ? 'ACTIVE' : 'DISABLED'} />}
       />
       {message && <Notice message={message} />}
-      <Toggle label="Send email" value={form.enabled} disabled={!canManage} onChange={(v) => set({ enabled: v })}
-        hint="When off, emails queue up and nothing is lost; in-app alerts keep working." />
+      <Toggle label="Send email" value={form.enabled} disabled={!canManage || busy}
+        onChange={(v) => { set({ enabled: v }); save(false, { enabled: v }); }}
+        hint="Saved as soon as you switch it. When off, emails queue up and nothing is lost; in-app alerts keep working." />
+      {dirty && (
+        <Banner tone="warning" message="You have unsaved changes. Press “Save SMTP settings” below, or they are lost when you leave this page." />
+      )}
       <Field label="SMTP host" value={form.host} editable={canManage} autoCapitalize="none" onChangeText={(v) => set({ host: v.trim() })} placeholder="smtp.office365.com" />
       <Field label="Port" value={form.port} editable={canManage} keyboardType="number-pad" onChangeText={(v) => set({ port: v.replace(/[^0-9]/g, '') })} />
       <Text style={styles.label}>Encryption</Text>

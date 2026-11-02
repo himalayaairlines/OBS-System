@@ -72,6 +72,11 @@ ROLE_PERMISSIONS = {
               "security_view"},
 }
 
+# The administrator can see and do everything every other role can, including
+# selling on any flight (no iPad assignment needed) and every approval (7.5).
+# "qr_menu": only administrators edit the passenger QR menu.
+ROLE_PERMISSIONS["admin"] = set().union(*ROLE_PERMISSIONS.values()) | {"sell_any_flight", "qr_menu"}
+
 # --------------------------------------------------------------------------- #
 # Commission
 # --------------------------------------------------------------------------- #
@@ -859,6 +864,14 @@ def initialize_database():
         # Accounts and sign-in security (7.5).
         from auth_schema import initialize_auth
         initialize_auth(connection, _add_column, demo_ids=[u[0] for u in DEMO_USERS])
+
+        # Sector-by-sector crew workflow (7.5).
+        from trip_flow import initialize_trip_flow
+        initialize_trip_flow(connection, _add_column, _columns)
+
+        # Passenger QR menu (7.8).
+        from routers.qr_menu import initialize_qr_menu
+        initialize_qr_menu(connection)
 
         connection.commit()
     finally:

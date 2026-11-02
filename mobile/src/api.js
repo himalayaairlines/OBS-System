@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
 
- const API_BASE =
+export const API_BASE =
   process.env.EXPO_PUBLIC_API_BASE || 'http://43.245.85.147:8005';
 
 // The oldest backend this app can talk to. Bump both this and API_VERSION in
@@ -421,7 +421,9 @@ export async function downloadReport(query, FileSystem, Sharing, path = '/report
     return { platform: 'web' };
   }
 
-  const target = `${FileSystem.cacheDirectory}${path.split('/').pop().replace('.xlsx', '')}-${Date.now()}.xlsx`;
+  const base = path.split('/').pop();
+  const ext = base.includes('.') ? base.split('.').pop() : 'xlsx';
+  const target = `${FileSystem.cacheDirectory}${base.replace(`.${ext}`, '')}-${Date.now()}.${ext}`;
   const result = await FileSystem.downloadAsync(url, target, {
     headers: { Authorization: `Bearer ${sessionToken}` },
   });

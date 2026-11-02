@@ -17,6 +17,7 @@ from database import (
     AIRCRAFT_TYPES, DUTY_GROUP_AMEND_LIMIT, DUTY_GROUP_SIZE, get_connection,
 )
 from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
+import trip_flow
 from security import (
     current_user, log_action, now_iso, permissions_for, requires, today_iso, validate_date,
 )
@@ -284,6 +285,7 @@ def _assert_device_assigned(connection, flight, user):
 
 
 def _assert_leg_open(flight, action="change"):
+    trip_flow.assert_started(flight, action)
     if flight["status"] == "FLOWN":
         raise HTTPException(
             status_code=400,
@@ -338,6 +340,7 @@ def finish_flight(flight_id: int, user: dict = Depends(requires("crew"))):
             raise HTTPException(status_code=400, detail="This flight has already been finished.")
 
         _assert_device_assigned(connection, flight, user)
+        trip_flow.assert_started(flight, "finish it")
 
         totals = connection.execute(
             """SELECT COALESCE(SUM(CASE WHEN sale_type='NORMAL' THEN npr_amount END),0) AS revenue,
@@ -364,6 +367,93 @@ def finish_flight(flight_id: int, user: dict = Depends(requires("crew"))):
         "revenue_npr": round(float(totals["revenue"] or 0), 2),
         "transactions": int(totals["orders"] or 0),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Trip workflow: start the second flight, finish the whole flight
+# --------------------------------------------------------------------------- #
+@router.get("/flights/{flight_id}/trip-progress")
+def trip_progress(flight_id: int, user: dict = Depends(current_user)):
+    connection = get_connection()
+    try:
+        flight = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if not flight:
+            raise HTTPException(status_code=404, detail="Flight not found.")
+        if user["role"] == "crew_supervisor":
+            _assert_device_assigned(connection, flight, user)
+        return trip_flow.progress(connection, flight_id)
+    finally:
+        connection.close()
+
+
+@router.post("/flights/{flight_id}/start-second")
+def start_second_flight(flight_id: int, user: dict = Depends(requires("crew"))):
+    """Open the return sector. The first sector's forms lock and stay with Management."""
+    connection = get_connection()
+    try:
+        state = trip_flow.progress(connection, flight_id)
+        if not state["round_trip"]:
+            raise HTTPException(status_code=400, detail="This is a one-way flight; there is no second flight.")
+        first, second = state["legs"][0], state["legs"][-1]
+        leg = connection.execute("SELECT * FROM flights WHERE id=?", (second["id"],)).fetchone()
+        _assert_device_assigned(connection, leg, user)
+        if second["started"]:
+            raise HTTPException(status_code=400, detail="The second flight has already been started.")
+        if not first["finished"]:
+            raise HTTPException(status_code=400, detail="Finish the first flight before starting the second.")
+        if not first["reports_done"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Save all {first['reports_total']} forms for {first['origin']}-{first['destination']} "
+                       f"first ({first['reports_filed']} saved so far).")
+        now = now_iso()
+        connection.execute("UPDATE flights SET started_at=?, started_by=? WHERE id=?",
+                           (now, user["employee_id"], second["id"]))
+        connection.execute("UPDATE flights SET reports_locked_at=? WHERE id=?", (now, first["id"]))
+        connection.commit()
+        result = trip_flow.progress(connection, flight_id)
+    finally:
+        connection.close()
+    log_action(user, "FLIGHT", "START_SECOND_FLIGHT",
+               f"Started {second['flight_number']} {second['origin']}-{second['destination']}; "
+               f"forms for {first['origin']}-{first['destination']} locked.", "flight", second["id"])
+    return result
+
+
+@router.post("/flights/{flight_id}/complete-trip")
+def complete_trip(flight_id: int, user: dict = Depends(requires("crew"))):
+    """The last step: every sector finished, every form saved, stock return in.
+    After this nothing on the trip can be changed from the iPad."""
+    connection = get_connection()
+    try:
+        state = trip_flow.progress(connection, flight_id)
+        root = connection.execute("SELECT * FROM flights WHERE id=?", (state["root_id"],)).fetchone()
+        _assert_device_assigned(connection, root, user)
+        if state["completed"]:
+            raise HTTPException(status_code=400, detail="This flight is already finished.")
+        missing = []
+        for leg in state["legs"]:
+            if not leg["finished"]:
+                missing.append(f"finish {leg['origin']}-{leg['destination']}")
+            elif not leg["reports_done"]:
+                missing.append(f"save the forms for {leg['origin']}-{leg['destination']}")
+        if state["stock_return"] not in ("PENDING", "APPROVED"):
+            missing.append("submit the stock return (Sync page)")
+        if missing:
+            raise HTTPException(status_code=400, detail="Before finishing the whole flight: " + "; ".join(missing) + ".")
+        now = now_iso()
+        for leg in state["legs"]:
+            connection.execute(
+                "UPDATE flights SET trip_completed_at=?, trip_completed_by=?, "
+                "reports_locked_at=COALESCE(reports_locked_at, ?) WHERE id=?",
+                (now, user["employee_id"], now, leg["id"]))
+        connection.commit()
+        result = trip_flow.progress(connection, flight_id)
+    finally:
+        connection.close()
+    route = " / ".join(f"{l['origin']}-{l['destination']}" for l in state["legs"])
+    log_action(user, "FLIGHT", "COMPLETE_TRIP", f"Finished the whole flight {route}.", "flight", state["root_id"])
+    return result
 
 
 # --------------------------------------------------------------------------- #

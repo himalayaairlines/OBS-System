@@ -14,7 +14,7 @@ import {
   Pill, SectionTitle, Select,
 } from '../ui';
 
-export default function SyncScreen({ user, online, onQueueChange, goToReports }) {
+export default function SyncScreen({ user, online, onQueueChange, goToReports, goTo }) {
   const isCrew = user.role === 'crew_supervisor';
   // Inventory roles have no stake in commission; what they need from this page
   // is what the crew declared as left over.
@@ -165,6 +165,13 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
   // in the trolley, and the difference is the variance the supervisor reviews.
 
   async function confirmReturn(trip) {
+    const sure = await confirm({
+      title: 'Submit the stock return?',
+      message: `The counted stock for ${trip.flight_number} goes to the Inventory Supervisor. `
+        + 'Once submitted it cannot be changed here unless it is sent back for a recount.',
+      confirmText: 'Confirm submit',
+    });
+    if (!sure) return;
     const typed = counts[trip.flight_id] || {};
     const lines = trip.items.map((item) => ({
       product_id: item.product_id,
@@ -200,18 +207,16 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
       });
       loadPending();
 
-      // The stock is dealt with; the sector's reports are what remain.
-      if (goToReports) {
-        const lastLeg = (trip.legs || [])[(trip.legs || []).length - 1];
-        const sectorId = lastLeg?.id || trip.flight_id;
+      // The last step is on the Sales page: Finish whole flight.
+      if (goTo && isCrew) {
         const now = await confirm({
-          title: 'File this sector\u2019s reports?',
-          message: 'The stock return is in. The four cabin reports for this sector still '
-            + 'need to be filled in.',
-          confirmText: 'Go to Reports',
+          title: 'Stock return submitted',
+          message: 'Last step: press \u201cFinish whole flight\u201d on the Sales page. After that '
+            + 'nothing on this trip can be changed.',
+          confirmText: 'Go to Sales',
           cancelText: 'Later',
         });
-        if (now) goToReports(sectorId);
+        if (now) goTo('crew');
       }
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
@@ -484,7 +489,10 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
       )}
 
       {isCrew && (
-        pending.length ? pending.map((trip) => (
+        pending.length ? pending.map((trip) => {
+          // Submitted and waiting for approval: read-only until sent back.
+          const locked = trip.submitted && trip.status !== 'REJECTED';
+          return (
           <Card key={trip.flight_id}>
             <SectionTitle
               title="End-of-flight stock return"
@@ -513,7 +521,9 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
             </View>
             {trip.items.map((item) => {
               const typed = (counts[trip.flight_id] || {})[item.product_id];
-              const value = typed === undefined ? String(item.expected_remaining) : typed;
+              const value = locked
+                ? String(item.declared_remaining ?? item.expected_remaining)
+                : typed === undefined ? String(item.expected_remaining) : typed;
               const diff = Number(value || 0) - item.expected_remaining;
               return (
                 <View key={item.product_id} style={[styles.rowBetween, { paddingVertical: 4 }]}>
@@ -530,6 +540,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
                       },
                     }))}
                     keyboardType="number-pad"
+                    editable={!locked}
                     style={[styles.input, {
                       width: 72,
                       paddingVertical: 4,
@@ -551,27 +562,28 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports })
               placeholder="e.g. two bottles broken in the trolley"
             />
 
-            {trip.submitted ? (
+            {locked ? (
               <Banner
-                tone="info"
-                message={'This count has been sent to the Inventory Supervisor. Submitting again '
-                  + 'replaces it until they approve.'}
+                tone="success"
+                message={'Submitted. The count is with the Inventory Supervisor. '
+                  + (isCrew ? 'Next: press \u201cFinish whole flight\u201d on the Sales page.' : '')}
               />
-            ) : null}
-
-            <Button
-              title={online ? 'Submit stock return' : 'SUBMIT (will upload on Wi-Fi)'}
-              tone={online ? 'primary' : 'warning'}
-              style={{ marginTop: 10 }}
-              onPress={() => confirmReturn(trip)}
-            />
+            ) : (
+              <Button
+                title={online ? 'Submit stock return' : 'SUBMIT (will upload on Wi-Fi)'}
+                tone={online ? 'primary' : 'warning'}
+                style={{ marginTop: 10 }}
+                onPress={() => confirmReturn(trip)}
+              />
+            )}
             <Text style={[styles.mono, { marginTop: 6 }]}>
               The Expected column is what the system works out from the load and every sale on the
               trip. Type what is actually in the trolley. Anything that differs is flagged for the
               Inventory Supervisor.
             </Text>
           </Card>
-        )) : (
+          );
+        }) : (
           <Card>
             <SectionTitle title="End-of-flight stock return" />
             {pendingError
