@@ -90,6 +90,23 @@ def upload(who, content, filename="dish.png", mime="image/png"):
 
 
 class QrMenuTests(unittest.TestCase):
+    def test_koseli_menu_loaded_on_first_start(self):
+        status, menu = call("GET", "/qr-menu", "ADMIN001")
+        self.assertEqual(status, 200)
+        names = [i["name_en"] for s in menu["sections"] for i in s["items"]]
+        self.assertIn("Nepali Momo Fridge Magnet", names)
+        self.assertIn("Playing Cards + Carlsberg Elephant 500ml", names)
+        self.assertEqual(len(menu["posters"]), 4)
+        page = raw("GET", "/public/menu")[1].decode()
+        self.assertIn("Gurkhas &amp; Guns Whiskey (90ml)", page.replace("Gurkhas & Guns", "Gurkhas &amp; Guns"))
+        self.assertEqual(raw("GET", "/public/menu/media/header.jpg")[0], 200)
+        # Restore after changes brings everything back.
+        _, s = call("POST", "/qr-menu/sections", "ADMIN001", {"name_en": "Temporary"})
+        status, result = call("POST", "/qr-menu/restore-koseli", "ADMIN001")
+        self.assertEqual((status, result["posters"]), (200, 4))
+        self.assertNotIn("Temporary", [x["name_en"] for x in call("GET", "/qr-menu", "ADMIN001")[1]["sections"]])
+        self.assertEqual(call("POST", "/qr-menu/restore-koseli", "INV001")[0], 403)
+
     def test_only_admin_can_manage(self):
         for who in ("INV001", "CREW001"):
             self.assertEqual(call("GET", "/qr-menu", who)[0], 403, who)

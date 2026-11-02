@@ -74,6 +74,25 @@ export default function QrMenuScreen({ online }) {
     }
   }
 
+  async function restoreKoseli() {
+    const ok = await confirm({
+      title: 'Restore the printed Koseli menu?',
+      message: 'Every item, section, poster and text will be replaced by the printed Koseli menu. Changes made here will be lost.',
+      confirmText: 'Restore', tone: 'danger',
+    });
+    if (!ok) return;
+    setBusy(true);
+    try {
+      const r = await api('/qr-menu/restore-koseli', { method: 'POST' });
+      await load();
+      notify({ title: 'Menu restored', message: `${r.items} items in ${r.sections} sections and ${r.posters} posters are back on the QR menu.` });
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function openMenu() {
     if (Platform.OS === 'web') window.open(API_BASE.startsWith('/') ? '/menu' : `${API_BASE}/public/menu`, '_blank', 'noopener');
   }
@@ -87,6 +106,7 @@ export default function QrMenuScreen({ online }) {
           <View style={[styles.wrap, { justifyContent: 'flex-end' }]}>
             {Platform.OS === 'web' && <Button small tone="ghost" title="Open menu" onPress={openMenu} />}
             <Button small tone="secondary" title="Download offline package" loading={busy} onPress={downloadOffline} />
+            <Button small tone="ghost" title="Restore printed menu" disabled={busy} onPress={restoreKoseli} />
           </View>
         )}
       />
@@ -613,7 +633,7 @@ const TEXT_FIELDS = [
   ['title', 'Menu title', 120],
   ['subtitle', 'Subtitle', 160],
   ['note', 'Note at the top', 400],
-  ['footer', 'Footer', 400],
+  ['footer', 'Footer (one line per note)', 1500],
 ];
 
 function SettingsTab({ menu, reload }) {
@@ -697,8 +717,9 @@ h1{font-size:24px;margin:10mm 0 2mm}p{color:#5B6778;margin:0 0 8mm}svg{width:110
         ))}
         <TwoCols>
           <Col><Field label="Currency shown with prices" value={form.currency || ''} onChangeText={set('currency')} maxLength={8} autoCapitalize="characters" /></Col>
-          <Col><PhotoPicker label="Logo" value={form.logo} onChange={set('logo')} /></Col>
+          <Col><PhotoPicker label="Logo (top of the page)" value={form.logo} onChange={set('logo')} /></Col>
         </TwoCols>
+        <PhotoPicker label="Banner picture (under the logo; leave empty to show the title text instead)" wide value={form.banner} onChange={set('banner')} />
         <View style={[styles.row, { justifyContent: 'flex-end', gap: SPACE.sm }]}>
           {dirty && <Button tone="ghost" title="Discard changes" onPress={() => setForm({ ...menu.settings })} />}
           <Button title="Save" onPress={save} loading={saving} disabled={!dirty} />

@@ -66,7 +66,7 @@ DEFAULT_SETTINGS = {
     "note_zh": "点击商品并向乘务员出示即可点单。",
     "footer_en": "Prices are in Nepalese Rupees. Other currencies accepted at the day's rate.",
     "footer_zh": "价格以尼泊尔卢比计。可按当日汇率使用其他货币支付。",
-    "currency": "NPR", "logo": "",
+    "currency": "NPR", "logo": "", "banner": "",
 }
 
 
@@ -74,6 +74,12 @@ def initialize_qr_menu(connection):
     connection.executescript(SCHEMA)
     for key, value in DEFAULT_SETTINGS.items():
         connection.execute("INSERT OR IGNORE INTO qr_menu_settings(key,value) VALUES (?,?)", (key, value))
+    # First start: load the printed Koseli menu so the QR page is never empty.
+    from menu_seed import load_koseli_menu, menu_is_empty
+    if menu_is_empty(connection) and not connection.execute(
+            "SELECT 1 FROM qr_menu_settings WHERE key='seeded'").fetchone():
+        load_koseli_menu(connection, MEDIA_DIR)
+        connection.execute("INSERT OR REPLACE INTO qr_menu_settings(key,value) VALUES ('seeded','1')")
 
 
 def _now():
@@ -179,10 +185,11 @@ class SettingsIn(BaseModel):
     subtitle_zh: str | None = Field(default=None, max_length=160)
     note_en: str | None = Field(default=None, max_length=400)
     note_zh: str | None = Field(default=None, max_length=400)
-    footer_en: str | None = Field(default=None, max_length=400)
-    footer_zh: str | None = Field(default=None, max_length=400)
+    footer_en: str | None = Field(default=None, max_length=1500)
+    footer_zh: str | None = Field(default=None, max_length=1500)
     currency: str = Field(default="NPR", min_length=1, max_length=8)
     logo: str | None = Field(default=None, max_length=120)
+    banner: str | None = Field(default=None, max_length=120)
 
 
 def _check_image(name):
@@ -337,6 +344,7 @@ def _delete(table, row_id, user, action, label_col):
 @router.put("/qr-menu/settings")
 def update_settings(data: SettingsIn, user: dict = Depends(requires("qr_menu"))):
     _check_image(data.logo)
+    _check_image(data.banner)
     connection = get_connection()
     try:
         for key, value in data.model_dump().items():
@@ -348,6 +356,22 @@ def update_settings(data: SettingsIn, user: dict = Depends(requires("qr_menu")))
         connection.close()
     log_action(user, "QR MENU", "UPDATE_SETTINGS", "Changed the QR menu page texts.", "qr_menu_settings", None)
     return settings
+
+
+@router.post("/qr-menu/restore-koseli")
+def restore_koseli(user: dict = Depends(requires("qr_menu"))):
+    """Throw away every change and reload the printed Koseli menu."""
+    from menu_seed import load_koseli_menu
+    connection = get_connection()
+    try:
+        result = load_koseli_menu(connection, MEDIA_DIR, by=user["employee_id"])
+        connection.execute("INSERT OR REPLACE INTO qr_menu_settings(key,value) VALUES ('seeded','1')")
+        connection.commit()
+    finally:
+        connection.close()
+    log_action(user, "QR MENU", "RESTORE_DEFAULT",
+               f"Restored the printed Koseli menu ({result['items']} items, {result['posters']} posters).", None, None)
+    return result
 
 
 @router.get("/qr-menu/qr.svg")
@@ -368,8 +392,9 @@ def offline_package(user: dict = Depends(requires("qr_menu"))):
         connection.close()
     used = {i["photo"] for s in data["sections"] for i in s["items"] if i["photo"]}
     used |= {p["image"] for p in data["posters"]}
-    if data["settings"].get("logo"):
-        used.add(data["settings"]["logo"])
+    for key in ("logo", "banner"):
+        if data["settings"].get(key):
+            used.add(data["settings"][key])
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("koseli-menu/public/index.html",
