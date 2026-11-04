@@ -14,9 +14,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from database import (
-    AIRCRAFT_TYPES, DUTY_GROUP_AMEND_LIMIT, DUTY_GROUP_SIZE, get_connection,
+    AIRCRAFT_TYPES, DUTY_GROUP_AMEND_LIMIT, DUTY_GROUP_MAX, DUTY_GROUP_MIN, DUTY_GROUP_SIZE, get_connection,
 )
 from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
+import sector_stock
 import trip_flow
 from security import (
     current_user, log_action, now_iso, permissions_for, requires, today_iso, validate_date,
@@ -406,6 +407,11 @@ def start_second_flight(flight_id: int, user: dict = Depends(requires("crew"))):
                 status_code=400,
                 detail=f"Save all {first['reports_total']} forms for {first['origin']}-{first['destination']} "
                        f"first ({first['reports_filed']} saved so far).")
+        if not first["stock_count_done"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Confirm the remaining stock after {first['origin']}-{first['destination']} "
+                       "on the Reports page before starting the second flight.")
         now = now_iso()
         connection.execute("UPDATE flights SET started_at=?, started_by=? WHERE id=?",
                            (now, user["employee_id"], second["id"]))
@@ -437,6 +443,8 @@ def complete_trip(flight_id: int, user: dict = Depends(requires("crew"))):
                 missing.append(f"finish {leg['origin']}-{leg['destination']}")
             elif not leg["reports_done"]:
                 missing.append(f"save the forms for {leg['origin']}-{leg['destination']}")
+            elif leg["stock_count_needed"] and not leg["stock_count_done"]:
+                missing.append(f"confirm the remaining stock after {leg['origin']}-{leg['destination']}")
         if state["stock_return"] not in ("PENDING", "APPROVED"):
             missing.append("submit the stock return (Sync page)")
         if missing:
@@ -454,6 +462,94 @@ def complete_trip(flight_id: int, user: dict = Depends(requires("crew"))):
     route = " / ".join(f"{l['origin']}-{l['destination']}" for l in state["legs"])
     log_action(user, "FLIGHT", "COMPLETE_TRIP", f"Finished the whole flight {route}.", "flight", state["root_id"])
     return result
+
+
+# --------------------------------------------------------------------------- #
+# Remaining stock after a sector (7.9)
+# --------------------------------------------------------------------------- #
+class SectorStockLine(BaseModel):
+    product_id: int
+    declared_remaining: int = Field(ge=0)
+
+
+class SectorStockIn(BaseModel):
+    lines: list[SectorStockLine] = []
+    remarks: str | None = Field(default=None, max_length=500)
+
+
+_STOCK_READERS = {"crew", "sales_view", "reports_review", "inventory", "reconcile_approve", "security_view"}
+
+
+@router.get("/flights/{flight_id}/sector-stock")
+def read_sector_stock(flight_id: int, user: dict = Depends(current_user)):
+    """What should be left in the trolley after this sector, and what the crew confirmed."""
+    if not permissions_for(user["role"]) & _STOCK_READERS:
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action.")
+    connection = get_connection()
+    try:
+        legs = trip_flow.trip_legs(connection, flight_id)
+        return sector_stock.sector_count(connection, legs, flight_id)
+    finally:
+        connection.close()
+
+
+@router.post("/flights/{flight_id}/sector-stock")
+def submit_sector_stock(flight_id: int, data: SectorStockIn, user: dict = Depends(requires("reconcile_submit"))):
+    """The crew confirm the remaining stock once the sector is finished and its forms are saved."""
+    connection = get_connection()
+    try:
+        state = trip_flow.progress(connection, flight_id)
+        leg = next((l for l in state["legs"] if l["id"] == flight_id), None)
+        if not leg:
+            raise HTTPException(status_code=404, detail="Flight not found.")
+        row = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        _assert_device_assigned(connection, row, user)
+        if not leg["finished"]:
+            raise HTTPException(status_code=400, detail="Finish this sector before confirming the remaining stock.")
+        if not leg["reports_done"]:
+            raise HTTPException(status_code=400, detail=f"Save all {leg['reports_total']} forms for this sector first "
+                                f"({leg['reports_filed']} saved so far).")
+        if not leg["stock_count_needed"]:
+            raise HTTPException(status_code=400, detail="This is the last sector: submit the final stock return on the Sync page instead.")
+        if leg["reports_locked"] or state["completed"]:
+            raise HTTPException(status_code=400, detail="This sector is locked; the remaining stock can no longer be changed here.")
+        legs = trip_flow.trip_legs(connection, flight_id)
+        result = sector_stock.save_sector_count(
+            connection, legs, flight_id, {l.product_id: l.declared_remaining for l in data.lines},
+            (data.remarks or "").strip() or None, user["employee_id"], now_iso())
+    finally:
+        connection.close()
+    note = (f"{result['total_variance']:+d} unit(s) against the system figure."
+            if result["has_variance"] else "No variance.")
+    log_action(user, "RECONCILIATION", "SECTOR_STOCK_COUNT",
+               f"Remaining stock confirmed after {leg['flight_number']} {leg['origin']}-{leg['destination']}: "
+               f"{result['total_declared']} unit(s) left. {note}"
+               + (f" Remarks: {result['remarks']}" if result["remarks"] else ""),
+               "flight", flight_id,
+               metadata={"total_declared": result["total_declared"], "total_expected": result["total_expected"],
+                         "variance": result["total_variance"], "remarks": result["remarks"]})
+    return result
+
+
+@router.get("/sector-stock-counts")
+def list_sector_stock_counts(page: int | None = PageParam, page_size: int = PageSizeParam,
+                             user: dict = Depends(current_user)):
+    """Every confirmed sector count, newest first (Management, Inventory, Admin)."""
+    if not permissions_for(user["role"]) & (_STOCK_READERS - {"crew"}):
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action.")
+    connection = get_connection()
+    try:
+        rows = connection.execute(
+            """SELECT c.id, c.flight_id, c.submitted_by, c.submitted_at, c.remarks,
+                      f.flight_number, f.flight_date, f.origin, f.destination, f.direction,
+                      (SELECT SUM(expected_remaining) FROM sector_stock_items WHERE count_id=c.id) AS total_expected,
+                      (SELECT SUM(declared_remaining) FROM sector_stock_items WHERE count_id=c.id) AS total_declared,
+                      (SELECT SUM(variance) FROM sector_stock_items WHERE count_id=c.id) AS total_variance
+               FROM sector_stock_counts c JOIN flights f ON f.id = c.flight_id
+               ORDER BY c.submitted_at DESC, c.id DESC""").fetchall()
+        return paginate_list([dict(r) for r in rows], page, page_size)
+    finally:
+        connection.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -511,6 +607,8 @@ def _duty_group_row(connection, flight_id: int):
         (group["id"],),
     ).fetchall()]
     group["size"] = DUTY_GROUP_SIZE
+    group["min_size"] = DUTY_GROUP_MIN
+    group["max_size"] = DUTY_GROUP_MAX
     group["amend_limit"] = DUTY_GROUP_AMEND_LIMIT
     # Whether the iPad still has its one correction. Management are not bound
     # by this; their corrections are governed by remarks and the audit trail.
@@ -521,10 +619,10 @@ def _duty_group_row(connection, flight_id: int):
 def _validate_members(connection, member_ids):
     if len(set(member_ids)) != len(member_ids):
         raise HTTPException(status_code=400, detail="The same crew member cannot be picked twice.")
-    if len(member_ids) != DUTY_GROUP_SIZE:
+    if not DUTY_GROUP_MIN <= len(member_ids) <= DUTY_GROUP_MAX:
         raise HTTPException(
             status_code=400,
-            detail=f"A duty group is exactly {DUTY_GROUP_SIZE} crew members. "
+            detail=f"A duty group is between {DUTY_GROUP_MIN} and {DUTY_GROUP_MAX} crew members. "
                    f"{len(member_ids)} were selected.",
         )
     for member_id in member_ids:

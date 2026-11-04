@@ -12,6 +12,7 @@ import { usePaged, usePagedArray } from '../paging';
 import {
   Banner, Button, Card, Chip, DataTable, Field, KeyValue, Metric, Notice, OptionModal, PageHeader,
   Pagination, Pill, SearchBar, SectionTitle, Select,
+  RemarkLine,
 } from '../ui';
 
 const YEARS = Array.from({ length: 6 }, (_, i) => new Date().getFullYear() - i);
@@ -358,10 +359,11 @@ export default function LogsScreen({ user }) {
                 ) : (sale.seller_name || 'unattributed')}
                 {' · '}{sale.sale_type}
               </Text>
+              {!!sale.remarks && sale.sale_type !== 'NORMAL' && (
+                <RemarkLine label={`${sale.sale_type} remarks`} text={sale.remarks} />
+              )}
               {!!sale.edited_by && (
-                <Text style={{ fontSize: 12, color: COLORS.warning, marginTop: 2 }}>
-                  Edited by {sale.edited_by}: {sale.edit_remarks}
-                </Text>
+                <RemarkLine label={`Edited by ${sale.edited_by}`} text={sale.edit_remarks} />
               )}
               {!sale.bundle_id && canEdit && (
                 <Button
@@ -586,7 +588,8 @@ function CrewHistory({ member, filter, query, onBack }) {
                     {String(l.transaction_time || '').replace('T', ' ').slice(0, 16)} · {l.flight_number}
                     {' '}{l.origin}–{l.destination} · seat {l.seat_number} · {l.sale_type}
                   </Text>
-                  {!!l.edit_remarks && <Text style={[styles.mono, { color: COLORS.warning }]}>Edited by {l.edited_by}: {l.edit_remarks}</Text>}
+                  {!!l.remarks && l.sale_type !== 'NORMAL' && <RemarkLine label={`${l.sale_type} remarks`} text={l.remarks} />}
+                  {!!l.edit_remarks && <RemarkLine label={`Edited by ${l.edited_by}`} text={l.edit_remarks} />}
                 </>
               )}
             />

@@ -109,6 +109,22 @@ export function Pill({ label, tone = 'info' }) {
   );
 }
 
+/** Remarks on a correction or approval, highlighted so Management and the
+ *  administrator cannot miss them (7.9). */
+export function RemarkLine({ label = 'Remarks', text, style }) {
+  if (!text) return null;
+  return (
+    <View style={[{
+      marginTop: 6, paddingVertical: 6, paddingHorizontal: 10, borderRadius: RADIUS.sm,
+      backgroundColor: COLORS.warningSoft, borderLeftWidth: 3, borderLeftColor: COLORS.warning,
+    }, style]}>
+      <Text style={[TYPE.small, { color: COLORS.text }]}>
+        <Text style={{ fontWeight: '600', color: COLORS.warning }}>{label}: </Text>{text}
+      </Text>
+    </View>
+  );
+}
+
 /* ----------------------------- layout ------------------------------ */
 export function Card({ children, style, tight }) {
   return <View style={[styles.card, tight && styles.cardTight, style]}>{children}</View>;

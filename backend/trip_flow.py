@@ -3,9 +3,10 @@
 A trip is worked in fixed steps on the iPad:
 
   round trip   sell sector 1 -> finish it -> save its forms (first segment)
+               -> confirm the remaining stock after sector 1 (7.9)
                -> START SECOND FLIGHT (first-segment forms lock)
                -> sell sector 2 -> finish it -> save its forms (second segment)
-               -> submit the stock return -> FINISH WHOLE FLIGHT (everything locks)
+               -> submit the final stock return -> FINISH WHOLE FLIGHT (everything locks)
   one way      sell -> finish -> save the forms -> stock return -> FINISH WHOLE FLIGHT
 
 Saved forms go to Management straight away. Until they lock, the crew may
@@ -20,6 +21,7 @@ State lives on the flights table:
 from fastapi import HTTPException
 
 from report_forms import REPORT_TYPES
+from sector_stock import sector_count_submitted
 
 FLIGHT_COLUMNS = (
     ("started_at", "TEXT"),
@@ -108,6 +110,10 @@ def progress(connection, flight_id: int) -> dict:
             "finished": leg["status"] in ("FLOWN", "CLOSED"),
             "reports_filed": filed, "reports_total": total, "reports_done": filed >= total,
             "reports_locked": bool(leg["reports_locked_at"]),
+            # Every sector except the last confirms its remaining stock before
+            # the next one starts; the last sector ends with the stock return.
+            "stock_count_needed": index < len(legs) - 1,
+            "stock_count_done": sector_count_submitted(connection, leg["id"]),
         })
     completed = bool(root.get("trip_completed_at"))
     stock = stock_return_status(connection, root["id"])
@@ -115,17 +121,18 @@ def progress(connection, flight_id: int) -> dict:
     first, last = out[0], out[-1]
 
     can_start_second = (round_trip and first["finished"] and first["reports_done"]
-                        and not last["started"] and not completed)
+                        and first["stock_count_done"] and not last["started"] and not completed)
     all_finished = all(l["finished"] for l in out)
     all_reports = all(l["reports_done"] for l in out)
-    can_complete = all_finished and all_reports and stock_done and not completed
+    all_counts = all(l["stock_count_done"] for l in out if l["stock_count_needed"])
+    can_complete = all_finished and all_reports and all_counts and stock_done and not completed
 
     if completed:
         step = "DONE"
     elif not first["finished"]:
         step = "SELL_FIRST"
     elif round_trip and not last["started"]:
-        step = "START_SECOND" if first["reports_done"] else "FORMS_FIRST"
+        step = ("START_SECOND" if first["stock_count_done"] else "STOCK_FIRST") if first["reports_done"] else "FORMS_FIRST"
     elif round_trip and not last["finished"]:
         step = "SELL_SECOND"
     elif not last["reports_done"]:

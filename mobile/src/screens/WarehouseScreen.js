@@ -12,6 +12,7 @@ import { COLORS, compact, npr, styles, todayString } from '../theme';
 import {
   Banner, Button, CalendarModal, Card, Chip, DataTable, Field, FrozenTable, Metric, Notice,
   OptionModal, PageHeader, Pagination, Pill, SearchBar, SectionTitle, Select, StockPill,
+  RemarkLine,
 } from '../ui';
 
 export default function WarehouseScreen({ user }) {
@@ -722,9 +723,7 @@ export default function WarehouseScreen({ user }) {
                 </Text>
               )}
               {!!order.edited_by && (
-                <Text style={{ fontSize: 12, color: COLORS.warning, marginTop: 4 }}>
-                  Edited by {order.edited_by}: {order.edit_remarks}
-                </Text>
+                <RemarkLine label={`Edited by ${order.edited_by}`} text={order.edit_remarks} />
               )}
 
               {canApprove && order.status === 'PENDING' && (
@@ -806,7 +805,7 @@ export default function WarehouseScreen({ user }) {
                 {order.items.map((item) => (
                   <Text key={item.id} style={styles.mono}>  {item.quantity}× {item.product_name}</Text>
                 ))}
-                {!!order.remarks && <Text style={[styles.mono, { marginTop: 3 }]}>“{order.remarks}”</Text>}
+                {!!order.remarks && <RemarkLine label="Request remarks" text={order.remarks} />}
                 {canApprove && (
                   <View style={[styles.row, styles.gap8, { marginTop: 8 }]}>
                     <Button title="Approve" tone="success" small style={styles.flex1} onPress={() => reviewOrder(order, true)} />

@@ -12,6 +12,7 @@ import { COLORS, npr, styles, todayString } from '../theme';
 import {
   Banner, Button, CalendarModal, Card, Field, KeyValue, Metric, Notice, PageHeader, Pagination,
   Pill, SectionTitle, Select,
+  RemarkLine,
 } from '../ui';
 
 export default function SyncScreen({ user, online, onQueueChange, goToReports, goTo }) {
@@ -345,9 +346,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
                     </Text>
                   </View>
                   {!!item.overridden && (
-                    <Text style={{ fontSize: 11, color: COLORS.warning }}>
-                      Corrected by {item.override_by}: {item.override_remarks}
-                    </Text>
+                    <RemarkLine label={`Corrected by ${item.override_by}`} text={item.override_remarks} style={{ marginTop: 2 }} />
                   )}
                   {canApproveReturns && entry.status === 'PENDING' && (
                     <Button
@@ -387,9 +386,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
                 </View>
               ))}
 
-              {!!entry.review_remarks && (
-                <Text style={[styles.mono, { marginTop: 4 }]}>Review: {entry.review_remarks}</Text>
-              )}
+              {!!entry.review_remarks && <RemarkLine label="Review" text={entry.review_remarks} />}
               {entry.has_variance && entry.status === 'PENDING' && (
                 <Banner
                   tone="warning"

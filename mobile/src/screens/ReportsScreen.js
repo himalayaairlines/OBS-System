@@ -5,13 +5,13 @@ import { Text, TextInput } from '../text';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 
-import { api, cached, downloadReport } from '../api';
+import { api, cached, downloadReport, writeCache } from '../api';
 import { usePaged } from '../paging';
 import { confirm, notify } from '../dialog';
-import { COLORS, styles, todayString } from '../theme';
+import { COLORS, npr, styles, todayString } from '../theme';
 import {
   Banner, Button, CalendarModal, Card, Field, Notice, OptionModal, PageHeader, Pagination, Pill,
-  SectionTitle, Select,
+  RemarkLine, SectionTitle, Select,
 } from '../ui';
 
 /*
@@ -229,6 +229,10 @@ function FormField({ field, value, onChange, readOnly, onPickDate }) {
 /* ------------------------------------------------------------------ */
 /* The screen                                                          */
 /* ------------------------------------------------------------------ */
+// A sector the iPad is working: selling now, or finished but not yet locked.
+const crewSector = (f) => !f.trip_completed_at && !f.reports_locked_at
+  && (f.status === 'FLOWN' || (f.status === 'OPEN' && (f.direction !== 'RETURN' || !!f.started_at)));
+
 export default function ReportsScreen({ user, online, initialFlightId, onHandled, goTo }) {
   const canReview = user.permissions?.includes('reports_review');
 
@@ -274,9 +278,9 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     setFlights(list);
     setFlightId((current) => {
       if (current && list.some((f) => f.id === current)) return current;
-      // The crew care about the sector they have just finished and can still fill in.
-      const open = list.filter((f) => f.status === 'FLOWN' && !f.reports_locked_at && !f.trip_completed_at);
-      if (!canReview) return open[0]?.id ?? null;
+      // The crew care about the sector they are selling on or have just finished.
+      const open = list.filter((f) => crewSector(f));
+      if (!canReview) return (open.find((f) => f.status === 'FLOWN') || open[0])?.id ?? null;
       const finished = list.filter((f) => f.status === 'FLOWN');
       return finished[0]?.id ?? list[0]?.id ?? null;
     });
@@ -376,16 +380,23 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
       onHandled?.();
       const left = (fresh?.outstanding || []).length;
       if (!canReview && fresh && left === 0) {
-        const next = fresh.trip_type === 'ROUND_TRIP' && fresh.segment === 1
-          ? 'Go to the Sales page and press \u201cStart second flight\u201d.'
-          : 'Next: submit the stock return on the Sync page, then press \u201cFinish whole flight\u201d on the Sales page.';
-        const go = await confirm({
-          title: 'All forms saved',
-          message: `All forms for ${fresh.sector} are saved and sent to Management.\n\n${next}`,
-          confirmText: fresh.trip_type === 'ROUND_TRIP' && fresh.segment === 1 ? 'Go to Sales' : 'Go to Sync',
-          cancelText: 'Later',
-        });
-        if (go) goTo?.(fresh.trip_type === 'ROUND_TRIP' && fresh.segment === 1 ? 'crew' : 'sync');
+        const roundFirst = fresh.trip_type === 'ROUND_TRIP' && fresh.segment === 1;
+        if (roundFirst) {
+          await notify({
+            title: 'All forms saved',
+            message: `All forms for ${fresh.sector} are saved and sent to Management.\n\n`
+              + 'Next: confirm the remaining stock after this sector, in the card below the forms.',
+          });
+        } else {
+          const go = await confirm({
+            title: 'All forms saved',
+            message: `All forms for ${fresh.sector} are saved and sent to Management.\n\n`
+              + 'Next: submit the final stock return on the Sync page, then press \u201cFinish whole flight\u201d on the Sales page.',
+            confirmText: 'Go to Sync',
+            cancelText: 'Later',
+          });
+          if (go) goTo?.('sync');
+        }
       } else {
         setMessage({
           tone: 'success',
@@ -460,6 +471,37 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     setEditRemarks('');
   }
 
+  /** Moved here from the Sales page (7.9): the sector is finished right above its forms. */
+  async function finishFlight() {
+    if (!sector) return;
+    const roundFirst = sector.trip_type === 'ROUND_TRIP' && sector.segment === 1;
+    const sure = await confirm({
+      title: 'Finish this flight?',
+      message: `${sector.flight_number} ${sector.sector} will be finished.\n\n`
+        + 'No further sale can be recorded on this sector and it cannot be reopened. '
+        + 'The sales already recorded are kept.'
+        + (roundFirst ? '\n\nThe returning crew will enter their own names before selling.' : ''),
+      confirmText: 'Finish this flight',
+      tone: 'danger',
+    });
+    if (!sure) return;
+    setBusy(true);
+    try {
+      const result = await api(`/flights/${sector.flight_id}/finish`, { method: 'PUT' });
+      await writeCache(`sectorReports.${sector.flight_id}`, null);
+      await loadFlights();
+      await loadSector(sector.flight_id);
+      await notify({
+        title: 'Sector finished',
+        message: `${sector.flight_number}: ${result.transactions} transaction(s), ${npr(result.revenue_npr)}.\n\n`
+          + 'Now fill in and save the four forms below. They go to Management as soon as they are saved.',
+      });
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+    setBusy(false);
+  }
+
   async function downloadPdf() {
     try {
       await downloadReport('', FileSystem, Sharing, `/flight-reports/${report.id}/pdf`);
@@ -530,18 +572,18 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
             <Pill label={`Date: ${footerDate}`} tone="muted" />
           </View>
           {!!report?.edit_remarks && (
-            <Text style={[styles.mono, { marginTop: 8 }]}>
-              Last correction by {report.edited_by}: {report.edit_remarks}
-            </Text>
+            <RemarkLine label={`Last correction by ${report.edited_by}`} text={report.edit_remarks} style={{ marginTop: 8 }} />
           )}
           {!!report?.revisions?.length && (
             <View style={{ marginTop: 8 }}>
               {report.revisions.map((rev, i) => (
-                <Text key={i} style={styles.mono}>
-                  Rev {String(rev.rev_no).padStart(2, '0')} · {rev.action.toLowerCase()} by{' '}
-                  {rev.changed_by} · {String(rev.changed_at || '').replace('T', ' ').slice(0, 16)}
-                  {rev.remarks ? ` · ${rev.remarks}` : ''}
-                </Text>
+                <View key={i}>
+                  <Text style={styles.mono}>
+                    Rev {String(rev.rev_no).padStart(2, '0')} · {rev.action.toLowerCase()} by{' '}
+                    {rev.changed_by} · {String(rev.changed_at || '').replace('T', ' ').slice(0, 16)}
+                  </Text>
+                  {!!rev.remarks && <RemarkLine text={rev.remarks} style={{ marginTop: 2, marginBottom: 4 }} />}
+                </View>
               ))}
             </View>
           )}
@@ -638,7 +680,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
   // Management see every finished sector; the crew only the ones still open to them.
   const sellable = canReview
     ? flights.filter((f) => f.status !== 'OPEN')
-    : flights.filter((f) => f.status === 'FLOWN' && !f.reports_locked_at && !f.trip_completed_at);
+    : flights.filter(crewSector);
   const segmentTitle = !sector ? 'Forms'
     : sector.trip_type === 'ROUND_TRIP'
       ? `Forms (${sector.segment === 2 ? 'second' : 'first'} segment) · ${sector.sector}`
@@ -692,6 +734,22 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
 
       )}
 
+      {!canReview && !!sector && sector.flight_status === 'OPEN' && (
+        <Card>
+          <SectionTitle
+            title="Finish this flight"
+            description="Press this when the sector is over. Selling stops on this sector and the forms below open for filling in."
+          />
+          <Button
+            title={busy ? 'Finishing\u2026' : `Finish this flight \u00b7 ${sector.flight_number} ${sector.sector}`}
+            tone="warning"
+            onPress={finishFlight}
+            disabled={busy || !online}
+          />
+          {!online && <Text style={[styles.mono, { marginTop: 6 }]}>Needs a connection.</Text>}
+        </Card>
+      )}
+
       {!canReview && !!sector && !!sectorReports.length && (
         <Card>
           <SectionTitle
@@ -726,6 +784,22 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
           })}
         </Card>
       )}
+
+      {!canReview && !!sector && sector.flight_status !== 'OPEN' && !outstanding.length && (
+        sector.trip_type === 'ROUND_TRIP' && sector.segment === 1 ? (
+          <SectorStockCard flightId={sector.flight_id} online={online} locked={locked} goTo={goTo} />
+        ) : (
+          <Card>
+            <SectionTitle
+              title="Final stock return"
+              description="All forms are saved. Submit the final stock return on the Sync page, then press Finish whole flight on the Sales page."
+            />
+            <Button title="Open the final stock return" tone="secondary" onPress={() => goTo?.('sync')} />
+          </Card>
+        )
+      )}
+
+      {canReview && <SectorStockList />}
 
       {canReview && (
         <Card>
@@ -779,6 +853,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
                 {' · filed by '}{r.submitted_by || r.created_by}
                 {r.edited_by ? ` · corrected by ${r.edited_by}` : ''}
               </Text>
+              {!!r.edit_remarks && <RemarkLine label={`Corrected by ${r.edited_by}`} text={r.edit_remarks} />}
             </Pressable>
           ))}
           {!!filedPager.error && <Banner tone="danger" message={filedPager.error} />}
@@ -813,5 +888,198 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
         onClose={() => setFilterCalendar(false)}
       />
     </ScrollView>
+  );
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Remaining stock after a sector (7.9)                                */
+/* ------------------------------------------------------------------ */
+function SectorStockCard({ flightId, online, locked, goTo }) {
+  const [position, setPosition] = useState(null);
+  const [declared, setDeclared] = useState({});
+  const [remarks, setRemarks] = useState('');
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      const p = await api(`/flights/${flightId}/sector-stock`);
+      setPosition(p);
+      setDeclared(Object.fromEntries(p.items.map((i) => [i.product_id, String(i.declared_remaining)])));
+      setRemarks(p.remarks || '');
+      setEditing(!p.submitted);
+      setError(null);
+    } catch (e) {
+      setError(e.message);
+    }
+  }, [flightId]);
+  useEffect(() => { if (online) load(); }, [load, online]);
+
+  async function submit() {
+    const lines = position.items.map((i) => ({ product_id: i.product_id, declared_remaining: Number(declared[i.product_id] || 0) }));
+    if (lines.some((l) => Number.isNaN(l.declared_remaining) || l.declared_remaining < 0)) {
+      return notify({ title: 'Check the quantities', message: 'Every remaining quantity must be a whole number, 0 or more.' });
+    }
+    const changed = position.items.filter((i) => Number(declared[i.product_id]) !== i.expected_remaining);
+    if (changed.length && !remarks.trim()) {
+      return notify({ title: 'Remarks required', message: `${changed.length} line(s) differ from the system figure. Say why.` });
+    }
+    const sure = await confirm({
+      title: 'Confirm the remaining stock?',
+      message: `${position.flight_number} ${position.origin}\u2192${position.destination}: `
+        + `${lines.reduce((a, l) => a + l.declared_remaining, 0)} unit(s) left in the trolley after this sector. `
+        + 'Management and Inventory can see this at once.',
+      confirmText: 'Confirm',
+    });
+    if (!sure) return;
+    setBusy(true);
+    try {
+      await api(`/flights/${flightId}/sector-stock`, { method: 'POST', body: { lines, remarks: remarks.trim() || null } });
+      await load();
+      const go = await confirm({
+        title: 'Remaining stock confirmed',
+        message: 'Next: go to the Sales page and press \u201cStart second flight\u201d.',
+        confirmText: 'Go to Sales', cancelText: 'Later',
+      });
+      if (go) goTo?.('crew');
+    } catch (e) {
+      setError(e.message);
+    }
+    setBusy(false);
+  }
+
+  if (!online) {
+    return <Card><SectionTitle title="Remaining stock after this sector" description="Needs a connection." /></Card>;
+  }
+  if (error) return <Card><Banner tone="danger" message={error} /></Card>;
+  if (!position) return null;
+  const readOnly = locked || !editing;
+
+  return (
+    <Card>
+      <SectionTitle
+        title="Remaining stock after this sector"
+        description={position.submitted
+          ? `Confirmed by ${position.submitted_by} at ${String(position.submitted_at || '').replace('T', ' ').slice(0, 16)}.`
+          : 'All forms are saved. Check what is left in the trolley: the figures are calculated from the load and the sales. Change a line only if the trolley says otherwise.'}
+        right={<Pill label={position.submitted ? 'Confirmed' : 'To confirm'} tone={position.submitted ? 'success' : 'warning'} />}
+      />
+      <View style={[styles.row, { paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: COLORS.border }]}>
+        <Text style={[styles.mono, { flex: 2 }]}>Product</Text>
+        <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>Loaded</Text>
+        <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>Sold</Text>
+        <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>Should be left</Text>
+        <Text style={[styles.mono, { flex: 1.2, textAlign: 'right' }]}>Left</Text>
+      </View>
+      {position.items.map((i) => {
+        const diff = Number(declared[i.product_id] || 0) - i.expected_remaining;
+        return (
+          <View key={i.product_id} style={[styles.row, { paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: COLORS.surfaceAlt }]}>
+            <View style={{ flex: 2 }}>
+              <Text style={{ fontSize: 13, color: COLORS.text }} numberOfLines={2}>{i.product_name}</Text>
+              {diff !== 0 && <Text style={[styles.mono, { color: COLORS.warning }]}>{diff > 0 ? '+' : ''}{diff} vs system</Text>}
+            </View>
+            <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{i.loaded_quantity}</Text>
+            <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{i.sold_before + i.sold_quantity}</Text>
+            <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{i.expected_remaining}</Text>
+            <View style={{ flex: 1.2, alignItems: 'flex-end' }}>
+              {readOnly ? (
+                <Text style={[styles.value, { fontWeight: '600' }]}>{i.declared_remaining}</Text>
+              ) : (
+                <TextInput
+                  value={declared[i.product_id] ?? ''}
+                  onChangeText={(v) => setDeclared((d) => ({ ...d, [i.product_id]: v.replace(/[^0-9]/g, '') }))}
+                  keyboardType="number-pad"
+                  style={[styles.input, { width: 64, textAlign: 'center', paddingVertical: 6 }]}
+                />
+              )}
+            </View>
+          </View>
+        );
+      })}
+      <View style={[styles.rowBetween, { paddingVertical: 8 }]}>
+        <Text style={styles.label}>Total left</Text>
+        <Text style={[styles.value, { fontWeight: '700' }]}>
+          {position.items.reduce((a, i) => a + Number(declared[i.product_id] || 0), 0)} unit(s)
+        </Text>
+      </View>
+      {!readOnly ? (
+        <>
+          <Field label="Remarks (required if a figure differs from the system)" value={remarks} onChangeText={setRemarks} multiline placeholder="e.g. one can damaged" />
+          <Button title={busy ? 'Saving\u2026' : 'Confirm remaining stock'} onPress={submit} disabled={busy} />
+          {position.submitted && (
+            <Button title="Cancel" tone="ghost" small style={{ marginTop: 8 }} onPress={() => { setEditing(false); load(); }} />
+          )}
+        </>
+      ) : (
+        <>
+          {!!position.remarks && <Text style={[styles.mono, { marginTop: 4 }]}>Remarks: {position.remarks}</Text>}
+          {!locked && (
+            <Button title="Correct the remaining stock" tone="ghost" small style={{ marginTop: 8 }} onPress={() => setEditing(true)} />
+          )}
+          <Button title="Go to Sales to start the second flight" tone="secondary" style={{ marginTop: 8 }} onPress={() => goTo?.('crew')} />
+        </>
+      )}
+    </Card>
+  );
+}
+
+/** Management, Inventory and the administrator: every confirmed sector count. */
+function SectorStockList() {
+  const pager = usePaged('/sector-stock-counts');
+  const [open, setOpen] = useState(null);      // flight id expanded
+  const [detail, setDetail] = useState(null);
+
+  async function toggle(flightId) {
+    if (open === flightId) { setOpen(null); setDetail(null); return; }
+    setOpen(flightId);
+    setDetail(null);
+    try { setDetail(await api(`/flights/${flightId}/sector-stock`)); } catch (e) { setDetail({ error: e.message }); }
+  }
+
+  return (
+    <Card>
+      <SectionTitle
+        title="Remaining stock after each sector"
+        description="Confirmed by the crew after the first sector of a round trip, before the second flight starts. The final stock return is on the Sync page."
+      />
+      {pager.items.map((c) => (
+        <View key={c.id}>
+          <Pressable onPress={() => toggle(c.flight_id)} style={[styles.listRow, { paddingVertical: 12 }]}>
+            <View style={styles.rowBetween}>
+              <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text, flex: 1 }}>
+                {c.flight_number} \u00b7 {c.origin}\u2192{c.destination} \u00b7 {c.flight_date}
+              </Text>
+              <Pill label={c.total_variance ? `${c.total_variance > 0 ? '+' : ''}${c.total_variance} vs system` : 'Matches system'}
+                    tone={c.total_variance ? 'warning' : 'success'} />
+            </View>
+            <Text style={styles.mono}>
+              {c.total_declared} unit(s) left \u00b7 confirmed by {c.submitted_by} \u00b7 {String(c.submitted_at || '').replace('T', ' ').slice(0, 16)}
+            </Text>
+            {!!c.remarks && <RemarkLine label="Crew remarks" text={c.remarks} />}
+          </Pressable>
+          {open === c.flight_id && (
+            <View style={{ paddingHorizontal: 8, paddingBottom: 10 }}>
+              {!detail && <Text style={styles.mono}>Loading\u2026</Text>}
+              {!!detail?.error && <Banner tone="danger" message={detail.error} />}
+              {!!detail?.items && detail.items.map((i) => (
+                <View key={i.product_id} style={[styles.rowBetween, { paddingVertical: 4 }]}>
+                  <Text style={{ fontSize: 13, color: COLORS.text, flex: 2 }}>{i.product_name}</Text>
+                  <Text style={[styles.mono, { flex: 2, textAlign: 'right' }]}>
+                    loaded {i.loaded_quantity} \u00b7 sold {i.sold_before + i.sold_quantity} \u00b7 should be {i.expected_remaining} \u00b7 left {i.declared_remaining}
+                    {i.variance ? ` (${i.variance > 0 ? '+' : ''}${i.variance})` : ''}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+      ))}
+      {!!pager.error && <Banner tone="danger" message={pager.error} />}
+      {!pager.items.length && !pager.loading && <Text style={styles.empty}>No sector count yet.</Text>}
+      <Pagination pager={pager} label="counts" />
+    </Card>
   );
 }

@@ -90,10 +90,10 @@ class TripFlowTests(unittest.TestCase):
         self.assertEqual(status, 200, out)
         return legs, product["product_id"]
 
-    def open_leg(self, leg):
+    def open_leg(self, leg, size=4):
         self.assertEqual(call("PUT", f"/flights/{leg['id']}/pax-load", "CREW001", {"passengers": 150})[0], 200)
         roster = call("GET", "/crew-roster", "CREW001")[1]
-        ids = [m["id"] for m in roster[:4]]
+        ids = [m["id"] for m in roster[:size]]
         status, group = call("POST", f"/flights/{leg['id']}/duty-group", "CREW001", {"member_ids": ids})
         self.assertEqual(status, 200, group)
         return ids[0]
@@ -143,9 +143,35 @@ class TripFlowTests(unittest.TestCase):
         self.assertEqual(status, 200, changed)
         self.assertEqual(changed["rev_no"], 1)
 
+        # 7.9: the remaining stock after the first sector is confirmed before the second starts.
+        status, err = call("POST", f"/flights/{out['id']}/start-second", "CREW001")
+        self.assertEqual(status, 400)
+        self.assertIn("remaining stock", err["detail"])
+        self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", "CREW001")[1]["step"], "STOCK_FIRST")
+        status, position = call("GET", f"/flights/{out['id']}/sector-stock", "CREW001")
+        self.assertEqual(status, 200, position)
+        line = [i for i in position["items"] if i["product_id"] == product][0]
+        self.assertEqual((line["loaded_quantity"], line["sold_quantity"], line["expected_remaining"]), (5, 1, 4))
+        self.assertFalse(position["submitted"])
+        status, saved = call("POST", f"/flights/{out['id']}/sector-stock", "CREW001",
+                             {"lines": [{"product_id": product, "declared_remaining": 3}], "remarks": "One damaged"})
+        self.assertEqual(status, 200, saved)
+        self.assertEqual((saved["submitted"], saved["total_variance"], saved["remarks"]), (True, -1, "One damaged"))
+        # Management and the administrator read it; the inventory officer too.
+        for who in ("MGT001", "ADMIN001", "INV001"):
+            self.assertEqual(call("GET", f"/flights/{out['id']}/sector-stock", who)[0], 200, who)
+        self.assertEqual(call("GET", "/sector-stock-counts", "FIN001")[0], 403)
+        listed = call("GET", "/sector-stock-counts?page=1", "MGT001")[1]
+        self.assertTrue(any(c["flight_id"] == out["id"] and c["total_variance"] == -1 for c in listed["items"]))
+
         status, state = call("POST", f"/flights/{out['id']}/start-second", "CREW001")
         self.assertEqual(status, 200, state)
         self.assertEqual(state["step"], "SELL_SECOND")
+        # Locked with the forms once the second flight has started.
+        self.assertEqual(call("POST", f"/flights/{out['id']}/sector-stock", "CREW001", {"lines": []})[0], 400)
+        # The second sector shows what was sold before it.
+        back_position = call("GET", f"/flights/{back['id']}/sector-stock", "CREW001")[1]
+        self.assertEqual([i for i in back_position["items"] if i["product_id"] == product][0]["sold_before"], 1)
         # First-segment forms are now locked to the iPad, not to Management.
         self.assertEqual(call("PUT", f"/flight-reports/{report['id']}", "CREW001",
                               {"payload": {}, "remarks": "again"})[0], 400)
@@ -174,14 +200,27 @@ class TripFlowTests(unittest.TestCase):
                               {"flight_id": back["id"], "report_type": REPORT_TYPES[0], "payload": {}})[0], 400)
         self.assertEqual(call("POST", f"/flights/{out['id']}/complete-trip", "CREW001")[0], 400)
 
+    def test_duty_group_size_2_to_10(self):
+        (leg,), _ = self.make_trip("ONE_WAY")
+        roster = call("GET", "/crew-roster", "CREW001")[1]
+        ids = [m["id"] for m in roster]
+        self.assertEqual(call("PUT", f"/flights/{leg['id']}/pax-load", "CREW001", {"passengers": 150})[0], 200)
+        self.assertEqual(call("POST", f"/flights/{leg['id']}/duty-group", "CREW001", {"member_ids": ids[:1]})[0], 400)
+        self.assertEqual(call("POST", f"/flights/{leg['id']}/duty-group", "CREW001", {"member_ids": ids[:11]})[0], 400)
+        status, group = call("POST", f"/flights/{leg['id']}/duty-group", "CREW001", {"member_ids": ids[:10]})
+        self.assertEqual(status, 200, group)
+        self.assertEqual((len(group["members"]), group["min_size"], group["max_size"]), (10, 2, 10))
+
     def test_one_way(self):
         (leg,), product = self.make_trip("ONE_WAY")
-        seller = self.open_leg(leg)
+        seller = self.open_leg(leg, size=2)
         self.sell(leg, product, seller)
         self.assertEqual(call("POST", f"/flights/{leg['id']}/start-second", "CREW001")[0], 400)
         self.assertEqual(call("PUT", f"/flights/{leg['id']}/finish", "CREW001")[0], 200)
         self.file_all(leg)
         self.assertEqual(call("GET", f"/flights/{leg['id']}/trip-progress", "CREW001")[1]["step"], "STOCK_RETURN")
+        # A one-way flight has no sector count: the final stock return covers it.
+        self.assertEqual(call("POST", f"/flights/{leg['id']}/sector-stock", "CREW001", {"lines": []})[0], 400)
         pending = [p for p in call("GET", "/reconciliations/pending", "CREW001")[1] if p["flight_id"] == leg["id"]][0]
         lines = [{"product_id": i["product_id"], "declared_remaining": i["expected_remaining"]} for i in pending["items"]]
         self.assertEqual(call("POST", "/reconciliations", "CREW001", {"flight_id": leg["id"], "lines": lines})[0], 200)

@@ -12,6 +12,7 @@ import { COLORS, npr, styles, todayString } from '../theme';
 import {
   Banner, Button, CalendarModal, Card, Chip, Field, FrozenTable, KeyValue, Notice, OptionModal,
   PageHeader, Pagination, Pill, SearchBar, SectionTitle, Select,
+  RemarkLine,
 } from '../ui';
 
 const TABS = [
@@ -456,9 +457,7 @@ function GroupsTab({ notify, user }) {
               ))}
             </View>
             {!!group.amend_remarks && (
-              <Text style={[styles.mono, { marginTop: 4 }]}>
-                Changed by {group.amended_by}: {group.amend_remarks}
-              </Text>
+              <RemarkLine label={`Changed by ${group.amended_by}`} text={group.amend_remarks} />
             )}
           </View>
         ))}

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Pressable, ScrollView, View } from 'react-native';
 import { Text } from '../text';
+import Icon from '../icons';
 
 import { api, cached, enqueueSale, orderRef, saveDutyGroup, writeCache } from '../api';
 import { confirm, notify } from '../dialog';
@@ -10,8 +11,10 @@ import {
   SeatMapModal, SectionTitle, Select,
 } from '../ui';
 
-// Mirrors DUTY_GROUP_SIZE in the backend. The server refuses anything else.
-const DUTY_GROUP_SIZE = 4;
+// Mirrors DUTY_GROUP_MIN / DUTY_GROUP_MAX in the backend. The server refuses anything else.
+const DUTY_GROUP_MIN = 2;
+const DUTY_GROUP_MAX = 10;
+const groupSizeOk = (n) => n >= DUTY_GROUP_MIN && n <= DUTY_GROUP_MAX;
 
 // A return leg opens for selling only after "Start second flight" (7.5).
 const isStarted = (f) => f.direction !== 'RETURN' || !!f.started_at;
@@ -52,6 +55,10 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
   const [amending, setAmending] = useState(false);
   const [sellerId, setSellerId] = useState(null);
   const [sellerPicker, setSellerPicker] = useState(false);
+  // The aircraft / PAX / crew card folds away once everything is saved (7.9);
+  // the "Flight info" button at the top opens it again for a correction.
+  const [infoOpen, setInfoOpen] = useState(true);
+  const [infoTouched, setInfoTouched] = useState(false);
 
   const [flightPicker, setFlightPicker] = useState(false);
   const [seatPicker, setSeatPicker] = useState(false);
@@ -144,11 +151,19 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
 
   const seller = dutyMembers.find((m) => m.id === sellerId) || null;
 
+  // Everything the sector needs before selling. Until it is all there the card
+  // stays open; once saved it hides by itself.
+  const infoComplete = !!flight && !!flight.aircraft_type && !!flight.passengers && !!dutyGroup;
+  useEffect(() => { setInfoTouched(false); }, [flightId]);
+  useEffect(() => {
+    if (!infoTouched) setInfoOpen(!infoComplete);
+  }, [infoComplete, infoTouched, flightId]);
+
   async function submitDutyGroup() {
-    if (dutyDraft.length !== DUTY_GROUP_SIZE) {
+    if (!groupSizeOk(dutyDraft.length)) {
       return notify({
-        title: `Pick ${DUTY_GROUP_SIZE} crew`,
-        message: `A duty group is exactly ${DUTY_GROUP_SIZE} cabin crew. `
+        title: `Pick ${DUTY_GROUP_MIN} to ${DUTY_GROUP_MAX} crew`,
+        message: `A duty group is between ${DUTY_GROUP_MIN} and ${DUTY_GROUP_MAX} cabin crew. `
           + `${dutyDraft.length} selected.`,
       });
     }
@@ -158,6 +173,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
       setDutyGroup(group);
       setDutyPicker(false);
       setSellerId(null);
+      setInfoTouched(false);
       notify({
         title: queued ? 'Saved on this device' : 'Duty group recorded',
         message: queued
@@ -174,10 +190,10 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
 
   /** The crew's single correction of the list. Needs a reason and is audited. */
   async function amendDutyGroup() {
-    if (dutyDraft.length !== DUTY_GROUP_SIZE) {
+    if (!groupSizeOk(dutyDraft.length)) {
       return notify({
-        title: `Pick ${DUTY_GROUP_SIZE} crew`,
-        message: `A duty group is exactly ${DUTY_GROUP_SIZE} cabin crew. `
+        title: `Pick ${DUTY_GROUP_MIN} to ${DUTY_GROUP_MAX} crew`,
+        message: `A duty group is between ${DUTY_GROUP_MIN} and ${DUTY_GROUP_MAX} cabin crew. `
           + `${dutyDraft.length} selected.`,
       });
     }
@@ -371,52 +387,30 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
     }
   }
 
-  async function finishFlight() {
+  /** Aircraft and PAX in one go. When the crew list is in too, the card folds away. */
+  async function saveFlightInfo() {
     if (!flight) return;
-    // The next leg only counts as "next" if it is still open for selling.
-    const linked = flights.find((f) => f.id === flight.linked_flight_id && f.status === 'OPEN');
-
-    const sure = await confirm({
-      title: 'Are you sure?',
-      message: `${flight.flight_number} ${flight.origin}\u2192${flight.destination} will be finished.\n\n`
-        + 'No further sale can be recorded on this sector and you will not be able to select '
-        + 'it again. The sales already recorded are kept, and each crew member keeps the '
-        + 'commission on what they personally sold.'
-        + (linked ? '\n\nThe returning crew will enter their own names before selling.' : ''),
-      confirmText: 'Confirm',
-      tone: 'danger',
-    });
-    if (!sure) return;
-
-    try {
-      const result = await api(`/flights/${flight.id}/finish`, { method: 'PUT' });
-      setFlights((list) => list.map((f) => (f.id === result.id ? { ...f, ...result } : f)));
-      setCart({});
-
-      const finishedId = flight.id;
-      const finishedNumber = flight.flight_number;
-
-      setMessage({
-        tone: 'success',
-        text: `${finishedNumber} finished: ${result.transactions} transaction(s), `
-          + `${npr(result.revenue_npr)}.`,
-      });
-      await notify({
-        title: 'Now fill in this sector\u2019s forms',
-        message: `${finishedNumber} is finished and its sales are recorded.\n\n`
-          + 'Fill in and save the four forms for this sector on the Reports page. They go to '
-          + 'Management as soon as they are saved.\n\n'
-          + (linked
-            ? `Then come back here and press \u201cStart second flight\u201d to open `
-              + `${linked.flight_number} ${route(linked)}.`
-            : 'Then submit the stock return on the Sync page, and press '
-              + '\u201cFinish whole flight\u201d here.'),
-      });
-      goToReports?.(finishedId);
-    } catch (error) {
-      setMessage({ tone: 'danger', text: error.message });
+    const aircraftChanged = aircraftType && (aircraftType !== flight.aircraft_type || (aircraft || '') !== (flight.aircraft || ''));
+    const paxChanged = pax !== '' && Number(pax) !== Number(flight.passengers || 0);
+    if ((aircraftChanged && flight.aircraft_locked) || (paxChanged && flight.pax_locked)) {
+      if (!lockRemarks.trim()) {
+        return notify({ title: 'Remarks required', message: 'Say why the aircraft or PAX load is being corrected.' });
+      }
+    }
+    setBusy(true);
+    if (aircraftChanged) await saveAircraft();
+    if (paxChanged) await savePax();
+    setBusy(false);
+    setInfoTouched(false);
+    if (dutyGroup) {
+      setInfoOpen(false);
+      notify({ title: 'Flight info saved', message: 'Aircraft, PAX load and crew are recorded. Tap \u201cFlight info\u201d at the top to see or correct them.' });
+    } else if (!dutyGroup && roster.length) {
+      setDutyDraft([]); setDutyMode('create'); setDutyPicker(true);
     }
   }
+
+  // "Finish this flight" lives on the Reports page (7.9), above the sector's forms.
 
   async function recordSale() {
     if (!flight) return notify({ title: 'Flight required', message: 'Select the flight you are working.' });
@@ -609,7 +603,30 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
             {selling && (
             <>
             <View style={styles.divider} />
-
+            <Pressable
+              onPress={() => { setInfoTouched(true); setInfoOpen((v) => !v); }}
+              accessibilityRole="button"
+              style={[styles.rowBetween, {
+                paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8,
+                backgroundColor: infoComplete ? COLORS.successSoft : COLORS.warningSoft,
+                borderWidth: 1, borderColor: infoComplete ? COLORS.success : COLORS.warning,
+              }]}
+            >
+              <View style={[styles.row, { gap: 8, flex: 1, flexWrap: 'wrap' }]}>
+                <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }}>Flight info</Text>
+                {!!flight.aircraft_type && <Pill label={flight.aircraft_type + (flight.aircraft ? ` ${flight.aircraft}` : '')} tone="muted" />}
+                {!!flight.passengers && <Pill label={`PAX ${flight.passengers}`} tone="muted" />}
+                {!!dutyGroup && <Pill label={`${dutyMembers.length} crew`} tone="muted" />}
+                {!infoComplete && <Pill label="Fill in before selling" tone="warning" />}
+              </View>
+              <Icon name={infoOpen ? 'chevronDown' : 'chevronRight'} size={18} color={COLORS.muted} />
+            </Pressable>
+            {!infoOpen && (
+              <Text style={[styles.mono, { marginTop: 6 }]}>Saved. Tap Flight info to see or correct the aircraft, PAX load and crew.</Text>
+            )}
+            {infoOpen && (
+            <>
+            <View style={{ height: 12 }} />
             <Select
               label={`Aircraft type${flight.aircraft_locked ? ' (locked)' : ''}`}
               valueLabel={aircraftType
@@ -655,25 +672,17 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
                 placeholder="Why is this being changed?"
               />
             )}
-            <View style={[styles.row, styles.gap8]}>
-              <Button
-                title="Save aircraft"
-                tone="secondary"
-                small
-                style={styles.flex1}
-                disabled={!aircraftType}
-                onPress={saveAircraft}
-              />
-              <Button
-                title="Save PAX"
-                tone="secondary"
-                small
-                style={styles.flex1}
-                disabled={pax === ''}
-                onPress={savePax}
-              />
-            </View>
-
+            <Button
+              title={busy ? 'Saving\u2026' : dutyGroup ? 'Save flight info' : 'Save and enter the crew'}
+              tone="primary"
+              disabled={busy || !aircraftType || pax === ''}
+              onPress={saveFlightInfo}
+            />
+            <Text style={[styles.mono, { marginTop: 6 }]}>
+              Aircraft, PAX load and the crew list are saved together. Once all three are in, this section hides itself.
+            </Text>
+            </>
+            )}
             </>
             )}
 
@@ -681,16 +690,13 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
               <>
                 <View style={styles.divider} />
                 <Button
-                  title="Finish this flight"
-                  tone="warning"
-                  onPress={finishFlight}
-                  disabled={!online}
+                  title="Sector over? Go to Reports to finish it"
+                  tone="ghost"
+                  small
+                  onPress={() => goToReports?.(flight.id)}
                 />
                 <Text style={[styles.mono, { marginTop: 6 }]}>
-                  {flight.trip_type === 'ROUND_TRIP'
-                    ? 'Press this when the sector is over. Selling stops here and the return sector opens, where the crew working it enter their own names.'
-                    : 'Press this when the sector is over. Selling stops and the leftover stock can be counted.'}
-                  {!online ? ' Needs a connection.' : ''}
+                  \u201cFinish this flight\u201d is on the Reports page, just above the forms for this sector.
                 </Text>
               </>
             )}
@@ -715,11 +721,11 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
         )}
       </Card>
 
-      {selling && (
+      {selling && infoOpen && (
         <Card>
           <SectionTitle
             title="Crew on this sector"
-            description={`The ${DUTY_GROUP_SIZE} cabin crew selling on this sector. Each sale records `
+            description={`The cabin crew selling on this sector (${DUTY_GROUP_MIN} to ${DUTY_GROUP_MAX}). Each sale records `
               + 'who made it, and that is what their commission is paid on.'}
             right={dutyGroup
               ? <Pill label={dutyGroup.pending ? 'Queued' : 'Recorded'} tone={dutyGroup.pending ? 'warning' : 'success'} />
@@ -736,7 +742,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
 
           {!dutyGroup && (
             <Button
-              title={`Enter the ${DUTY_GROUP_SIZE} crew working this sector`}
+              title="Enter the crew working this sector"
               tone="primary"
               onPress={() => { setDutyDraft([]); setDutyMode('create'); setDutyPicker(true); }}
               disabled={busy || !roster.length}
@@ -789,7 +795,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
                 })}
               </View>
               <Button
-                title={`CHANGE WHO IS SELECTED (${dutyDraft.length} of ${DUTY_GROUP_SIZE})`}
+                title={`CHANGE WHO IS SELECTED (${dutyDraft.length} selected, ${DUTY_GROUP_MIN}\u2013${DUTY_GROUP_MAX})`}
                 tone="secondary"
                 small
                 onPress={() => setDutyPicker(true)}
@@ -931,8 +937,8 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
       <OptionModal
         visible={dutyPicker}
         title={dutyMode === 'amend'
-          ? `Correct the crew list — pick ${DUTY_GROUP_SIZE}`
-          : `Who is working this sector? Pick ${DUTY_GROUP_SIZE}`}
+          ? `Correct the crew list \u2014 pick ${DUTY_GROUP_MIN} to ${DUTY_GROUP_MAX}`
+          : `Who is working this sector? Pick ${DUTY_GROUP_MIN} to ${DUTY_GROUP_MAX}`}
         multi
         searchable
         searchPlaceholder="Search the crew roster…"
@@ -944,9 +950,9 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
         selectedValue={dutyDraft}
         onSelect={(value) => setDutyDraft((current) => {
           if (current.includes(value)) return current.filter((id) => id !== value);
-          if (current.length >= DUTY_GROUP_SIZE) {
+          if (current.length >= DUTY_GROUP_MAX) {
             notify({
-              title: `${DUTY_GROUP_SIZE} crew already selected`,
+              title: `${DUTY_GROUP_MAX} crew already selected`,
               message: 'Remove one before adding another.',
             });
             return current;
@@ -1100,8 +1106,11 @@ function TripSteps({ trip }) {
       label: `Forms (${label}) ${leg.reports_filed}/${leg.reports_total} saved`,
       done: leg.reports_done,
     });
+    if (leg.stock_count_needed) {
+      steps.push({ label: `Remaining stock after ${route(leg)} confirmed`, done: !!leg.stock_count_done });
+    }
   });
-  steps.push({ label: 'Stock return submitted', done: stock });
+  steps.push({ label: 'Final stock return submitted', done: stock });
   steps.push({ label: 'Finish whole flight', done: trip.completed });
   const current = steps.findIndex((s) => !s.done);
   return (
@@ -1130,7 +1139,7 @@ function TripAction({ trip, online, onStartSecond, onComplete, goToReports, goTo
   if (trip.step === 'DONE') {
     return <Banner tone="success" message="The whole flight is finished. Nothing on this trip can be edited any more." />;
   }
-  if (trip.step === 'FORMS_FIRST' || trip.step === 'START_SECOND') {
+  if (trip.step === 'FORMS_FIRST' || trip.step === 'STOCK_FIRST' || trip.step === 'START_SECOND') {
     return (
       <>
         <Button
@@ -1141,13 +1150,15 @@ function TripAction({ trip, online, onStartSecond, onComplete, goToReports, goTo
         />
         <Text style={[styles.mono, { marginTop: 6 }]}>
           {trip.can_start_second
-            ? `The forms for ${route(first)} lock and stay with Management when you start.`
-            : `Save all ${first.reports_total} forms for ${route(first)} first `
-              + `(${first.reports_filed} saved).`}
+            ? `The forms and the remaining stock for ${route(first)} lock and stay with Management when you start.`
+            : trip.step === 'STOCK_FIRST'
+              ? `Confirm the remaining stock after ${route(first)} on the Reports page first.`
+              : `Save all ${first.reports_total} forms for ${route(first)} first `
+                + `(${first.reports_filed} saved).`}
           {need}
         </Text>
         {!trip.can_start_second && (
-          <Button title="Open the forms" tone="ghost" small style={{ marginTop: 8 }}
+          <Button title={trip.step === 'STOCK_FIRST' ? 'Open the remaining stock' : 'Open the forms'} tone="ghost" small style={{ marginTop: 8 }}
             onPress={() => goToReports?.(first.id)} />
         )}
       </>
@@ -1166,7 +1177,7 @@ function TripAction({ trip, online, onStartSecond, onComplete, goToReports, goTo
           {trip.step === 'FORMS_LAST'
             ? `Save all ${last.reports_total} forms for ${route(last)} first (${last.reports_filed} saved).`
             : trip.step === 'STOCK_RETURN'
-              ? 'Submit the stock return on the Sync page first.'
+              ? 'Submit the final stock return on the Sync page first.'
               : 'Everything is in. Finishing locks the whole trip.'}
           {need}
         </Text>
@@ -1175,7 +1186,7 @@ function TripAction({ trip, online, onStartSecond, onComplete, goToReports, goTo
             onPress={() => goToReports?.(last.id)} />
         )}
         {trip.step === 'STOCK_RETURN' && (
-          <Button title="Open the stock return" tone="ghost" small style={{ marginTop: 8 }}
+          <Button title="Open the final stock return" tone="ghost" small style={{ marginTop: 8 }}
             onPress={() => goTo?.('sync')} />
         )}
       </>

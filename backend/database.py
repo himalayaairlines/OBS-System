@@ -91,8 +91,11 @@ COMMISSION_RATE = 0.10
 # required, because both models read the same `sales.sold_by_crew_member_id`.
 COMMISSION_MODEL = "INDIVIDUAL"
 
-# A duty group is the crew working one sector: exactly four cabin crew.
+# A duty group is the crew working one sector: between two and ten cabin crew
+# (7.9). DUTY_GROUP_SIZE is the usual size, kept for labels and old callers.
 DUTY_GROUP_SIZE = 4
+DUTY_GROUP_MIN = 2
+DUTY_GROUP_MAX = 10
 
 # The crew may correct the duty group once after it has been formed, with
 # mandatory remarks. After that the membership stands, because it is the basis
@@ -868,6 +871,10 @@ def initialize_database():
         # Sector-by-sector crew workflow (7.5).
         from trip_flow import initialize_trip_flow
         initialize_trip_flow(connection, _add_column, _columns)
+
+        # Remaining stock after each sector (7.9).
+        from sector_stock import initialize_sector_stock
+        initialize_sector_stock(connection)
 
         # Passenger QR menu (7.8).
         from routers.qr_menu import initialize_qr_menu
