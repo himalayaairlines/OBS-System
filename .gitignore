@@ -7,3 +7,6 @@ backend/.obs_secret.key
 
 # Database backups made by backup.bat
 backups/
+
+# Packages downloaded from Claude chats
+Claude outputs/
