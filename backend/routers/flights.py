@@ -106,17 +106,13 @@ def _crew_visible_rows(connection, account):
     pending = [dict(r) for r in rows if not r["trip_completed_at"]]
     if not pending:
         return rows
-    # Within one day the trips are worked in order: only the earliest trip of
-    # each date that is not yet finished is shown (its root leg's id gives the
-    # order Inventory created them in). Trips on other dates are not held back.
+    # One trip at a time: the earliest trip (by date, then the order Inventory
+    # created them) that is not yet finished with "Finish whole flight". The
+    # next trip on the roster appears once this one is complete.
     def root_id(r):
         return r["linked_flight_id"] if r["direction"] == "RETURN" and r["linked_flight_id"] else r["id"]
-    first_root_by_date = {}
-    for r in pending:
-        d = r["flight_date"]
-        if d not in first_root_by_date or root_id(r) < first_root_by_date[d]:
-            first_root_by_date[d] = root_id(r)
-    keep = {r["id"] for r in pending if root_id(r) == first_root_by_date[r["flight_date"]]}
+    current = min(pending, key=lambda r: (r["flight_date"], root_id(r)))
+    keep = {r["id"] for r in pending if root_id(r) == root_id(current)}
     return [r for r in rows if r["id"] in keep or r["trip_completed_at"]]
 
 

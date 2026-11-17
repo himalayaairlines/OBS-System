@@ -353,6 +353,14 @@ def my_pending_return(user: dict = Depends(requires("sync"))):
         ).fetchall()
 
         roots = {trip_root(connection, row["flight_id"]) for row in rows}
+        if user["role"] == "crew_supervisor":
+            # Only the trip this iPad is working now (7.11): the earliest trip of
+            # the day not yet finished with "Finish whole flight". Older trips
+            # and the next one on the roster stay off the page.
+            from routers.flights import _crew_visible_rows
+            visible = {trip_root(connection, r["id"]) for r in _crew_visible_rows(connection, user["employee_id"])
+                       if not r["trip_completed_at"]}
+            roots &= visible
 
         pending = []
         for root_id in roots:

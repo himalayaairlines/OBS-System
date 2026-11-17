@@ -75,6 +75,8 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
   const flight = flights.find((f) => f.id === flightId) || null;
   const selling = isSellable(flight);
   const [trip, setTrip] = useState(null);
+  // An iPad account works the trip Inventory assigned to it: no flight picker (7.11).
+  const isDevice = user?.role === 'crew_supervisor';
 
   /* ---------------------------- data ---------------------------- */
   const loadReference = useCallback(async () => {
@@ -610,16 +612,34 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
 
         {(!flight || !selling || infoOpen) && (
           <>
-            <SectionTitle title="Flight" description="Only flights assigned to this device are listed." />
-            <Select
-              valueLabel={
-                flight
-                  ? `${flight.flight_number} \u00b7 ${flight.origin}\u2192${flight.destination} \u00b7 ${flight.flight_date}`
-                  : null
-              }
-              placeholder="Select a flight"
-              onPress={() => setFlightPicker(true)}
+            <SectionTitle
+              title="Flight"
+              description={isDevice
+                ? 'Set by Inventory for this iPad. The next trip appears here once this one is finished.'
+                : 'Only flights assigned to this device are listed.'}
             />
+            {isDevice && flight ? (
+              <View style={[styles.listRow, { paddingVertical: 10, marginBottom: 8 }]}>
+                <Text style={{ fontSize: 15, fontWeight: '600', color: COLORS.text }}>
+                  {flight.flight_number} · {flight.origin}→{flight.destination}
+                </Text>
+                <Text style={styles.mono}>
+                  {flight.flight_date}
+                  {activeFlights.length > 1 ? ` \u00b7 ${activeFlights.map((f) => f.flight_number + ' ' + route(f)).join(' / ')}` : ''}
+                  {flight.crew_account ? ` \u00b7 iPads: ${String(flight.crew_account).split(',').join(' + ')}` : ''}
+                </Text>
+              </View>
+            ) : (
+              <Select
+                valueLabel={
+                  flight
+                    ? `${flight.flight_number} \u00b7 ${flight.origin}\u2192${flight.destination} \u00b7 ${flight.flight_date}`
+                    : null
+                }
+                placeholder="Select a flight"
+                onPress={() => setFlightPicker(true)}
+              />
+            )}
             {!activeFlights.length && (
               <Text style={styles.empty}>
                 {flights.length

@@ -73,6 +73,15 @@ def call(method, path, who=None, body=None):
 class TripFlowTests(unittest.TestCase):
     seq = 0
 
+    def tearDown(self):
+        # A device works one trip at a time (7.11), so each test starts with the
+        # previous tests' trips closed off, as "Finish whole flight" would.
+        connection = get_connection()
+        connection.execute("UPDATE flights SET trip_completed_at=COALESCE(trip_completed_at, '2026-01-01T00:00:00'), "
+                           "trip_completed_by=COALESCE(trip_completed_by, 'TEST')")
+        connection.commit()
+        connection.close()
+
     def make_trip(self, trip_type="ROUND_TRIP"):
         TripFlowTests.seq += 1
         today = (date.today() + timedelta(days=TripFlowTests.seq)).isoformat()
@@ -288,7 +297,10 @@ class TripFlowTests(unittest.TestCase):
         self.sell(leg, product, seller)
         self.assertEqual(call("PUT", f"/flights/{leg['id']}/finish", "CSUP001")[0], 200)
         # Final stock return: 5 loaded, 2 sold -> 3 expected. iPad 1 holds 2, iPad 2 holds 1.
-        pending = [p for p in call("GET", "/reconciliations/pending", "CREW001")[1] if p["flight_id"] == leg["id"]][0]
+        pending_all = call("GET", "/reconciliations/pending", "CREW001")[1]
+        # Only the trip this iPad is working now is listed (7.11).
+        self.assertEqual([p["flight_id"] for p in pending_all], [leg["id"]])
+        pending = pending_all[0]
         self.assertEqual((pending["waiting_for"], pending["my_submitted"]), (["CREW001", "CSUP001"], False))
         status, r1 = call("POST", "/reconciliations", "CREW001",
                           {"flight_id": leg["id"], "lines": [{"product_id": product, "declared_remaining": 2}]})
