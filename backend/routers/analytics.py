@@ -228,38 +228,42 @@ def top_products(year: int | None = None, month: int | None = None, day: int | N
 # --------------------------------------------------------------------------- #
 # Commission
 # --------------------------------------------------------------------------- #
-def _seller_rows(connection, conditions, params):
-    """NORMAL revenue per crew member per sector, from the recorded seller.
-
-    This is the whole basis of commission now. A sale carries the crew member
-    who made it, so nothing has to be inferred from group membership and
-    editing a group later cannot rewrite what somebody earned.
-    """
+def _sector_rows(connection, conditions, params):
+    """NORMAL revenue per sector, split into product sales (pooled) and combo
+    sales (paid to the seller). 7.11: no seller is needed for product sales."""
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     return connection.execute(
-        f"""SELECT f.id AS flight_id, f.flight_number, f.flight_date, f.destination,
+        f"""SELECT f.id AS flight_id, f.flight_number, f.flight_date, f.destination, f.origin,
                    d.id AS duty_group_id, d.label AS duty_group_label,
-                   m.id AS crew_member_id, m.crew_code, m.name, m.position,
-                   COALESCE(SUM(s.npr_amount),0) AS revenue,
+                   COALESCE(SUM(CASE WHEN s.bundle_id IS NULL THEN s.npr_amount END),0) AS product_revenue,
+                   COALESCE(SUM(CASE WHEN s.bundle_id IS NOT NULL THEN s.npr_amount END),0) AS combo_revenue,
                    COUNT(DISTINCT s.order_ref) AS transactions
             FROM sales s
             JOIN flights f ON f.id = s.flight_id
-            JOIN crew_members m ON m.id = s.sold_by_crew_member_id
-            LEFT JOIN duty_groups d ON d.id = s.duty_group_id
+            LEFT JOIN duty_groups d ON d.flight_id = f.id
             {where}{' AND ' if where else 'WHERE '}s.sale_type='NORMAL'
-            GROUP BY f.id, m.id
-            HAVING revenue > 0""",
+            GROUP BY f.id""",
+        params,
+    ).fetchall()
+
+
+def _combo_rows(connection, conditions, params):
+    """Combo (bundle) revenue per crew member per sector, from the recorded seller."""
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    return connection.execute(
+        f"""SELECT f.id AS flight_id, m.id AS crew_member_id, m.crew_code, m.name, m.position,
+                   COALESCE(SUM(s.npr_amount),0) AS revenue, COUNT(DISTINCT s.order_ref) AS transactions
+            FROM sales s
+            JOIN flights f ON f.id = s.flight_id
+            JOIN crew_members m ON m.id = s.sold_by_crew_member_id
+            {where}{' AND ' if where else 'WHERE '}s.sale_type='NORMAL' AND s.bundle_id IS NOT NULL
+            GROUP BY f.id, m.id""",
         params,
     ).fetchall()
 
 
 def _sector_members(connection, flight_ids):
-    """Everyone rostered on each sector, including those who sold nothing.
-
-    The pooled model pays them, and even under the individual model a crew
-    member who sold nothing should still appear on the sector rather than
-    vanish from the record.
-    """
+    """Everyone rostered on each sector (the duty group the crew entered on board)."""
     if not flight_ids:
         return {}
     placeholders = ",".join("?" * len(flight_ids))
@@ -278,75 +282,65 @@ def _sector_members(connection, flight_ids):
 
 
 def _commission_entries(connection, conditions, params):
-    """Per crew member totals under whichever commission model is configured.
+    """Per crew member totals (7.11, pooled):
+
+    * product sales: the sector's pool (COMMISSION_RATE x product revenue) is
+      split equally across the duty group, e.g. NPR 100 of commission and 4
+      crew = NPR 25 each;
+    * combo sales: COMMISSION_RATE x the combo revenue goes to the crew member
+      who sold it.
 
     Returns (entries_by_member_id, sectors).
     """
-    seller_rows = [dict(r) for r in _seller_rows(connection, conditions, params)]
-
     sectors = {}
-    for row in seller_rows:
-        sector = sectors.setdefault(row["flight_id"], {
-            "flight_id": row["flight_id"],
-            "flight_number": row["flight_number"],
-            "flight_date": row["flight_date"],
-            "destination": row["destination"],
+    for row in _sector_rows(connection, conditions, params):
+        sectors[row["flight_id"]] = {
+            "flight_id": row["flight_id"], "flight_number": row["flight_number"],
+            "flight_date": row["flight_date"], "origin": row["origin"], "destination": row["destination"],
             "duty_group_id": row["duty_group_id"],
             "duty_group_label": row["duty_group_label"] or row["flight_number"],
-            "revenue_npr": 0.0,
+            "product_revenue_npr": float(row["product_revenue"] or 0),
+            "combo_revenue_npr": float(row["combo_revenue"] or 0),
+            "revenue_npr": float(row["product_revenue"] or 0) + float(row["combo_revenue"] or 0),
+            "transactions": int(row["transactions"] or 0),
             "sellers": [],
-        })
-        sector["revenue_npr"] += float(row["revenue"] or 0)
-        sector["sellers"].append(row)
+        }
+    combo_rows = [dict(r) for r in _combo_rows(connection, conditions, params)]
+    for row in combo_rows:
+        if row["flight_id"] in sectors:
+            sectors[row["flight_id"]]["sellers"].append(row)
 
     members_by_flight = _sector_members(connection, list(sectors))
-
     entries = {}
 
     def entry_for(member):
         return entries.setdefault(member["id"], {
-            "crew_member_id": member["id"],
-            "crew_code": member["crew_code"],
-            "name": member["name"],
-            "position": member["position"],
-            "sales_npr": 0.0,
-            "commission_npr": 0.0,
-            "transactions": 0,
-            "sectors": set(),
+            "crew_member_id": member["id"], "crew_code": member["crew_code"],
+            "name": member["name"], "position": member["position"],
+            "sales_npr": 0.0, "commission_npr": 0.0,
+            "combo_sales_npr": 0.0, "combo_commission_npr": 0.0,
+            "transactions": 0, "sectors": set(), "combo_sectors": set(),
         })
 
     for sector in sectors.values():
         roster = members_by_flight.get(sector["flight_id"], [])
         sector["member_count"] = len(roster)
-
-        if COMMISSION_MODEL == "POOLED" and roster:
-            # Everyone on the sector shares the pool regardless of who rang it up.
-            pool = sector["revenue_npr"] * COMMISSION_RATE
-            share = pool / len(roster)
-            sold_by = {r["crew_member_id"]: r for r in sector["sellers"]}
-            for member in roster:
-                entry = entry_for(member)
-                entry["commission_npr"] += share
-                own = sold_by.get(member["id"])
-                if own:
-                    entry["sales_npr"] += float(own["revenue"] or 0)
-                    entry["transactions"] += int(own["transactions"] or 0)
-                entry["sectors"].add(sector["duty_group_label"])
-        else:
-            # INDIVIDUAL: a crew member earns on what they personally sold.
-            for row in sector["sellers"]:
-                entry = entry_for({
-                    "id": row["crew_member_id"], "crew_code": row["crew_code"],
-                    "name": row["name"], "position": row["position"],
-                })
-                revenue = float(row["revenue"] or 0)
-                entry["sales_npr"] += revenue
-                entry["commission_npr"] += revenue * COMMISSION_RATE
-                entry["transactions"] += int(row["transactions"] or 0)
-                entry["sectors"].add(sector["duty_group_label"])
-
-        sector.pop("sellers_raw", None)
-
+        pool = sector["product_revenue_npr"] * COMMISSION_RATE
+        sector["pool_npr"] = pool
+        sector["share_npr"] = pool / len(roster) if roster else 0.0
+        for member in roster:
+            entry = entry_for(member)
+            entry["commission_npr"] += sector["share_npr"]
+            entry["sales_npr"] += sector["product_revenue_npr"] / len(roster)
+            entry["sectors"].add(sector["duty_group_label"])
+        for row in sector["sellers"]:
+            entry = entry_for({"id": row["crew_member_id"], "crew_code": row["crew_code"],
+                               "name": row["name"], "position": row["position"]})
+            revenue = float(row["revenue"] or 0)
+            entry["combo_sales_npr"] += revenue
+            entry["combo_commission_npr"] += revenue * COMMISSION_RATE
+            entry["transactions"] += int(row["transactions"] or 0)
+            entry["combo_sectors"].add(sector["duty_group_label"])
     return entries, sectors
 
 
@@ -355,22 +349,62 @@ def _render_sector(sector):
         "flight_id": sector["flight_id"],
         "flight_number": sector["flight_number"],
         "flight_date": sector["flight_date"],
+        "origin": sector.get("origin"),
         "destination": sector["destination"],
         "duty_group_id": sector["duty_group_id"],
         "duty_group_label": sector["duty_group_label"],
         "member_count": sector.get("member_count", 0),
         "revenue_npr": round(sector["revenue_npr"], 2),
-        "commission_pool_npr": round(sector["revenue_npr"] * COMMISSION_RATE, 2),
+        "product_revenue_npr": round(sector["product_revenue_npr"], 2),
+        "combo_revenue_npr": round(sector["combo_revenue_npr"], 2),
+        "commission_pool_npr": round(sector.get("pool_npr", 0.0), 2),
+        "share_npr": round(sector.get("share_npr", 0.0), 2),
+        "combo_commission_npr": round(sector["combo_revenue_npr"] * COMMISSION_RATE, 2),
         "sellers": sorted(
             [{
                 "crew_member_id": r["crew_member_id"],
                 "crew_code": r["crew_code"],
                 "name": r["name"],
-                "sales_npr": round(float(r["revenue"] or 0), 2),
+                "combo_sales_npr": round(float(r["revenue"] or 0), 2),
+                "combo_commission_npr": round(float(r["revenue"] or 0) * COMMISSION_RATE, 2),
                 "transactions": int(r["transactions"] or 0),
             } for r in sector["sellers"]],
-            key=lambda r: r["sales_npr"], reverse=True,
+            key=lambda r: r["combo_sales_npr"], reverse=True,
         ),
+    }
+
+
+def sector_commission(connection, flight_id: int) -> dict:
+    """One sector's commission, member by member (crew view after finishing)."""
+    entries, sectors = _commission_entries(connection, ["f.id=?"], [flight_id])
+    sector = sectors.get(flight_id)
+    roster = _sector_members(connection, [flight_id]).get(flight_id, [])
+    rendered = _render_sector(sector) if sector else None
+    combo_by_member = {}
+    if sector:
+        for r in sector["sellers"]:
+            combo_by_member[r["crew_member_id"]] = float(r["revenue"] or 0)
+    members = []
+    for m in roster:
+        combo = combo_by_member.get(m["id"], 0.0)
+        share = sector["share_npr"] if sector else 0.0
+        members.append({
+            "crew_member_id": m["id"], "crew_code": m["crew_code"], "name": m["name"], "position": m["position"],
+            "share_npr": round(share, 2), "combo_sales_npr": round(combo, 2),
+            "combo_commission_npr": round(combo * COMMISSION_RATE, 2),
+            "total_npr": round(share + combo * COMMISSION_RATE, 2),
+        })
+    flight = connection.execute(
+        "SELECT id, flight_number, flight_date, origin, destination, direction, status FROM flights WHERE id=?",
+        (flight_id,)).fetchone()
+    return {
+        "flight": dict(flight) if flight else None,
+        "commission_rate": COMMISSION_RATE, "commission_model": COMMISSION_MODEL,
+        "sector": rendered or {"flight_id": flight_id, "revenue_npr": 0.0, "product_revenue_npr": 0.0,
+                               "combo_revenue_npr": 0.0, "commission_pool_npr": 0.0, "share_npr": 0.0,
+                               "combo_commission_npr": 0.0, "member_count": len(roster), "sellers": []},
+        "members": sorted(members, key=lambda m: (-m["total_npr"], m["name"])),
+        "total_commission_npr": round(sum(m["total_npr"] for m in members), 2),
     }
 
 
@@ -387,6 +421,8 @@ def crew_ranking(year: int | None = None, month: int | None = None, day: int | N
         connection.close()
 
     ranking = sorted(entries.values(), key=lambda e: (-e["commission_npr"], e["name"]))
+    combo_ranking = sorted((e for e in entries.values() if e["combo_commission_npr"] > 0),
+                           key=lambda e: (-e["combo_commission_npr"], e["name"]))
     # Everyone on the active roster appears, including those with nothing this
     # period, so the table is the whole crew rather than only the earners.
     if all_crew:
@@ -397,7 +433,8 @@ def crew_ranking(year: int | None = None, month: int | None = None, day: int | N
                 if m["id"] not in entries:
                     ranking.append({"crew_member_id": m["id"], "crew_code": m["crew_code"], "name": m["name"],
                                     "position": m["position"], "sales_npr": 0.0, "commission_npr": 0.0,
-                                    "transactions": 0, "sectors": set()})
+                                    "combo_sales_npr": 0.0, "combo_commission_npr": 0.0,
+                                    "transactions": 0, "sectors": set(), "combo_sectors": set()})
         finally:
             connection.close()
     result = [{
@@ -411,12 +448,28 @@ def crew_ranking(year: int | None = None, month: int | None = None, day: int | N
         "transactions": entry["transactions"],
         "attributed_sales_npr": round(entry["sales_npr"], 2),
         "commission_npr": round(entry["commission_npr"], 2),
+        "combo_sales_npr": round(entry["combo_sales_npr"], 2),
+        "combo_commission_npr": round(entry["combo_commission_npr"], 2),
+        "total_commission_npr": round(entry["commission_npr"] + entry["combo_commission_npr"], 2),
     } for position, entry in enumerate(ranking, start=1)]
+    combo_result = [{
+        "rank": position,
+        "crew_member_id": entry["crew_member_id"],
+        "crew_code": entry["crew_code"],
+        "name": entry["name"],
+        "position": entry["position"],
+        "sectors": sorted(entry["combo_sectors"]),
+        "flights": len(entry["combo_sectors"]),
+        "transactions": entry["transactions"],
+        "combo_sales_npr": round(entry["combo_sales_npr"], 2),
+        "combo_commission_npr": round(entry["combo_commission_npr"], 2),
+    } for position, entry in enumerate(combo_ranking, start=1)]
 
     return {
         "commission_rate": COMMISSION_RATE,
         "commission_model": COMMISSION_MODEL,
         "ranking": result,
+        "combo_ranking": combo_result,
         "sectors": sorted(
             (_render_sector(s) for s in sectors.values()),
             key=lambda s: s["revenue_npr"], reverse=True,
@@ -466,7 +519,6 @@ def crew_history(member_id: int, year: int | None = None, month: int | None = No
     finally:
         connection.close()
 
-    roster_size = {fid: s.get("member_count", 0) for fid, s in sectors.items()}
     by_flight = defaultdict(lambda: {"sales_npr": 0.0, "items": 0, "transactions": set()})
     for line in lines:
         if line["sale_type"] != "NORMAL":
@@ -478,18 +530,23 @@ def crew_history(member_id: int, year: int | None = None, month: int | None = No
     sector_rows = []
     for w in worked:
         agg = by_flight.get(w["flight_id"], {"sales_npr": 0.0, "items": 0, "transactions": set()})
-        pool = sectors.get(w["flight_id"], {}).get("revenue_npr", 0.0) * COMMISSION_RATE
-        size = roster_size.get(w["flight_id"]) or 0
-        commission = (pool / size if size else 0.0) if COMMISSION_MODEL == "POOLED" \
-            else agg["sales_npr"] * COMMISSION_RATE
+        sec = sectors.get(w["flight_id"], {})
+        share = sec.get("share_npr", 0.0)
+        combo_sales = sum(float(r["revenue"] or 0) for r in sec.get("sellers", []) if r["crew_member_id"] == member_id)
         sector_rows.append({**w, "sales_npr": round(agg["sales_npr"], 2), "items": agg["items"],
-                            "transactions": len(agg["transactions"]), "commission_npr": round(commission, 2)})
+                            "transactions": len(agg["transactions"]),
+                            "share_npr": round(share, 2), "combo_sales_npr": round(combo_sales, 2),
+                            "combo_commission_npr": round(combo_sales * COMMISSION_RATE, 2),
+                            "commission_npr": round(share + combo_sales * COMMISSION_RATE, 2)})
     return {
         "crew_member": {"id": member["id"], "crew_code": member["crew_code"], "name": member["name"],
                         "position": member["position"], "active": bool(member["active"])},
         "totals": {
             "sales_npr": round(mine["sales_npr"], 2) if mine else 0.0,
-            "commission_npr": round(mine["commission_npr"], 2) if mine else 0.0,
+            "commission_npr": round(mine["commission_npr"] + mine["combo_commission_npr"], 2) if mine else 0.0,
+            "pool_commission_npr": round(mine["commission_npr"], 2) if mine else 0.0,
+            "combo_sales_npr": round(mine["combo_sales_npr"], 2) if mine else 0.0,
+            "combo_commission_npr": round(mine["combo_commission_npr"], 2) if mine else 0.0,
             "transactions": mine["transactions"] if mine else 0,
             "sectors": len(worked),
             "items": sum(int(l["quantity"] or 0) for l in lines if l["sale_type"] == "NORMAL"),
@@ -538,7 +595,9 @@ def group_summary(user: dict, date: str | None = None):
             "crew_code": e["crew_code"],
             "name": e["name"],
             "sales_npr": round(e["sales_npr"], 2),
-            "commission_npr": round(e["commission_npr"], 2),
+            "commission_npr": round(e["commission_npr"] + e["combo_commission_npr"], 2),
+            "pool_commission_npr": round(e["commission_npr"], 2),
+            "combo_commission_npr": round(e["combo_commission_npr"], 2),
             "transactions": e["transactions"],
         } for e in entries.values()),
         key=lambda e: e["commission_npr"], reverse=True,

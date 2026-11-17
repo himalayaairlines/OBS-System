@@ -10,6 +10,7 @@ Sale types:
   CANCELLATION  -> no revenue, no stock consumed (the sale did not happen)
 """
 
+import json
 import re
 import sqlite3
 
@@ -53,9 +54,10 @@ class SaleTransaction(BaseModel):
     order_ref: str = Field(min_length=6, max_length=64)
     flight_id: int
     seat_number: str
-    # Which member of the sector's duty group made this sale. Commission and
-    # the performance ranking are built from it, so it is not optional.
-    sold_by_crew_member_id: int
+    # 7.11: normal sales pay into the sector's pooled commission, so no seller
+    # is picked. A combo (bundle) sale names the crew member who sold it, and
+    # that person earns the combo commission.
+    sold_by_crew_member_id: int | None = None
     lines: list[SaleLine]
     payment_currency: str = "NPR"
     payment_method: str = "Cash"
@@ -186,18 +188,17 @@ def _record(connection, transaction: SaleTransaction, user: dict):
             f"Seat {seat} does not exist on a {flight['aircraft_type'] or 'this'} aircraft."
         )
 
-    assignment = connection.execute(
-        "SELECT * FROM flight_assignments WHERE flight_id=?", (transaction.flight_id,)
-    ).fetchone()
+    accounts = [r["crew_account"] for r in connection.execute(
+        "SELECT crew_account FROM flight_assignments WHERE flight_id=?", (transaction.flight_id,))]
     if "sell_any_flight" not in permissions_for(user["role"]):
-        if not assignment:
+        if not accounts:
             raise PermanentError("No OBS device is assigned to this flight.")
-        if user["employee_id"] != assignment["crew_account"]:
+        if user["employee_id"] not in accounts:
             raise PermanentError("This device is not assigned to that flight.")
 
-    # The seller must be one of the people the crew put in this sector's duty
-    # group. Without a group there is nobody to attribute a sale to, so selling
-    # cannot start until the names have been entered.
+    # The sale belongs to the sector's duty group: the pooled commission is
+    # split across its members. Without a group there is nobody to pay, so
+    # selling cannot start until the names have been entered.
     duty_group = connection.execute(
         "SELECT * FROM duty_groups WHERE flight_id=?", (transaction.flight_id,)
     ).fetchone()
@@ -205,14 +206,19 @@ def _record(connection, transaction: SaleTransaction, user: dict):
         raise PermanentError(
             "No duty group has been formed for this sector. Enter the crew names before selling."
         )
-    seller = connection.execute(
-        """SELECT m.id, m.name FROM duty_group_members dm
-           JOIN crew_members m ON m.id = dm.crew_member_id
-           WHERE dm.duty_group_id=? AND dm.crew_member_id=?""",
-        (duty_group["id"], transaction.sold_by_crew_member_id),
-    ).fetchone()
-    if not seller:
-        raise PermanentError("The selected crew member is not in this sector's duty group.")
+    has_combo = any(line.bundle_id for line in transaction.lines)
+    seller = None
+    if transaction.sold_by_crew_member_id:
+        seller = connection.execute(
+            """SELECT m.id, m.name FROM duty_group_members dm
+               JOIN crew_members m ON m.id = dm.crew_member_id
+               WHERE dm.duty_group_id=? AND dm.crew_member_id=?""",
+            (duty_group["id"], transaction.sold_by_crew_member_id),
+        ).fetchone()
+        if not seller:
+            raise PermanentError("The selected crew member is not in this sector's duty group.")
+    elif has_combo:
+        raise PermanentError("Choose the crew member who sold the combo. Combo commission is paid to that person.")
 
     # The membership now backs a real sale, so it stops being freely editable.
     if not duty_group["locked"]:
@@ -259,7 +265,7 @@ def _record(connection, transaction: SaleTransaction, user: dict):
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 f"{transaction.order_ref}-{index + 1}", transaction.order_ref,
-                transaction.flight_id, duty_group["id"], seller["id"], line["product_id"],
+                transaction.flight_id, duty_group["id"], seller["id"] if seller else None, line["product_id"],
                 line["bundle_id"], user["employee_id"], seat, line["quantity"],
                 line["unit_price"], transaction.payment_method, transaction.transaction_time,
                 transaction.payment_currency.strip().upper(), rate,
@@ -270,7 +276,7 @@ def _record(connection, transaction: SaleTransaction, user: dict):
     return {
         "status": "success",
         "order_ref": transaction.order_ref,
-        "sold_by": seller["name"],
+        "sold_by": seller["name"] if seller else None,
         "sale_type": sale_type,
         "total_npr": round(total_npr, 2),
         "total_currency": round(total_npr / rate, 2) if rate else 0,
@@ -357,7 +363,9 @@ SELECT s.id, s.transaction_id, s.order_ref, s.flight_id, f.flight_number, f.flig
        s.bundle_id, b.bundle_name, s.crew_id, s.seat_number, s.quantity, s.unit_price,
        s.payment_method, s.transaction_time, s.transaction_currency, s.exchange_rate_to_npr,
        s.transaction_currency_amount, s.npr_amount, s.sale_type, s.remarks,
-       s.edited_by, s.edited_at, s.edit_remarks
+       s.edited_by, s.edited_at, s.edit_remarks,
+       f.trip_type, CASE WHEN f.direction='RETURN' THEN 2 ELSE 1 END AS segment,
+       (SELECT COUNT(*) FROM sale_edit_history h WHERE h.sale_id = s.id) AS edit_count
 FROM sales s
 JOIN flights f ON f.id = s.flight_id
 LEFT JOIN products p ON p.id = s.product_id
@@ -450,6 +458,37 @@ def my_sales_summary(date: str | None = None, user: dict = Depends(requires("syn
 # --------------------------------------------------------------------------- #
 # Management corrections
 # --------------------------------------------------------------------------- #
+@router.get("/sales/{sale_id}/history")
+def sale_history(sale_id: int, user: dict = Depends(requires("sales_view"))):
+    """Every correction made to one sale, newest first, with names resolved."""
+    connection = get_connection()
+    try:
+        if not connection.execute("SELECT 1 FROM sales WHERE id=?", (sale_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="Sale not found.")
+        products = {r["id"]: r["product_name"] for r in connection.execute("SELECT id, product_name FROM products")}
+        crew = {r["id"]: r["name"] for r in connection.execute("SELECT id, name FROM crew_members")}
+        out = []
+        for row in connection.execute(
+                "SELECT * FROM sale_edit_history WHERE sale_id=? ORDER BY changed_at DESC, id DESC", (sale_id,)):
+            before, after = json.loads(row["before_json"]), json.loads(row["after_json"])
+            changes = []
+            for key, label in (("product_id", "product"), ("quantity", "quantity"), ("seat_number", "seat"),
+                               ("sold_by_crew_member_id", "sold by"), ("unit_price", "unit price")):
+                if before.get(key) != after.get(key):
+                    if key == "product_id":
+                        a, b = products.get(before.get(key), before.get(key)), products.get(after.get(key), after.get(key))
+                    elif key == "sold_by_crew_member_id":
+                        a, b = crew.get(before.get(key), before.get(key)), crew.get(after.get(key), after.get(key))
+                    else:
+                        a, b = before.get(key), after.get(key)
+                    changes.append(f"{label}: {a} \u2192 {b}")
+            out.append({"id": row["id"], "changed_by": row["changed_by"], "changed_at": row["changed_at"],
+                        "remarks": row["remarks"], "changes": changes})
+        return out
+    finally:
+        connection.close()
+
+
 @router.put("/sales/{sale_id}")
 def edit_sale(sale_id: int, data: SaleEdit, user: dict = Depends(requires("sales_edit"))):
     """Correct a mis-keyed sale (wrong product, wrong quantity, wrong seat)."""
@@ -537,14 +576,24 @@ def edit_sale(sale_id: int, data: SaleEdit, user: dict = Depends(requires("sales
                       else float(sale["unit_price"]))
         npr_amount = round(unit_price * new_quantity, 2) if sale["sale_type"] == "NORMAL" else 0.0
         rate = float(sale["exchange_rate_to_npr"] or 1)
+        edited_at = now_iso()
         connection.execute(
             """UPDATE sales SET product_id=?, quantity=?, seat_number=?, unit_price=?,
                    sold_by_crew_member_id=?, npr_amount=?, transaction_currency_amount=?,
                    edited_by=?, edited_at=?, edit_remarks=? WHERE id=?""",
             (new_product_id, new_quantity, seat, unit_price, new_seller_id, npr_amount,
              round(npr_amount / rate, 2) if rate else 0,
-             user["employee_id"], now_iso(), data.edit_remarks.strip(), sale_id),
+             user["employee_id"], edited_at, data.edit_remarks.strip(), sale_id),
         )
+        # Every correction is kept line by line (7.10), not only the last one.
+        before = {"product_id": sale["product_id"], "quantity": sale["quantity"], "seat_number": sale["seat_number"],
+                  "sold_by_crew_member_id": sale["sold_by_crew_member_id"], "unit_price": sale["unit_price"],
+                  "npr_amount": sale["npr_amount"]}
+        after = {"product_id": new_product_id, "quantity": new_quantity, "seat_number": seat,
+                 "sold_by_crew_member_id": new_seller_id, "unit_price": unit_price, "npr_amount": npr_amount}
+        connection.execute(
+            "INSERT INTO sale_edit_history(sale_id,changed_by,changed_at,remarks,before_json,after_json) VALUES (?,?,?,?,?,?)",
+            (sale_id, user["employee_id"], edited_at, data.edit_remarks.strip(), json.dumps(before), json.dumps(after)))
         connection.commit()
         row = connection.execute(f"{SALE_SELECT} WHERE s.id=?", (sale_id,)).fetchone()
     except HTTPException:

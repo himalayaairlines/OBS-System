@@ -27,12 +27,14 @@ const STATUS_TONE = {
   SUBMITTED: 'success',
   DRAFT: 'warning',
   NOT_STARTED: 'danger',
+  AWAITING_OTHER: 'info',
 };
 
 const STATUS_LABEL = {
   SUBMITTED: 'SAVED',
   DRAFT: 'DRAFT',
   NOT_STARTED: 'NOT FILLED',
+  AWAITING_OTHER: 'OTHER iPAD',
 };
 
 /* ------------------------------------------------------------------ */
@@ -381,22 +383,16 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
       const left = (fresh?.outstanding || []).length;
       if (!canReview && fresh && left === 0) {
         const roundFirst = fresh.trip_type === 'ROUND_TRIP' && fresh.segment === 1;
-        if (roundFirst) {
-          await notify({
-            title: 'All forms saved',
-            message: `All forms for ${fresh.sector} are saved and sent to Management.\n\n`
-              + 'Next: confirm the remaining stock after this sector, in the card below the forms.',
-          });
-        } else {
-          const go = await confirm({
-            title: 'All forms saved',
-            message: `All forms for ${fresh.sector} are saved and sent to Management.\n\n`
-              + 'Next: submit the final stock return on the Sync page, then press \u201cFinish whole flight\u201d on the Sales page.',
-            confirmText: 'Go to Sync',
-            cancelText: 'Later',
-          });
-          if (go) goTo?.('sync');
-        }
+        const go = await confirm({
+          title: 'All forms handled',
+          message: `All forms for ${fresh.sector} are saved and sent to Management.\n\n`
+            + (roundFirst
+              ? 'Next: go to the Sales page and press \u201cStart second flight\u201d (both iPads must have confirmed the remaining stock).'
+              : 'Next: press \u201cFinish whole flight\u201d on the Sales page (both iPads must have submitted the final stock return).'),
+          confirmText: 'Go to Sales',
+          cancelText: 'Later',
+        });
+        if (go) goTo?.('crew');
       } else {
         setMessage({
           tone: 'success',
@@ -457,6 +453,34 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     setBusy(false);
   }
 
+  /** "Submitted by the other iPad" (7.11): this device leaves the form to the other one. */
+  async function deferForm(item) {
+    const sure = await confirm({
+      title: 'Submitted by the other iPad?',
+      message: `${item.title} will be left to ${item.other_device || 'the other iPad'}. It counts as handled for this trip; `
+        + 'it shows as SAVED once that iPad uploads it, and Management sees it as awaiting the other iPad until then.',
+      confirmText: 'Yes, the other iPad has it',
+    });
+    if (!sure) return;
+    try {
+      await api('/flight-reports/defer', { method: 'POST', body: { flight_id: sector.flight_id, report_type: item.report_type } });
+      await writeCache(`sectorReports.${sector.flight_id}`, null);
+      await loadSector(sector.flight_id);
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+  }
+
+  async function undeferForm(reportType) {
+    try {
+      await api(`/flight-reports/defer?flight_id=${sector.flight_id}&report_type=${encodeURIComponent(reportType)}`, { method: 'DELETE' });
+      await writeCache(`sectorReports.${sector.flight_id}`, null);
+      await loadSector(sector.flight_id);
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+  }
+
   function openFiled(r) {
     setFiledReport(r);
     setFlightId(r.flight_id);
@@ -491,10 +515,13 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
       await writeCache(`sectorReports.${sector.flight_id}`, null);
       await loadFlights();
       await loadSector(sector.flight_id);
+      const left = result.reports_outstanding ?? 0;
       await notify({
         title: 'Sector finished',
         message: `${sector.flight_number}: ${result.transactions} transaction(s), ${npr(result.revenue_npr)}.\n\n`
-          + 'Now fill in and save the four forms below. They go to Management as soon as they are saved.',
+          + 'Next, in order: 1) confirm the remaining stock on this iPad, 2) see the commission, 3) the forms'
+          + (left ? ` (${left} of ${result.reports_total} still to handle on this sector)` : ' (all already saved)')
+          + ', then the final step on the Sales page.',
       });
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
@@ -683,8 +710,8 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     : flights.filter(crewSector);
   const segmentTitle = !sector ? 'Forms'
     : sector.trip_type === 'ROUND_TRIP'
-      ? `Forms (${sector.segment === 2 ? 'second' : 'first'} segment) · ${sector.sector}`
-      : `Forms · ${sector.sector}`;
+      ? `${sector.flight_status === 'OPEN' ? '' : '3. '}Forms (${sector.segment === 2 ? 'second' : 'first'} segment) · ${sector.sector}`
+      : `${sector.flight_status === 'OPEN' ? '' : '3. '}Forms · ${sector.sector}`;
 
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
@@ -724,8 +751,8 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
             </View>
             {sector.flight_status === 'OPEN' && (
               <Banner
-                tone="warning"
-                message="This sector is still selling. Finish it before filing its reports."
+                tone="info"
+                message="This sector is still selling. The forms can be filled in now or after you finish it; anything still open is reminded at finish."
               />
             )}
           </>
@@ -750,13 +777,25 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
         </Card>
       )}
 
+      {!canReview && !!sector && sector.flight_status !== 'OPEN' && (
+        sector.trip_type === 'ROUND_TRIP' && sector.segment === 1 ? (
+          <SectorStockCard flightId={sector.flight_id} online={online} locked={locked} goTo={goTo} user={user} />
+        ) : (
+          <FinalReturnCard flightId={sector.flight_id} online={online} goTo={goTo} user={user} />
+        )
+      )}
+
+      {!canReview && !!sector && sector.flight_status !== 'OPEN' && (
+        <CommissionCard flightId={sector.flight_id} online={online} user={user} />
+      )}
+
       {!canReview && !!sector && !!sectorReports.length && (
         <Card>
           <SectionTitle
             title={segmentTitle}
             description={sector.locked
               ? 'Locked: the next flight was started or the whole flight was finished.'
-              : 'Tap a form to fill it in. Saved forms go to Management straight away.'}
+              : 'Tap a form to fill it in, before or after the sector is finished. Saved forms go to Management straight away.'}
           />
           {sectorReports.map((item) => {
             const r = item.report;
@@ -778,25 +817,35 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
                 <Text style={styles.mono}>
                   {item.form_code} · {item.manual}
                   {r ? ` · ${r.issue_label} · ${r.rev_label} · ${r.report_date}` : ''}
+                  {item.status === 'AWAITING_OTHER' ? ` · marked as submitted by ${item.other_device || 'the other iPad'}` : ''}
                 </Text>
+                {!sector.locked && item.status !== 'SUBMITTED' && sector.flight_status !== 'OPEN' && (
+                  <View style={[styles.row, styles.gap8, { marginTop: 6 }]}>
+                    {item.status === 'AWAITING_OTHER' && item.deferred_by_me ? (
+                      <Button title="Take it back on this iPad" tone="ghost" small onPress={() => undeferForm(item.report_type)} />
+                    ) : item.status !== 'AWAITING_OTHER' ? (
+                      <>
+                        <Button title="Fill in on this iPad" tone="secondary" small onPress={() => openForm(item.report_type)} />
+                        <Button title={`Submitted by ${item.other_device || 'the other iPad'}`} tone="ghost" small onPress={() => deferForm(item)} />
+                      </>
+                    ) : null}
+                  </View>
+                )}
               </Pressable>
             );
           })}
-        </Card>
-      )}
-
-      {!canReview && !!sector && sector.flight_status !== 'OPEN' && !outstanding.length && (
-        sector.trip_type === 'ROUND_TRIP' && sector.segment === 1 ? (
-          <SectorStockCard flightId={sector.flight_id} online={online} locked={locked} goTo={goTo} />
-        ) : (
-          <Card>
-            <SectionTitle
-              title="Final stock return"
-              description="All forms are saved. Submit the final stock return on the Sync page, then press Finish whole flight on the Sales page."
+          {!!(sector.awaiting_other || []).length && (
+            <Banner tone="info" message={`${sector.awaiting_other.length} form(s) are marked as submitted by the other iPad. They turn to SAVED when that iPad uploads them.`} />
+          )}
+          {!outstanding.length && sector.flight_status !== 'OPEN' && !sector.locked && (
+            <Banner
+              tone="success"
+              message={sector.trip_type === 'ROUND_TRIP' && sector.segment === 1
+                ? 'All forms handled. Next: go to Sales and press \u201cStart second flight\u201d once both iPads have confirmed the remaining stock.'
+                : 'All forms handled. Next: press \u201cFinish whole flight\u201d on the Sales page once both iPads have submitted the final stock return.'}
             />
-            <Button title="Open the final stock return" tone="secondary" onPress={() => goTo?.('sync')} />
-          </Card>
-        )
+          )}
+        </Card>
       )}
 
       {canReview && <SectorStockList />}
@@ -895,7 +944,8 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
 /* ------------------------------------------------------------------ */
 /* Remaining stock after a sector (7.9)                                */
 /* ------------------------------------------------------------------ */
-function SectorStockCard({ flightId, online, locked, goTo }) {
+function SectorStockCard({ flightId, online, locked, goTo, user }) {
+  const me = user?.employee_id;
   const [position, setPosition] = useState(null);
   const [declared, setDeclared] = useState({});
   const [remarks, setRemarks] = useState('');
@@ -903,18 +953,26 @@ function SectorStockCard({ flightId, online, locked, goTo }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
 
+  // What THIS iPad should hold: the system figure less what the other iPad declared.
+  const mineDefault = (p, i) => {
+    const others = Object.entries(i.by_device || {}).filter(([d]) => d !== me).reduce((a, [, q]) => a + Number(q || 0), 0);
+    const otherIn = (p.submitted_devices || []).some((d) => d !== me);
+    return otherIn ? Math.max(0, i.expected_remaining - others) : i.expected_remaining;
+  };
+
   const load = useCallback(async () => {
     try {
       const p = await api(`/flights/${flightId}/sector-stock`);
       setPosition(p);
-      setDeclared(Object.fromEntries(p.items.map((i) => [i.product_id, String(i.declared_remaining)])));
-      setRemarks(p.remarks || '');
-      setEditing(!p.submitted);
+      setDeclared(Object.fromEntries(p.items.map((i) => [i.product_id,
+        String((i.by_device || {})[me] ?? mineDefault(p, i))])));
+      setRemarks((p.device_remarks || {})[me] || '');
+      setEditing(!p.my_submitted);
       setError(null);
     } catch (e) {
       setError(e.message);
     }
-  }, [flightId]);
+  }, [flightId, me]);
   useEffect(() => { if (online) load(); }, [load, online]);
 
   async function submit() {
@@ -922,28 +980,30 @@ function SectorStockCard({ flightId, online, locked, goTo }) {
     if (lines.some((l) => Number.isNaN(l.declared_remaining) || l.declared_remaining < 0)) {
       return notify({ title: 'Check the quantities', message: 'Every remaining quantity must be a whole number, 0 or more.' });
     }
-    const changed = position.items.filter((i) => Number(declared[i.product_id]) !== i.expected_remaining);
+    const changed = position.items.filter((i) => Number(declared[i.product_id]) !== mineDefault(position, i));
     if (changed.length && !remarks.trim()) {
       return notify({ title: 'Remarks required', message: `${changed.length} line(s) differ from the system figure. Say why.` });
     }
+    const others = (position.devices || []).filter((d) => d !== me);
     const sure = await confirm({
-      title: 'Confirm the remaining stock?',
+      title: 'Confirm the remaining stock on this iPad?',
       message: `${position.flight_number} ${position.origin}\u2192${position.destination}: `
-        + `${lines.reduce((a, l) => a + l.declared_remaining, 0)} unit(s) left in the trolley after this sector. `
-        + 'Management and Inventory can see this at once.',
+        + `${lines.reduce((a, l) => a + l.declared_remaining, 0)} unit(s) left on this iPad after this sector.`
+        + (others.length ? ` ${others.join(', ')} declares its own part; the two are added together.` : '')
+        + ' Management and Inventory can see this at once.',
       confirmText: 'Confirm',
     });
     if (!sure) return;
     setBusy(true);
     try {
-      await api(`/flights/${flightId}/sector-stock`, { method: 'POST', body: { lines, remarks: remarks.trim() || null } });
+      const result = await api(`/flights/${flightId}/sector-stock`, { method: 'POST', body: { lines, remarks: remarks.trim() || null } });
       await load();
-      const go = await confirm({
+      const waiting = (result.waiting_for || []).filter((d) => d !== me);
+      await notify({
         title: 'Remaining stock confirmed',
-        message: 'Next: go to the Sales page and press \u201cStart second flight\u201d.',
-        confirmText: 'Go to Sales', cancelText: 'Later',
+        message: (waiting.length ? `Waiting for ${waiting.join(', ')} to confirm its part. ` : 'Both iPads have confirmed. ')
+          + 'Next: see the commission below, then the forms, then \u201cStart second flight\u201d on the Sales page.',
       });
-      if (go) goTo?.('crew');
     } catch (e) {
       setError(e.message);
     }
@@ -956,37 +1016,45 @@ function SectorStockCard({ flightId, online, locked, goTo }) {
   if (error) return <Card><Banner tone="danger" message={error} /></Card>;
   if (!position) return null;
   const readOnly = locked || !editing;
+  const others = (position.devices || []).filter((d) => d !== me);
+  const waiting = (position.waiting_for || []).filter((d) => d !== me);
 
   return (
     <Card>
       <SectionTitle
-        title="Remaining stock after this sector"
-        description={position.submitted
-          ? `Confirmed by ${position.submitted_by} at ${String(position.submitted_at || '').replace('T', ' ').slice(0, 16)}.`
-          : 'All forms are saved. Check what is left in the trolley: the figures are calculated from the load and the sales. Change a line only if the trolley says otherwise.'}
-        right={<Pill label={position.submitted ? 'Confirmed' : 'To confirm'} tone={position.submitted ? 'success' : 'warning'} />}
+        title="1. Remaining stock after this sector"
+        description={position.my_submitted
+          ? (position.submitted
+            ? `Both iPads have confirmed. ${position.total_declared} unit(s) left in total.`
+            : `Your part is in. Waiting for ${waiting.join(', ')} to confirm its part.`)
+          : 'Count what is left on THIS iPad. The system figure is calculated from the load and every sale on both iPads; change a line only if the trolley says otherwise.'}
+        right={<Pill label={position.submitted ? 'Confirmed' : position.my_submitted ? 'Waiting for other iPad' : 'To confirm'}
+                     tone={position.submitted ? 'success' : position.my_submitted ? 'info' : 'warning'} />}
       />
       <View style={[styles.row, { paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: COLORS.border }]}>
         <Text style={[styles.mono, { flex: 2 }]}>Product</Text>
         <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>Loaded</Text>
         <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>Sold</Text>
-        <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>Should be left</Text>
-        <Text style={[styles.mono, { flex: 1.2, textAlign: 'right' }]}>Left</Text>
+        <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>{others.length ? 'Should be here' : 'Should be left'}</Text>
+        <Text style={[styles.mono, { flex: 1.2, textAlign: 'right' }]}>{others.length ? 'On this iPad' : 'Left'}</Text>
       </View>
       {position.items.map((i) => {
-        const diff = Number(declared[i.product_id] || 0) - i.expected_remaining;
+        const expectedHere = mineDefault(position, i);
+        const diff = Number(declared[i.product_id] || 0) - expectedHere;
+        const otherQty = Object.entries(i.by_device || {}).filter(([d]) => d !== me);
         return (
           <View key={i.product_id} style={[styles.row, { paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: COLORS.surfaceAlt }]}>
             <View style={{ flex: 2 }}>
               <Text style={{ fontSize: 13, color: COLORS.text }} numberOfLines={2}>{i.product_name}</Text>
               {diff !== 0 && <Text style={[styles.mono, { color: COLORS.warning }]}>{diff > 0 ? '+' : ''}{diff} vs system</Text>}
+              {otherQty.length > 0 && <Text style={styles.mono}>{otherQty.map(([d, q]) => `${d}: ${q}`).join(' · ')}</Text>}
             </View>
             <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{i.loaded_quantity}</Text>
             <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{i.sold_before + i.sold_quantity}</Text>
-            <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{i.expected_remaining}</Text>
+            <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{expectedHere}</Text>
             <View style={{ flex: 1.2, alignItems: 'flex-end' }}>
               {readOnly ? (
-                <Text style={[styles.value, { fontWeight: '600' }]}>{i.declared_remaining}</Text>
+                <Text style={[styles.value, { fontWeight: '600' }]}>{(i.by_device || {})[me] ?? i.declared_remaining}</Text>
               ) : (
                 <TextInput
                   value={declared[i.product_id] ?? ''}
@@ -1000,7 +1068,7 @@ function SectorStockCard({ flightId, online, locked, goTo }) {
         );
       })}
       <View style={[styles.rowBetween, { paddingVertical: 8 }]}>
-        <Text style={styles.label}>Total left</Text>
+        <Text style={styles.label}>{others.length ? 'Total on this iPad' : 'Total left'}</Text>
         <Text style={[styles.value, { fontWeight: '700' }]}>
           {position.items.reduce((a, i) => a + Number(declared[i.product_id] || 0), 0)} unit(s)
         </Text>
@@ -1008,8 +1076,8 @@ function SectorStockCard({ flightId, online, locked, goTo }) {
       {!readOnly ? (
         <>
           <Field label="Remarks (required if a figure differs from the system)" value={remarks} onChangeText={setRemarks} multiline placeholder="e.g. one can damaged" />
-          <Button title={busy ? 'Saving\u2026' : 'Confirm remaining stock'} onPress={submit} disabled={busy} />
-          {position.submitted && (
+          <Button title={busy ? 'Saving\u2026' : 'Confirm remaining stock on this iPad'} onPress={submit} disabled={busy} />
+          {position.my_submitted && (
             <Button title="Cancel" tone="ghost" small style={{ marginTop: 8 }} onPress={() => { setEditing(false); load(); }} />
           )}
         </>
@@ -1017,11 +1085,78 @@ function SectorStockCard({ flightId, online, locked, goTo }) {
         <>
           {!!position.remarks && <Text style={[styles.mono, { marginTop: 4 }]}>Remarks: {position.remarks}</Text>}
           {!locked && (
-            <Button title="Correct the remaining stock" tone="ghost" small style={{ marginTop: 8 }} onPress={() => setEditing(true)} />
+            <Button title="Correct this iPad's count" tone="ghost" small style={{ marginTop: 8 }} onPress={() => setEditing(true)} />
           )}
-          <Button title="Go to Sales to start the second flight" tone="secondary" style={{ marginTop: 8 }} onPress={() => goTo?.('crew')} />
         </>
       )}
+    </Card>
+  );
+}
+
+/** The last sector: the final stock return is on the Sync page (per iPad). */
+function FinalReturnCard({ flightId, online, goTo, user }) {
+  const [trip, setTrip] = useState(null);
+  useEffect(() => {
+    if (!online) return;
+    api(`/flights/${flightId}/trip-progress`).then(setTrip).catch(() => setTrip(null));
+  }, [flightId, online]);
+  const done = trip && ['PENDING', 'APPROVED'].includes(trip.stock_return);
+  const mine = trip?.my_stock_return_done;
+  const waiting = (trip?.stock_return_waiting_for || []).filter((d) => d !== user?.employee_id);
+  return (
+    <Card>
+      <SectionTitle
+        title="1. Final stock return"
+        description={done
+          ? 'Both iPads have submitted the final stock return. It is with the Inventory Supervisor.'
+          : mine
+            ? `Your part is in. Waiting for ${waiting.join(', ')} to submit its part.`
+            : 'Each iPad submits what is left on it; the two counts are added together and go to Inventory.'}
+        right={<Pill label={done ? 'Submitted' : mine ? 'Waiting for other iPad' : 'To submit'} tone={done ? 'success' : mine ? 'info' : 'warning'} />}
+      />
+      {!done && !mine && <Button title="Open the final stock return" tone="secondary" onPress={() => goTo?.('sync')} />}
+    </Card>
+  );
+}
+
+/** What this sector earned and how it is shared (7.11). */
+function CommissionCard({ flightId, online, user }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  useEffect(() => {
+    if (!online) return;
+    api(`/flights/${flightId}/commission`).then((d) => { setData(d); setError(null); }).catch((e) => setError(e.message));
+  }, [flightId, online]);
+  if (!online) return null;
+  if (error) return <Card><Banner tone="danger" message={error} /></Card>;
+  if (!data) return null;
+  const s = data.sector || {};
+  return (
+    <Card>
+      <SectionTitle
+        title="2. Commission on this sector"
+        description={`${Math.round((data.commission_rate || 0.1) * 100)}% of product sales is shared equally by the ${s.member_count || 0} crew on this sector; `
+          + 'combo commission goes to whoever sold the combo.'}
+        right={<Pill label={npr(data.total_commission_npr)} tone="success" />}
+      />
+      <View style={[styles.wrap, { marginBottom: 8 }]}>
+        <Pill label={`Product sales ${npr(s.product_revenue_npr || 0)}`} tone="muted" />
+        <Pill label={`Pool ${npr(s.commission_pool_npr || 0)} \u00f7 ${s.member_count || 0} = ${npr(s.share_npr || 0)} each`} tone="info" />
+        {!!s.combo_revenue_npr && <Pill label={`Combo sales ${npr(s.combo_revenue_npr)} \u2192 ${npr(s.combo_commission_npr)} commission`} tone="warning" />}
+      </View>
+      {data.members.map((m) => (
+        <View key={m.crew_member_id} style={[styles.rowBetween, { paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: COLORS.surfaceAlt }]}>
+          <View style={{ flex: 1 }}>
+            <Text style={{ fontSize: 13, color: COLORS.text }}>{m.name}</Text>
+            <Text style={styles.mono}>
+              share {npr(m.share_npr)}{m.combo_commission_npr ? ` + combo ${npr(m.combo_commission_npr)}` : ''}
+            </Text>
+          </View>
+          <Text style={[styles.value, { fontWeight: '700' }]}>{npr(m.total_npr)}</Text>
+        </View>
+      ))}
+      {!data.members.length && <Text style={styles.empty}>No crew recorded on this sector.</Text>}
+      <Text style={[styles.mono, { marginTop: 6 }]}>Recorded for Management and the administrator. Next: the forms below.</Text>
     </Card>
   );
 }
@@ -1050,25 +1185,25 @@ function SectorStockList() {
           <Pressable onPress={() => toggle(c.flight_id)} style={[styles.listRow, { paddingVertical: 12 }]}>
             <View style={styles.rowBetween}>
               <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text, flex: 1 }}>
-                {c.flight_number} \u00b7 {c.origin}\u2192{c.destination} \u00b7 {c.flight_date}
+                {c.flight_number} · {c.origin}→{c.destination} · {c.flight_date}
               </Text>
               <Pill label={c.total_variance ? `${c.total_variance > 0 ? '+' : ''}${c.total_variance} vs system` : 'Matches system'}
                     tone={c.total_variance ? 'warning' : 'success'} />
             </View>
             <Text style={styles.mono}>
-              {c.total_declared} unit(s) left \u00b7 confirmed by {c.submitted_by} \u00b7 {String(c.submitted_at || '').replace('T', ' ').slice(0, 16)}
+              {c.total_declared} unit(s) left · confirmed by {c.submitted_by} · {String(c.submitted_at || '').replace('T', ' ').slice(0, 16)}
             </Text>
             {!!c.remarks && <RemarkLine label="Crew remarks" text={c.remarks} />}
           </Pressable>
           {open === c.flight_id && (
             <View style={{ paddingHorizontal: 8, paddingBottom: 10 }}>
-              {!detail && <Text style={styles.mono}>Loading\u2026</Text>}
+              {!detail && <Text style={styles.mono}>Loading…</Text>}
               {!!detail?.error && <Banner tone="danger" message={detail.error} />}
               {!!detail?.items && detail.items.map((i) => (
                 <View key={i.product_id} style={[styles.rowBetween, { paddingVertical: 4 }]}>
                   <Text style={{ fontSize: 13, color: COLORS.text, flex: 2 }}>{i.product_name}</Text>
                   <Text style={[styles.mono, { flex: 2, textAlign: 'right' }]}>
-                    loaded {i.loaded_quantity} \u00b7 sold {i.sold_before + i.sold_quantity} \u00b7 should be {i.expected_remaining} \u00b7 left {i.declared_remaining}
+                    loaded {i.loaded_quantity} · sold {i.sold_before + i.sold_quantity} · should be {i.expected_remaining} · left {i.declared_remaining}
                     {i.variance ? ` (${i.variance > 0 ? '+' : ''}${i.variance})` : ''}
                   </Text>
                 </View>

@@ -45,7 +45,7 @@ export default function InventoryScreen({ user }) {
       {message && <Notice message={message} />}
 
       {tab === 'flights' && <FlightsTab notify={setMessage} />}
-      {tab === 'products' && <ProductsTab notify={setMessage} />}
+      {tab === 'products' && <ProductsTab notify={setMessage} user={user} />}
       {tab === 'load' && <LoadTab notify={setMessage} />}
       {tab === 'groups' && <GroupsTab notify={setMessage} user={user} />}
       {tab === 'bundles' && canBundle && <BundlesTab notify={setMessage} user={user} />}
@@ -347,7 +347,7 @@ function GroupsTab({ notify, user }) {
   const [trips, setTrips] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [dutyGroups, setDutyGroups] = useState([]);
-  const [assign, setAssign] = useState({ root_id: null, crew_account: '' });
+  const [assign, setAssign] = useState({ root_id: null, crew_account: '', crew_account_2: '' });
   const [picker, setPicker] = useState(null);
 
   const load = useCallback(async () => {
@@ -369,11 +369,11 @@ function GroupsTab({ notify, user }) {
     try {
       const result = await api(`/trips/${assign.root_id}/assign`, {
         method: 'POST',
-        body: { crew_account: assign.crew_account },
+        body: { crew_account: assign.crew_account, crew_account_2: assign.crew_account_2 || null },
       });
       notify({
         tone: 'success',
-        text: `${result.route} assigned to ${assign.crew_account}. The crew enter their own `
+        text: `${result.route} assigned to ${(result.devices || [assign.crew_account]).join(' and ')}. The crew enter their own `
           + 'names on the iPad at the start of each sector.',
       });
       load();
@@ -388,8 +388,8 @@ function GroupsTab({ notify, user }) {
     <>
       <Card>
         <SectionTitle
-          title="Assign the OBS iPad to a trip"
-          description="One device works the whole trip, both sectors. Who sells is decided on board."
+          title="Assign the OBS iPads to a trip"
+          description="Two iPads work the whole trip, both sectors; both sell and both confirm the remaining stock. Who sells is decided on board."
         />
         <Select
           label="Trip"
@@ -410,22 +410,30 @@ function GroupsTab({ notify, user }) {
             </View>
 
             <Select
-              label="OBS iPad account"
+              label="OBS iPad 1"
               valueLabel={assign.crew_account
                 ? `${assign.crew_account} — ${accounts.find((a) => a.employee_id === assign.crew_account)?.name || ''}`
                 : null}
-              placeholder="Select the device working this trip"
+              placeholder="Select the first device"
               onPress={() => setPicker('crew_account')}
+            />
+            <Select
+              label="OBS iPad 2"
+              valueLabel={assign.crew_account_2
+                ? `${assign.crew_account_2} — ${accounts.find((a) => a.employee_id === assign.crew_account_2)?.name || ''}`
+                : null}
+              placeholder="Select the second device"
+              onPress={() => setPicker('crew_account_2')}
             />
 
             <Button
-              title="Assign device to trip"
+              title={assign.crew_account_2 ? 'Assign both devices to trip' : 'Assign device to trip'}
               onPress={saveAssignment}
-              disabled={!assign.crew_account}
+              disabled={!assign.crew_account || (!!assign.crew_account_2 && assign.crew_account_2 === assign.crew_account)}
             />
             <Text style={[styles.mono, { marginTop: 6 }]}>
-              Crew names are no longer set here. At the start of each sector the crew pick
-              themselves from the roster on the iPad, and every sale records which of them made it.
+              An iPad may be rostered to more than one trip on a day; it sees the next trip once the
+              current one is finished with “Finish whole flight”. Crew names are picked on the iPad.
             </Text>
           </>
         )}
@@ -475,24 +483,26 @@ function GroupsTab({ notify, user }) {
           value: t.root_id,
           label: t.route,
           sub: `${t.flight_date} · ${t.flight_numbers}`
-            + (t.fully_assigned ? ' · device assigned' : ''),
+            + (t.devices?.length ? ` · ${t.devices.join(' + ')}` : ''),
         }))}
         selectedValue={assign.root_id}
         onSelect={(value) => {
           const trip = trips.find((t) => t.root_id === value);
-          setAssign({ root_id: value, crew_account: trip?.outbound?.crew_account || '' });
+          const devices = String(trip?.outbound?.crew_account || '').split(',').filter(Boolean);
+          setAssign({ root_id: value, crew_account: devices[0] || '', crew_account_2: devices[1] || '' });
           setPicker(null);
         }}
         onClose={() => setPicker(null)}
       />
       <OptionModal
-        visible={picker === 'crew_account'}
-        title="OBS iPad account"
-        options={accounts.map((a) => ({
-          value: a.employee_id, label: a.employee_id, sub: a.name,
-        }))}
-        selectedValue={assign.crew_account}
-        onSelect={(value) => { setAssign({ ...assign, crew_account: value }); setPicker(null); }}
+        visible={picker === 'crew_account' || picker === 'crew_account_2'}
+        title={picker === 'crew_account_2' ? 'OBS iPad 2' : 'OBS iPad 1'}
+        options={[
+          ...(picker === 'crew_account_2' ? [{ value: '', label: 'No second device', sub: 'One iPad works this trip' }] : []),
+          ...accounts.map((a) => ({ value: a.employee_id, label: a.employee_id, sub: a.name })),
+        ]}
+        selectedValue={assign[picker] || ''}
+        onSelect={(value) => { setAssign({ ...assign, [picker]: value }); setPicker(null); }}
         onClose={() => setPicker(null)}
       />
     </>
@@ -742,10 +752,52 @@ function BundlesTab({ notify, user }) {
  * from the warehouse, either as an existing item or via a new-product line on
  * a purchase order, which creates the product once the order is approved.
  */
-function ProductsTab({ notify }) {
+function ProductsTab({ notify, user }) {
+  const canEditPrice = user?.permissions?.includes('price_edit');
   const [products, setProducts] = useState([]);
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState('');
+  // Price change with remarks (7.10): one product at a time.
+  const [pricing, setPricing] = useState(null);       // { product_id, price, remarks }
+  const [history, setHistory] = useState({});         // product_id -> rows (when opened)
+  const [saving, setSaving] = useState(false);
+
+  async function savePrice() {
+    const price = Number(String(pricing.price).replace(/,/g, ''));
+    if (Number.isNaN(price) || price < 0) {
+      return notify({ tone: 'danger', text: 'Enter the new price as a number.' });
+    }
+    if (!pricing.remarks.trim()) {
+      return notify({ tone: 'danger', text: 'Remarks are mandatory for a price change.' });
+    }
+    const sure = await confirm({
+      title: 'Change the selling price?',
+      message: `${pricing.name}: ${npr(pricing.old)} \u2192 ${npr(price)}.\n\nSales already recorded keep the price the passenger paid. The change and your remarks go to the audit log.`,
+      confirmText: 'Change price',
+    });
+    if (!sure) return;
+    setSaving(true);
+    try {
+      await api(`/products/${pricing.product_id}/price`, { method: 'PUT', body: { selling_price: price, remarks: pricing.remarks.trim() } });
+      notify({ tone: 'success', text: `${pricing.name} now sells at ${npr(price)}.` });
+      setPricing(null);
+      setHistory((h) => ({ ...h, [pricing.product_id]: undefined }));
+      load();
+    } catch (error) {
+      notify({ tone: 'danger', text: error.message });
+    }
+    setSaving(false);
+  }
+
+  async function toggleHistory(productId) {
+    if (history[productId]) { setHistory((h) => ({ ...h, [productId]: undefined })); return; }
+    try {
+      const rows = await api(`/products/${productId}/price-history`);
+      setHistory((h) => ({ ...h, [productId]: rows }));
+    } catch (error) {
+      notify({ tone: 'danger', text: error.message });
+    }
+  }
 
   const load = useCallback(async () => {
     try {
@@ -800,6 +852,40 @@ function ProductsTab({ notify }) {
               {product.product_code} · {product.category} · {npr(product.selling_price)} ·
               {' '}{product.quantity} {product.unit} in warehouse · {product.on_aircraft} on aircraft
             </Text>
+            <View style={[styles.row, styles.gap8, { marginTop: 6 }]}>
+              {canEditPrice && pricing?.product_id !== product.product_id && (
+                <Button title="Edit price" tone="ghost" small
+                  onPress={() => setPricing({ product_id: product.product_id, name: product.product_name, old: product.selling_price, price: String(product.selling_price), remarks: '' })} />
+              )}
+              <Button title={history[product.product_id] ? 'Hide price history' : 'Price history'} tone="ghost" small
+                onPress={() => toggleHistory(product.product_id)} />
+            </View>
+            {pricing?.product_id === product.product_id && (
+              <View style={{ marginTop: 8, padding: 10, borderRadius: 8, backgroundColor: COLORS.surfaceAlt }}>
+                <Field label={`New selling price (NPR) \u00b7 now ${npr(product.selling_price)}`} value={pricing.price}
+                  onChangeText={(v) => setPricing({ ...pricing, price: v.replace(/[^0-9.]/g, '') })} keyboardType="decimal-pad" />
+                <Field label="Remarks (mandatory)" value={pricing.remarks} multiline
+                  onChangeText={(v) => setPricing({ ...pricing, remarks: v })} placeholder="e.g. new supplier price from 1 December" />
+                <View style={[styles.row, styles.gap8]}>
+                  <Button title="Cancel" tone="ghost" style={styles.flex1} onPress={() => setPricing(null)} disabled={saving} />
+                  <Button title={saving ? 'Saving\u2026' : 'Save price'} style={styles.flex1} onPress={savePrice}
+                    disabled={saving || !pricing.remarks.trim() || pricing.price === ''} />
+                </View>
+              </View>
+            )}
+            {!!history[product.product_id] && (
+              <View style={{ marginTop: 6 }}>
+                {!history[product.product_id].length && <Text style={styles.mono}>No price change recorded.</Text>}
+                {history[product.product_id].map((h) => (
+                  <View key={h.id}>
+                    <Text style={styles.mono}>
+                      {String(h.changed_at || '').replace('T', ' ').slice(0, 16)} · {npr(h.old_price)} → {npr(h.new_price)} · by {h.changed_by}
+                    </Text>
+                    <RemarkLine text={h.remarks} style={{ marginTop: 2, marginBottom: 4 }} />
+                  </View>
+                ))}
+              </View>
+            )}
           </View>
         ))}
         {!shown.length && <Text style={styles.empty}>No product matches that search.</Text>}

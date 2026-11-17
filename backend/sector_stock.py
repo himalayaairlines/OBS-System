@@ -1,12 +1,12 @@
-"""Remaining stock after each sector (7.9).
+"""Remaining stock after each sector (7.9, per iPad since 7.11).
 
-After a sector is finished and its forms are saved, the crew confirm what is
-left in the trolley before the next sector starts (or before the final stock
-return on a one-way flight / the last sector). The figures are calculated:
-loaded for the trip, minus everything sold up to and including this sector,
-minus wastage. The crew may correct a line to what they can actually see;
-the system figure is kept beside it. Management and the administrator read
-every count. The final stock return (reconciliations) is unchanged.
+After a sector is finished, each iPad confirms what is left in its own part
+of the trolley before the next sector starts (the last sector ends with the
+final stock return instead). The figures are calculated for the whole trip:
+loaded, minus everything sold up to and including this sector, minus wastage.
+Each device types what it can see; the sum of the devices is the sector's
+remaining stock, and the system figure is kept beside it. Management and the
+administrator read every count.
 """
 
 from fastapi import HTTPException
@@ -14,10 +14,12 @@ from fastapi import HTTPException
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sector_stock_counts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    flight_id INTEGER NOT NULL UNIQUE,
+    flight_id INTEGER NOT NULL,
+    device TEXT NOT NULL DEFAULT '',
     submitted_by TEXT NOT NULL,
     submitted_at TEXT NOT NULL,
     remarks TEXT,
+    UNIQUE(flight_id, device),
     FOREIGN KEY(flight_id) REFERENCES flights(id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS sector_stock_items (
@@ -39,6 +41,24 @@ CREATE TABLE IF NOT EXISTS sector_stock_items (
 
 def initialize_sector_stock(connection):
     connection.executescript(SCHEMA)
+    # 7.9 kept one count per sector; 7.11 keeps one per iPad.
+    cols = [r[1] for r in connection.execute("PRAGMA table_info('sector_stock_counts')").fetchall()]
+    if "device" not in cols:
+        connection.executescript("""
+            ALTER TABLE sector_stock_counts RENAME TO sector_stock_counts_old;
+        """)
+        connection.executescript(SCHEMA)
+        connection.executescript("""
+            INSERT INTO sector_stock_counts(id,flight_id,device,submitted_by,submitted_at,remarks)
+                SELECT id,flight_id,submitted_by,submitted_by,submitted_at,remarks FROM sector_stock_counts_old;
+            DROP TABLE sector_stock_counts_old;
+        """)
+
+
+def devices_for(connection, flight_id: int) -> list[str]:
+    """The iPad accounts assigned to this leg (one or two)."""
+    return [r["crew_account"] for r in connection.execute(
+        "SELECT crew_account FROM flight_assignments WHERE flight_id=? ORDER BY id", (flight_id,))]
 
 
 def _sold_by_product(connection, flight_ids):
@@ -64,11 +84,18 @@ def sector_count(connection, legs: list[dict], leg_id: int) -> dict:
     sold_before = _sold_by_product(connection, before_ids)
     sold_here = _sold_by_product(connection, [leg_id])
 
-    header = connection.execute("SELECT * FROM sector_stock_counts WHERE flight_id=?", (leg_id,)).fetchone()
-    saved = {}
-    if header:
-        saved = {r["product_id"]: dict(r) for r in connection.execute(
-            "SELECT * FROM sector_stock_items WHERE count_id=?", (header["id"],)).fetchall()}
+    devices = devices_for(connection, leg_id)
+    headers = {r["device"]: dict(r) for r in connection.execute(
+        "SELECT * FROM sector_stock_counts WHERE flight_id=?", (leg_id,)).fetchall()}
+    # declared per product = the sum of what each iPad that has confirmed typed in.
+    saved = {}          # product_id -> summed declared
+    per_device = {}     # product_id -> {device: declared}
+    for device, header in headers.items():
+        for r in connection.execute("SELECT * FROM sector_stock_items WHERE count_id=?", (header["id"],)):
+            saved[r["product_id"]] = saved.get(r["product_id"], 0) + int(r["declared_remaining"])
+            per_device.setdefault(r["product_id"], {})[device] = int(r["declared_remaining"])
+    submitted_devices = [d for d in devices if d in headers] + [d for d in headers if d not in devices]
+    all_in = bool(devices) and all(d in headers for d in devices)
 
     items = []
     for row in connection.execute(
@@ -79,21 +106,25 @@ def sector_count(connection, legs: list[dict], leg_id: int) -> dict:
         before = sold_before.get(pid, 0)
         here = sold_here.get(pid, 0)
         expected = int(row["loaded_quantity"]) - before - here - int(row["wasted_quantity"] or 0)
-        line = saved.get(pid)
-        declared = int(line["declared_remaining"]) if line else expected
+        declared = expected if not headers else saved.get(pid, 0)
         items.append({
             "product_id": pid, "product_code": row["product_code"], "product_name": row["product_name"],
             "unit": row["unit"], "loaded_quantity": int(row["loaded_quantity"]),
             "sold_before": before, "sold_quantity": here, "wasted_quantity": int(row["wasted_quantity"] or 0),
             "expected_remaining": expected, "declared_remaining": declared, "variance": declared - expected,
+            "by_device": per_device.get(pid, {}),
         })
+    last = max(headers.values(), key=lambda h: h["submitted_at"]) if headers else None
     return {
         "flight_id": leg_id, "segment": index + 1, "segments": len(legs),
         "flight_number": leg["flight_number"], "origin": leg["origin"], "destination": leg["destination"],
         "flight_date": leg["flight_date"],
-        "submitted": bool(header), "submitted_by": header["submitted_by"] if header else None,
-        "submitted_at": header["submitted_at"] if header else None,
-        "remarks": header["remarks"] if header else None,
+        "devices": devices, "submitted_devices": submitted_devices,
+        "waiting_for": [d for d in devices if d not in headers],
+        "submitted": all_in, "submitted_by": last["submitted_by"] if last else None,
+        "submitted_at": last["submitted_at"] if last else None,
+        "remarks": "; ".join(f"{d}: {h['remarks']}" for d, h in headers.items() if h.get("remarks")) or None,
+        "device_remarks": {d: h.get("remarks") for d, h in headers.items()},
         "items": items,
         "total_expected": sum(i["expected_remaining"] for i in items),
         "total_declared": sum(i["declared_remaining"] for i in items),
@@ -102,10 +133,17 @@ def sector_count(connection, legs: list[dict], leg_id: int) -> dict:
     }
 
 
-def save_sector_count(connection, legs, leg_id, lines: dict, remarks, by, now) -> dict:
-    """Store the crew's confirmation. May be re-submitted until the sector's forms lock."""
+def save_sector_count(connection, legs, leg_id, lines: dict, remarks, by, now, device=None) -> dict:
+    """Store one iPad's confirmation. May be re-submitted until the sector locks.
+
+    `lines` holds what THIS device can see. A product it leaves out counts as 0
+    on this device once any line is typed; with no lines at all the device
+    confirms the system figure (less what the other device already declared).
+    """
+    device = device or by
     position = sector_count(connection, legs, leg_id)
-    header = connection.execute("SELECT id FROM sector_stock_counts WHERE flight_id=?", (leg_id,)).fetchone()
+    header = connection.execute("SELECT id FROM sector_stock_counts WHERE flight_id=? AND device=?",
+                                (leg_id, device)).fetchone()
     if header:
         count_id = header["id"]
         connection.execute("UPDATE sector_stock_counts SET submitted_by=?, submitted_at=?, remarks=? WHERE id=?",
@@ -113,10 +151,13 @@ def save_sector_count(connection, legs, leg_id, lines: dict, remarks, by, now) -
         connection.execute("DELETE FROM sector_stock_items WHERE count_id=?", (count_id,))
     else:
         count_id = connection.execute(
-            "INSERT INTO sector_stock_counts(flight_id,submitted_by,submitted_at,remarks) VALUES (?,?,?,?)",
-            (leg_id, by, now, remarks)).lastrowid
+            "INSERT INTO sector_stock_counts(flight_id,device,submitted_by,submitted_at,remarks) VALUES (?,?,?,?,?)",
+            (leg_id, device, by, now, remarks)).lastrowid
+    others = [d for d in position["submitted_devices"] if d != device]
     for item in position["items"]:
-        declared = int(lines.get(item["product_id"], item["expected_remaining"]))
+        other_total = sum(v for d, v in item["by_device"].items() if d != device)
+        default = item["expected_remaining"] - other_total if others else item["expected_remaining"]
+        declared = int(lines.get(item["product_id"], max(0, default) if not lines else 0))
         if declared < 0:
             raise HTTPException(status_code=400, detail="A remaining quantity cannot be negative.")
         connection.execute(
@@ -128,5 +169,12 @@ def save_sector_count(connection, legs, leg_id, lines: dict, remarks, by, now) -
     return sector_count(connection, legs, leg_id)
 
 
-def sector_count_submitted(connection, leg_id: int) -> bool:
-    return bool(connection.execute("SELECT 1 FROM sector_stock_counts WHERE flight_id=?", (leg_id,)).fetchone())
+def sector_count_submitted(connection, leg_id: int, device: str | None = None) -> bool:
+    """Every assigned iPad has confirmed (or this one, when `device` is given)."""
+    if device:
+        return bool(connection.execute("SELECT 1 FROM sector_stock_counts WHERE flight_id=? AND device=?",
+                                       (leg_id, device)).fetchone())
+    devices = devices_for(connection, leg_id)
+    done = {r["device"] for r in connection.execute(
+        "SELECT device FROM sector_stock_counts WHERE flight_id=?", (leg_id,))}
+    return bool(devices) and all(d in done for d in devices) if devices else bool(done)

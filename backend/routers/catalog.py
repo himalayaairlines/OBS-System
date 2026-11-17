@@ -27,6 +27,11 @@ class ProductIn(BaseModel):
     active: bool = True
 
 
+class PriceIn(BaseModel):
+    selling_price: float = Field(ge=0)
+    remarks: str = Field(min_length=1, max_length=500)
+
+
 class BundleItemIn(BaseModel):
     product_id: int
     quantity: int = Field(gt=0)
@@ -108,6 +113,49 @@ def update_product(product_id: int, data: ProductIn, user: dict = Depends(requir
     log_action(user, "PRODUCT", "UPDATE_PRODUCT", f"Updated product {data.product_code}.",
                "product", product_id)
     return dict(row)
+
+
+@router.put("/products/{product_id}/price")
+def change_price(product_id: int, data: PriceIn, user: dict = Depends(requires("price_edit"))):
+    """Change the selling price with mandatory remarks (7.10). Inventory,
+    Management and the administrator. The old price is kept in the history
+    and already-recorded sales keep the price the passenger paid."""
+    remarks = data.remarks.strip()
+    if not remarks:
+        raise HTTPException(status_code=400, detail="Remarks are mandatory when changing a price.")
+    connection = get_connection()
+    try:
+        row = connection.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Product not found.")
+        old = float(row["selling_price"])
+        if abs(old - data.selling_price) < 0.005:
+            raise HTTPException(status_code=400, detail="That is already the selling price.")
+        now = now_iso()
+        connection.execute("UPDATE products SET selling_price=? WHERE id=?", (data.selling_price, product_id))
+        connection.execute(
+            "INSERT INTO product_price_history(product_id,old_price,new_price,changed_by,changed_at,remarks) VALUES (?,?,?,?,?,?)",
+            (product_id, old, data.selling_price, user["employee_id"], now, remarks))
+        connection.commit()
+        updated = dict(connection.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone())
+    finally:
+        connection.close()
+    log_action(user, "PRODUCT", "CHANGE_PRICE",
+               f"Price of {row['product_code']} {row['product_name']} changed from NPR {old:,.2f} to "
+               f"NPR {data.selling_price:,.2f}. Remarks: {remarks}", "product", product_id,
+               metadata={"old_price": old, "new_price": data.selling_price, "remarks": remarks})
+    return updated
+
+
+@router.get("/products/{product_id}/price-history")
+def price_history(product_id: int, user: dict = Depends(current_user)):
+    connection = get_connection()
+    try:
+        return [dict(r) for r in connection.execute(
+            "SELECT * FROM product_price_history WHERE product_id=? ORDER BY changed_at DESC, id DESC",
+            (product_id,)).fetchall()]
+    finally:
+        connection.close()
 
 
 @router.delete("/products/{product_id}")

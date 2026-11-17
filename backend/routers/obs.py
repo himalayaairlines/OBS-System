@@ -206,12 +206,11 @@ def _trip_devices(connection, root_id):
     """
     accounts = []
     for leg in trip_legs(connection, root_id):
-        row = connection.execute(
-            "SELECT crew_account FROM flight_assignments WHERE flight_id=?", (leg,),
-        ).fetchone()
-        if row and row["crew_account"]:
-            accounts.append(row["crew_account"])
-    return sorted(set(accounts))
+        for row in connection.execute(
+                "SELECT crew_account FROM flight_assignments WHERE flight_id=? ORDER BY id", (leg,)):
+            if row["crew_account"] and row["crew_account"] not in accounts:
+                accounts.append(row["crew_account"])
+    return accounts
 
 
 def _trip_label(connection, root_id):
@@ -253,6 +252,17 @@ def _recon(connection, recon_id=None, flight_id=None):
     recon["round_trip"] = len(legs) > 1
 
     recon["devices"] = _trip_devices(connection, root_id)
+    device_rows = {r["device"]: dict(r) for r in connection.execute(
+        "SELECT * FROM stock_return_devices WHERE reconciliation_id=?", (recon["id"],)).fetchall()}
+    recon["submitted_devices"] = [d for d in recon["devices"] if d in device_rows] \
+        + [d for d in device_rows if d not in recon["devices"]]
+    recon["waiting_for"] = [] if "*" in device_rows else [d for d in recon["devices"] if d not in device_rows]
+    recon["device_remarks"] = {d: r.get("remarks") for d, r in device_rows.items()}
+    by_device = {}
+    for r in connection.execute(
+            "SELECT device, product_id, declared_remaining FROM stock_return_device_items WHERE reconciliation_id=?",
+            (recon["id"],)):
+        by_device.setdefault(r["product_id"], {})[r["device"]] = int(r["declared_remaining"])
 
     overrides = {
         r["product_id"]: dict(r)
@@ -285,6 +295,7 @@ def _recon(connection, recon_id=None, flight_id=None):
             "overridden": bool(override and override["override_by"]),
             "override_by": override["override_by"] if override else None,
             "override_remarks": override["override_remarks"] if override else None,
+            "by_device": by_device.get(line["product_id"], {}),
         })
     recon["items"] = items
     recon["total_expected"] = sum(i["expected_remaining"] for i in items)
@@ -405,6 +416,7 @@ def _pending_entry(connection, root_id, user):
             "origin": legs[0]["origin"],
             "destination": legs[0]["destination"],
             "devices": devices,
+            "submitted_devices": [], "waiting_for": list(devices), "device_remarks": {},
             "review_remarks": None,
             "items": items,
             "total_expected": sum(i["expected_remaining"] for i in items),
@@ -413,7 +425,8 @@ def _pending_entry(connection, root_id, user):
             "has_variance": False,
         }
 
-    recon["submitted"] = recon["status"] != "NOT_SUBMITTED"
+    recon["submitted"] = recon["status"] not in ("NOT_SUBMITTED", "WAITING")
+    recon["my_submitted"] = user["employee_id"] in recon.get("submitted_devices", [])
     return recon
 
 
@@ -424,10 +437,13 @@ def submit_reconciliation(
 ):
     """Declare what physically came off the aircraft at the end of the trip.
 
-    The trolley is loaded once for the whole trip and worked from one iPad, so
-    there is a single count, taken after the last sector is finished. The crew
-    type what they can actually see; any line they leave out is taken as
-    agreeing with the system figure.
+    7.11: two iPads work the trip and each holds part of the trolley, so each
+    device declares what IT can see; the trip's remaining stock is the sum of
+    the devices. The return waits (status WAITING) until every assigned iPad
+    has declared, then goes to the Inventory Supervisor (PENDING). A device
+    that sends no lines at all confirms the system figure less what the other
+    device declared. A supervisor or manager submitting is taken as the final
+    total (device "*").
     """
     connection = get_connection()
     try:
@@ -456,8 +472,10 @@ def submit_reconciliation(
                 status_code=400,
                 detail="This stock return has been approved and can no longer be changed.",
             )
-        # Submitted once, it waits for the Inventory Supervisor (7.5). The crew
-        # count again only if it is sent back.
+        is_device = user["employee_id"] in devices
+        device = user["employee_id"] if is_device else "*"
+        # Once every iPad has declared it waits for the Inventory Supervisor;
+        # the crew count again only if it is sent back.
         if header and header["status"] == "PENDING" \
                 and "reconcile_approve" not in permissions_for(user["role"]):
             raise HTTPException(
@@ -468,27 +486,62 @@ def submit_reconciliation(
         now = now_iso()
         if header:
             recon_id = header["id"]
-            connection.execute(
-                """UPDATE reconciliations SET status='PENDING', submitted_by=?, submitted_at=?,
-                       review_remarks=NULL WHERE id=?""",
-                (user["employee_id"], now, recon_id),
-            )
+            if header["status"] == "REJECTED":
+                # Sent back: every device counts again.
+                connection.execute("DELETE FROM stock_return_devices WHERE reconciliation_id=?", (recon_id,))
+                connection.execute("DELETE FROM stock_return_device_items WHERE reconciliation_id=?", (recon_id,))
         else:
             cur = connection.execute(
                 """INSERT INTO reconciliations(flight_id,submitted_by,submitted_at,status)
-                   VALUES (?,?,?,'PENDING')""",
+                   VALUES (?,?,?,'WAITING')""",
                 (root_id, user["employee_id"], now),
             )
             recon_id = cur.lastrowid
 
-        # Store the crew's count against the system figure, line by line.
         expected_by_product = {
             line["product_id"]: line for line in _inventory_rows(connection, root_id)
         }
-        declared_by_product = {line.product_id: line.declared_remaining for line in data.lines}
+        # This device's own lines. No lines at all = confirm the system figure
+        # less what the other device(s) already declared.
+        others = {}
+        for r in connection.execute(
+                "SELECT device, product_id, declared_remaining FROM stock_return_device_items "
+                "WHERE reconciliation_id=? AND device<>?", (recon_id, device)):
+            others[r["product_id"]] = others.get(r["product_id"], 0) + int(r["declared_remaining"])
+        if device == "*":
+            others = {}
+            connection.execute("DELETE FROM stock_return_device_items WHERE reconciliation_id=?", (recon_id,))
+            connection.execute("DELETE FROM stock_return_devices WHERE reconciliation_id=?", (recon_id,))
+        typed = {line.product_id: line.declared_remaining for line in data.lines}
+        connection.execute(
+            """INSERT INTO stock_return_devices(reconciliation_id,device,submitted_at,remarks) VALUES (?,?,?,?)
+               ON CONFLICT(reconciliation_id,device) DO UPDATE SET submitted_at=excluded.submitted_at,
+               remarks=excluded.remarks""",
+            (recon_id, device, now, (data.remarks or "").strip() or None))
         for product_id, line in expected_by_product.items():
             expected = line["remaining_quantity"]
-            declared = declared_by_product.get(product_id, expected)
+            mine = typed.get(product_id, max(0, expected - others.get(product_id, 0)) if not typed else 0)
+            connection.execute(
+                """INSERT INTO stock_return_device_items(reconciliation_id,device,product_id,declared_remaining)
+                   VALUES (?,?,?,?) ON CONFLICT(reconciliation_id,device,product_id)
+                   DO UPDATE SET declared_remaining=excluded.declared_remaining""",
+                (recon_id, device, product_id, mine))
+
+        # The trip's declared figure is the sum of the devices.
+        submitted = {r["device"] for r in connection.execute(
+            "SELECT device FROM stock_return_devices WHERE reconciliation_id=?", (recon_id,))}
+        complete = "*" in submitted or (bool(devices) and all(d in submitted for d in devices))
+        connection.execute(
+            """UPDATE reconciliations SET status=?, submitted_by=?, submitted_at=?, review_remarks=NULL WHERE id=?""",
+            ("PENDING" if complete else "WAITING", user["employee_id"], now, recon_id))
+        totals = {}
+        for r in connection.execute(
+                "SELECT product_id, SUM(declared_remaining) q FROM stock_return_device_items "
+                "WHERE reconciliation_id=? GROUP BY product_id", (recon_id,)):
+            totals[r["product_id"]] = int(r["q"] or 0)
+        for product_id, line in expected_by_product.items():
+            expected = line["remaining_quantity"]
+            declared = totals.get(product_id, expected)
             connection.execute(
                 """INSERT INTO reconciliation_items
                        (reconciliation_id,product_id,loaded_quantity,sold_quantity,
@@ -505,14 +558,16 @@ def submit_reconciliation(
             )
         connection.commit()
         result = _recon(connection, recon_id)
+        result["my_submitted"] = True
     finally:
         connection.close()
 
     variance_note = (f"{result['total_variance']:+d} unit(s) against the system figure."
                      if result["has_variance"] else "No variance.")
+    waiting = (f" Waiting for {', '.join(result['waiting_for'])}." if result.get("waiting_for") else "")
     log_action(user, "RECONCILIATION", "DECLARE_STOCK_RETURN",
-               f"Stock return declared for {result['flight_number']}: "
-               f"{result['total_declared']} unit(s) returning. {variance_note}"
+               f"Stock return declared for {result['flight_number']} by {device if device != '*' else user['employee_id']}: "
+               f"{result['total_declared']} unit(s) returning so far. {variance_note}{waiting}"
                + (f" Remarks: {data.remarks.strip()}" if (data.remarks or '').strip() else ""),
                "flight", root_id,
                metadata={"total_declared": result["total_declared"],

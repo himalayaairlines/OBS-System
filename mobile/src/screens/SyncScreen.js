@@ -165,6 +165,20 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
   // system shows what it expects to be left; the crew type what is actually
   // in the trolley, and the difference is the variance the supervisor reviews.
 
+  // What this iPad is expected to hold: the system figure less what the other
+  // iPad has already declared (7.11, two devices share the trolley).
+  function othersDeclared(trip, item) {
+    return Object.entries(item.by_device || {})
+      .filter(([device]) => device !== user.employee_id)
+      .reduce((sum, [, qty]) => sum + Number(qty || 0), 0);
+  }
+  function myDefault(trip, item) {
+    const others = othersDeclared(trip, item);
+    return (trip.submitted_devices || []).some((d) => d !== user.employee_id)
+      ? Math.max(0, item.expected_remaining - others)
+      : item.expected_remaining;
+  }
+
   async function confirmReturn(trip) {
     const sure = await confirm({
       title: 'Submit the stock return?',
@@ -177,7 +191,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
     const lines = trip.items.map((item) => ({
       product_id: item.product_id,
       declared_remaining: typed[item.product_id] === undefined || typed[item.product_id] === ''
-        ? item.expected_remaining
+        ? myDefault(trip, item)
         : Number(typed[item.product_id]),
     }));
     if (lines.some((l) => Number.isNaN(l.declared_remaining) || l.declared_remaining < 0)) {
@@ -198,26 +212,29 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
 
     try {
       const result = await api('/reconciliations', { method: 'POST', body: payload });
+      const waiting = (result.waiting_for || []).length;
       setMessage({
-        tone: result.has_variance ? 'warning' : 'success',
-        text: result.has_variance
-          ? `Submitted with a difference of ${result.total_variance} unit(s) against the system `
-            + 'figure. The Inventory Supervisor will review it.'
-          : `Submitted. ${result.total_declared} unit(s) go back to main inventory once the `
-            + 'Inventory Supervisor approves.',
+        tone: waiting ? 'info' : result.has_variance ? 'warning' : 'success',
+        text: waiting
+          ? `Your count is in. Waiting for ${result.waiting_for.join(', ')} to declare its part; the two counts are added together.`
+          : result.has_variance
+            ? `Submitted with a difference of ${result.total_variance} unit(s) against the system `
+              + 'figure. The Inventory Supervisor will review it.'
+            : `Submitted. ${result.total_declared} unit(s) go back to main inventory once the `
+              + 'Inventory Supervisor approves.',
       });
       loadPending();
 
-      // The last step is on the Sales page: Finish whole flight.
+      // Next: the commission and the forms on the Reports page, then Finish whole flight.
       if (goTo && isCrew) {
         const now = await confirm({
           title: 'Stock return submitted',
-          message: 'Last step: press \u201cFinish whole flight\u201d on the Sales page. After that '
-            + 'nothing on this trip can be changed.',
-          confirmText: 'Go to Sales',
+          message: 'Next: see this sector\u2019s commission and fill in the forms on the Reports page, '
+            + 'then press \u201cFinish whole flight\u201d on the Sales page.',
+          confirmText: 'Go to Reports',
           cancelText: 'Later',
         });
-        if (now) goTo('crew');
+        if (now) goTo('reports');
       }
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
@@ -318,9 +335,13 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
                 />
               </View>
               <Text style={styles.mono}>
-                {entry.flight_date} · declared by {entry.submitted_by || '—'}
+                {entry.flight_date} · declared by {(entry.submitted_devices || []).join(' + ') || entry.submitted_by || '—'}
                 {entry.has_variance ? ` · ${entry.total_variance} unit difference` : ' · matches the system'}
+                {(entry.waiting_for || []).length ? ` · waiting for ${entry.waiting_for.join(', ')}` : ''}
               </Text>
+              {(entry.submitted_devices || []).length > 1 && (
+                <Text style={styles.mono}>The Recorded column is the two iPads added together; each iPad's part is shown under the product.</Text>
+              )}
 
               <View style={[styles.rowBetween, { marginTop: 8, marginBottom: 2 }]}>
                 <Text style={[styles.label, { flex: 2, marginBottom: 0 }]}>Product</Text>
@@ -345,6 +366,11 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
                       {item.declared_remaining}
                     </Text>
                   </View>
+                  {Object.keys(item.by_device || {}).length > 1 && (
+                    <Text style={[styles.mono, { fontSize: 11 }]}>
+                      {Object.entries(item.by_device).map(([d, q]) => `${d}: ${q}`).join(' · ')}
+                    </Text>
+                  )}
                   {!!item.overridden && (
                     <RemarkLine label={`Corrected by ${item.override_by}`} text={item.override_remarks} style={{ marginTop: 2 }} />
                   )}
@@ -464,14 +490,17 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
                     </View>
                     <KeyValue label="Sector sales" value={npr(sector.revenue_npr)} />
                     <KeyValue
-                      label="Commission earned"
-                      value={npr(sector.commission_pool_npr)}
+                      label={`Pool \u00f7 ${sector.member_count} crew`}
+                      value={`${npr(sector.commission_pool_npr)} = ${npr(sector.share_npr || 0)} each`}
                       tone={COLORS.success}
                     />
+                    {!!sector.combo_commission_npr && (
+                      <KeyValue label="Combo commission" value={npr(sector.combo_commission_npr)} />
+                    )}
                     {sector.sellers.map((seller) => (
                       <View key={seller.crew_member_id} style={[styles.rowBetween, { paddingVertical: 2 }]}>
-                        <Text style={{ fontSize: 13, flex: 1 }}>{seller.name}</Text>
-                        <Text style={[styles.mono, { fontSize: 11 }]}>{npr(seller.sales_npr)}</Text>
+                        <Text style={{ fontSize: 13, flex: 1 }}>{seller.name} (combo)</Text>
+                        <Text style={[styles.mono, { fontSize: 11 }]}>{npr(seller.combo_sales_npr ?? seller.sales_npr)}</Text>
                       </View>
                     ))}
                   </View>
@@ -487,8 +516,9 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
 
       {isCrew && (
         pending.length ? pending.map((trip) => {
-          // Submitted and waiting for approval: read-only until sent back.
-          const locked = trip.submitted && trip.status !== 'REJECTED';
+          // This iPad has declared its part: read-only until sent back.
+          const locked = (trip.my_submitted || trip.submitted) && trip.status !== 'REJECTED';
+          const otherDevices = (trip.devices || []).filter((d) => d !== user.employee_id);
           return (
           <Card key={trip.flight_id}>
             <SectionTitle
@@ -509,6 +539,15 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
             {trip.status === 'REJECTED' && (
               <Banner tone="danger" message={`Sent back: ${trip.review_remarks || 'recount required'}`} />
             )}
+            {otherDevices.length > 0 && (
+              <Banner
+                tone="info"
+                message={`Two iPads share this trolley. Type what is left on THIS iPad; ${otherDevices.join(', ')} declares its own part and the two are added together. `
+                  + ((trip.waiting_for || []).length && !trip.waiting_for.includes(user.employee_id)
+                    ? `Waiting for ${trip.waiting_for.join(', ')}.`
+                    : (trip.submitted_devices || []).some((d) => d !== user.employee_id) ? 'The other iPad has already declared; the Expected column shows what should be left on this one.' : '')}
+              />
+            )}
 
             <View style={[styles.rowBetween, { marginBottom: 4 }]}>
               <Text style={[styles.label, { flex: 2, marginBottom: 0 }]}>Product</Text>
@@ -518,15 +557,17 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
             </View>
             {trip.items.map((item) => {
               const typed = (counts[trip.flight_id] || {})[item.product_id];
+              const mine = (item.by_device || {})[user.employee_id];
+              const expectedHere = myDefault(trip, item);
               const value = locked
-                ? String(item.declared_remaining ?? item.expected_remaining)
-                : typed === undefined ? String(item.expected_remaining) : typed;
-              const diff = Number(value || 0) - item.expected_remaining;
+                ? String(mine ?? item.declared_remaining ?? item.expected_remaining)
+                : typed === undefined ? String(expectedHere) : typed;
+              const diff = Number(value || 0) - expectedHere;
               return (
                 <View key={item.product_id} style={[styles.rowBetween, { paddingVertical: 4 }]}>
                   <Text style={{ flex: 2, fontSize: 13 }} numberOfLines={1}>{item.product_name}</Text>
                   <Text style={{ width: 48, fontSize: 13, textAlign: 'right' }}>{item.sold_quantity}</Text>
-                  <Text style={{ width: 58, fontSize: 13, textAlign: 'right' }}>{item.expected_remaining}</Text>
+                  <Text style={{ width: 58, fontSize: 13, textAlign: 'right' }}>{otherDevices.length ? expectedHere : item.expected_remaining}</Text>
                   <TextInput
                     value={value}
                     onChangeText={(text) => setCounts((current) => ({
@@ -562,8 +603,10 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
             {locked ? (
               <Banner
                 tone="success"
-                message={'Submitted. The count is with the Inventory Supervisor. '
-                  + (isCrew ? 'Next: press \u201cFinish whole flight\u201d on the Sales page.' : '')}
+                message={((trip.waiting_for || []).length
+                  ? `Your count is in. Waiting for ${trip.waiting_for.join(', ')}. `
+                  : 'Submitted. The count is with the Inventory Supervisor. ')
+                  + (isCrew ? 'Next: the commission and the forms on the Reports page, then \u201cFinish whole flight\u201d on the Sales page.' : '')}
               />
             ) : (
               <Button

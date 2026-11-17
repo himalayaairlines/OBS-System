@@ -45,13 +45,16 @@ ROLE_PERMISSIONS = {
     "crew_supervisor": {"crew", "sync", "reconcile_submit", "flight_reports"},
     # `groups` is read-only visibility of the duty groups the crew formed.
     # Nobody on the ground builds them any more.
-    "inventory": {"inventory", "warehouse", "groups", "sync", "alerts_handle"},
+    # 7.10: inventory staff read and correct the sales ledger (with remarks)
+    # and edit product prices (with remarks); every change is recorded.
+    "inventory": {"inventory", "warehouse", "groups", "sync", "alerts_handle",
+                  "sales_view", "sales_edit", "price_edit"},
     # The inventory supervisor reconciles what the crew sold against what came
     # back, so they read the sales ledger and may correct a mis-keyed line.
     "inventory_supervisor": {
         "inventory", "warehouse", "warehouse_approve", "bundles",
         "groups", "stock_add", "reconcile_approve", "sync",
-        "sales_view", "sales_edit", "alerts_handle",
+        "sales_view", "sales_edit", "alerts_handle", "price_edit",
     },
     # Management oversee and correct; they do not sell, so no crew sales screen.
     # `groups_manage` is the post-lock amendment of a duty group, with remarks.
@@ -60,6 +63,7 @@ ROLE_PERMISSIONS = {
         "stock_add", "dashboard", "sync", "logs", "rates", "rates_edit",
         "sales_view", "sales_edit", "reports", "warehouse_approve",
         "reconcile_approve", "reconcile_submit", "flight_reports", "reports_review", "alerts_handle",
+        "price_edit",
     },
     # Finance set rates and read performance. No sales, commission or sync.
     "finance": {"rates", "rates_edit", "dashboard", "reports"},
@@ -87,9 +91,15 @@ COMMISSION_RATE = 0.10
 # POOLED     : the sector's commission is pooled and split equally across the
 #              duty group, and the seller is kept for traceability only.
 #
-# Pending the department decision; flipping this constant is the only change
-# required, because both models read the same `sales.sold_by_crew_member_id`.
-COMMISSION_MODEL = "INDIVIDUAL"
+# 7.11: POOLED. Normal (product) sales pay COMMISSION_RATE into the sector's
+# pool, split equally across the duty group, so no seller is picked at the
+# till. Combo (bundle) sales are the exception: the crew member who sold the
+# combo is picked and earns that combo's commission personally.
+COMMISSION_MODEL = "POOLED"
+
+# How many OBS iPads work one sector (7.11): both are assigned by Inventory,
+# both sell offline, both confirm the remaining stock.
+DEVICES_PER_FLIGHT = 2
 
 # A duty group is the crew working one sector: between two and ten cabin crew
 # (7.9). DUTY_GROUP_SIZE is the usual size, kept for labels and old callers.
@@ -235,10 +245,11 @@ CREATE TABLE IF NOT EXISTS flights (
 -- this any more: the people are chosen on board, in duty_groups.
 CREATE TABLE IF NOT EXISTS flight_assignments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    flight_id INTEGER NOT NULL UNIQUE,
+    flight_id INTEGER NOT NULL,
     crew_account TEXT NOT NULL,
     assigned_by TEXT,
     assigned_at TEXT,
+    UNIQUE(flight_id, crew_account),
     FOREIGN KEY(flight_id) REFERENCES flights(id) ON DELETE CASCADE
 );
 
@@ -871,6 +882,84 @@ def initialize_database():
         # Sector-by-sector crew workflow (7.5).
         from trip_flow import initialize_trip_flow
         initialize_trip_flow(connection, _add_column, _columns)
+
+        # 7.11: two iPads per sector. The old table allowed one device per
+        # flight (UNIQUE(flight_id)); rebuild it so a flight can carry two.
+        idx = connection.execute("PRAGMA index_list('flight_assignments')").fetchall()
+        for row in idx:
+            cols = [c[2] for c in connection.execute(f"PRAGMA index_info('{row[1]}')").fetchall()]
+            if row[2] and cols == ["flight_id"]:
+                connection.executescript("""
+                    CREATE TABLE flight_assignments_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        flight_id INTEGER NOT NULL,
+                        crew_account TEXT NOT NULL,
+                        assigned_by TEXT,
+                        assigned_at TEXT,
+                        UNIQUE(flight_id, crew_account),
+                        FOREIGN KEY(flight_id) REFERENCES flights(id) ON DELETE CASCADE
+                    );
+                    INSERT INTO flight_assignments_new(id,flight_id,crew_account,assigned_by,assigned_at)
+                        SELECT id,flight_id,crew_account,assigned_by,assigned_at FROM flight_assignments;
+                    DROP TABLE flight_assignments;
+                    ALTER TABLE flight_assignments_new RENAME TO flight_assignments;
+                """)
+                break
+        connection.executescript("""
+            -- Each iPad's own count of what is left (final stock return), summed per product.
+            CREATE TABLE IF NOT EXISTS stock_return_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reconciliation_id INTEGER NOT NULL,
+                device TEXT NOT NULL,
+                submitted_at TEXT NOT NULL,
+                remarks TEXT,
+                UNIQUE(reconciliation_id, device),
+                FOREIGN KEY(reconciliation_id) REFERENCES reconciliations(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS stock_return_device_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reconciliation_id INTEGER NOT NULL,
+                device TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                declared_remaining INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(reconciliation_id, device, product_id),
+                FOREIGN KEY(reconciliation_id) REFERENCES reconciliations(id) ON DELETE CASCADE
+            );
+            -- "Submitted by the other iPad": this device skips the form.
+            CREATE TABLE IF NOT EXISTS flight_report_deferrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                flight_id INTEGER NOT NULL,
+                report_type TEXT NOT NULL,
+                device TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(flight_id, report_type, device),
+                FOREIGN KEY(flight_id) REFERENCES flights(id) ON DELETE CASCADE
+            );
+        """)
+
+        # Price changes and sale corrections, line by line (7.10).
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS product_price_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                product_id INTEGER NOT NULL,
+                old_price REAL NOT NULL,
+                new_price REAL NOT NULL,
+                changed_by TEXT NOT NULL,
+                changed_at TEXT NOT NULL,
+                remarks TEXT NOT NULL,
+                FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS sale_edit_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sale_id INTEGER NOT NULL,
+                changed_by TEXT NOT NULL,
+                changed_at TEXT NOT NULL,
+                remarks TEXT NOT NULL,
+                before_json TEXT NOT NULL,
+                after_json TEXT NOT NULL,
+                FOREIGN KEY(sale_id) REFERENCES sales(id) ON DELETE CASCADE
+            );
+        """)
 
         # Remaining stock after each sector (7.9).
         from sector_stock import initialize_sector_stock

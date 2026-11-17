@@ -100,10 +100,13 @@ class TripFlowTests(unittest.TestCase):
 
     def sell(self, leg, product_id, seller, expect=200):
         TripFlowTests.seq += 1
-        status, out = call("POST", "/sales", "CREW001", {
+        body = {
             "order_ref": f"TRIP-{leg['id']}-{TripFlowTests.seq:03d}", "flight_id": leg["id"], "seat_number": "12A",
-            "sold_by_crew_member_id": seller, "lines": [{"product_id": product_id, "quantity": 1}],
-            "transaction_time": f"{date.today().isoformat()}T10:00:00"})
+            "lines": [{"product_id": product_id, "quantity": 1}],
+            "transaction_time": f"{date.today().isoformat()}T10:00:00"}
+        if seller:
+            body["sold_by_crew_member_id"] = seller
+        status, out = call("POST", "/sales", "CREW001", body)
         self.assertEqual(status, expect, out)
         return out
 
@@ -123,9 +126,30 @@ class TripFlowTests(unittest.TestCase):
         self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", "CREW001")[1]["step"], "SELL_FIRST")
 
         self.assertEqual(call("PUT", f"/flights/{out['id']}/finish", "CREW001")[0], 200)
+        # 7.11 order: remaining stock first, then the forms.
         status, err = call("POST", f"/flights/{out['id']}/start-second", "CREW001")
         self.assertEqual(status, 400)
-        self.assertIn("forms", err["detail"])
+        self.assertIn("remaining stock", err["detail"])
+        self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", "CREW001")[1]["step"], "STOCK_FIRST")
+        status, position = call("GET", f"/flights/{out['id']}/sector-stock", "CREW001")
+        self.assertEqual(status, 200, position)
+        line = [i for i in position["items"] if i["product_id"] == product][0]
+        self.assertEqual((line["loaded_quantity"], line["sold_quantity"], line["expected_remaining"]), (5, 1, 4))
+        self.assertFalse(position["submitted"])
+        status, saved = call("POST", f"/flights/{out['id']}/sector-stock", "CREW001",
+                             {"lines": [{"product_id": product, "declared_remaining": 3}], "remarks": "One damaged"})
+        self.assertEqual(status, 200, saved)
+        self.assertEqual((saved["submitted"], saved["total_variance"], saved["remarks"]), (True, -1, "CREW001: One damaged"))
+        for who in ("MGT001", "ADMIN001", "INV001"):
+            self.assertEqual(call("GET", f"/flights/{out['id']}/sector-stock", who)[0], 200, who)
+        self.assertEqual(call("GET", "/sector-stock-counts", "FIN001")[0], 403)
+        listed = call("GET", "/sector-stock-counts?page=1", "MGT001")[1]
+        self.assertTrue(any(c["flight_id"] == out["id"] and c["total_variance"] == -1 for c in listed["items"]))
+        # The commission for the sector is visible to the crew and to management.
+        status, comm = call("GET", f"/flights/{out['id']}/commission", "CREW001")
+        self.assertEqual(status, 200, comm)
+        self.assertEqual(len(comm["members"]), 4)
+        self.assertEqual(call("GET", f"/flights/{out['id']}/commission", "MGT001")[0], 200)
         self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", "CREW001")[1]["step"], "FORMS_FIRST")
 
         self.file_all(out)
@@ -142,27 +166,6 @@ class TripFlowTests(unittest.TestCase):
                                {"payload": {}, "remarks": "Typo in seat number"})
         self.assertEqual(status, 200, changed)
         self.assertEqual(changed["rev_no"], 1)
-
-        # 7.9: the remaining stock after the first sector is confirmed before the second starts.
-        status, err = call("POST", f"/flights/{out['id']}/start-second", "CREW001")
-        self.assertEqual(status, 400)
-        self.assertIn("remaining stock", err["detail"])
-        self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", "CREW001")[1]["step"], "STOCK_FIRST")
-        status, position = call("GET", f"/flights/{out['id']}/sector-stock", "CREW001")
-        self.assertEqual(status, 200, position)
-        line = [i for i in position["items"] if i["product_id"] == product][0]
-        self.assertEqual((line["loaded_quantity"], line["sold_quantity"], line["expected_remaining"]), (5, 1, 4))
-        self.assertFalse(position["submitted"])
-        status, saved = call("POST", f"/flights/{out['id']}/sector-stock", "CREW001",
-                             {"lines": [{"product_id": product, "declared_remaining": 3}], "remarks": "One damaged"})
-        self.assertEqual(status, 200, saved)
-        self.assertEqual((saved["submitted"], saved["total_variance"], saved["remarks"]), (True, -1, "One damaged"))
-        # Management and the administrator read it; the inventory officer too.
-        for who in ("MGT001", "ADMIN001", "INV001"):
-            self.assertEqual(call("GET", f"/flights/{out['id']}/sector-stock", who)[0], 200, who)
-        self.assertEqual(call("GET", "/sector-stock-counts", "FIN001")[0], 403)
-        listed = call("GET", "/sector-stock-counts?page=1", "MGT001")[1]
-        self.assertTrue(any(c["flight_id"] == out["id"] and c["total_variance"] == -1 for c in listed["items"]))
 
         status, state = call("POST", f"/flights/{out['id']}/start-second", "CREW001")
         self.assertEqual(status, 200, state)
@@ -186,6 +189,7 @@ class TripFlowTests(unittest.TestCase):
         status, err = call("POST", f"/flights/{out['id']}/complete-trip", "CREW001")
         self.assertEqual(status, 400)
         self.assertIn("stock return", err["detail"])
+        self.assertEqual(call("GET", f"/flights/{back['id']}/trip-progress", "CREW001")[1]["step"], "STOCK_RETURN")
 
         pending = [p for p in call("GET", "/reconciliations/pending", "CREW001")[1] if p["flight_id"] == out["id"]][0]
         lines = [{"product_id": i["product_id"], "declared_remaining": i["expected_remaining"]} for i in pending["items"]]
@@ -199,6 +203,160 @@ class TripFlowTests(unittest.TestCase):
         self.assertEqual(call("POST", "/flight-reports", "CREW001",
                               {"flight_id": back["id"], "report_type": REPORT_TYPES[0], "payload": {}})[0], 400)
         self.assertEqual(call("POST", f"/flights/{out['id']}/complete-trip", "CREW001")[0], 400)
+
+    def test_forms_any_time_and_finish_reminds(self):
+        (leg,), product = self.make_trip("ONE_WAY")
+        seller = self.open_leg(leg)
+        self.sell(leg, product, seller)
+        # 7.10: a form can be saved while the sector is still selling.
+        status, out = call("POST", "/flight-reports", "CREW001",
+                           {"flight_id": leg["id"], "report_type": REPORT_TYPES[0], "payload": {}, "submit": True})
+        self.assertEqual(status, 200, out)
+        status, done = call("PUT", f"/flights/{leg['id']}/finish", "CREW001")
+        self.assertEqual(status, 200, done)
+        self.assertEqual((done["reports_outstanding"], done["reports_total"]), (len(REPORT_TYPES) - 1, len(REPORT_TYPES)))
+
+    def test_device_reassigned_same_day_after_trip_finished(self):
+        (leg,), product = self.make_trip("ONE_WAY")
+        TripFlowTests.seq += 1
+        status, legs2 = call("POST", "/flights", "INV001", {
+            "flight_number": f"H9{800 + TripFlowTests.seq}", "flight_date": leg["flight_date"], "origin": "KTM",
+            "destination": "DEL", "trip_type": "ONE_WAY"})
+        self.assertEqual(status, 200, legs2)
+        second = legs2[0]
+        # 7.11: the same iPad may be rostered to a second trip on the same day,
+        # but it does not see it until the first trip is finished.
+        status, out = call("POST", f"/trips/{second['id']}/assign", "INV001", {"crew_account": "CREW001"})
+        self.assertEqual(status, 200, out)
+        visible = {f["id"] for f in call("GET", "/flights", "CREW001")[1]}
+        self.assertIn(leg["id"], visible)
+        self.assertNotIn(second["id"], visible)
+        seller = self.open_leg(leg)
+        self.sell(leg, product, seller)
+        self.assertEqual(call("PUT", f"/flights/{leg['id']}/finish", "CREW001")[0], 200)
+        self.file_all(leg)
+        pending = [p for p in call("GET", "/reconciliations/pending", "CREW001")[1] if p["flight_id"] == leg["id"]][0]
+        lines = [{"product_id": i["product_id"], "declared_remaining": i["expected_remaining"]} for i in pending["items"]]
+        self.assertEqual(call("POST", "/reconciliations", "CREW001", {"flight_id": leg["id"], "lines": lines})[0], 200)
+        self.assertEqual(call("POST", f"/flights/{leg['id']}/complete-trip", "CREW001")[1]["step"], "DONE")
+        visible = {f["id"] for f in call("GET", "/flights", "CREW001")[1]}
+        self.assertIn(second["id"], visible)
+
+    def test_price_and_sale_edits_are_recorded(self):
+        (leg,), product = self.make_trip("ONE_WAY")
+        seller = self.open_leg(leg)
+        sale_tx = self.sell(leg, product, seller)
+        # Price edit: inventory officer, with remarks, kept in the history.
+        self.assertEqual(call("PUT", f"/products/{product}/price", "INV001", {"selling_price": 999, "remarks": ""})[0], 422)
+        self.assertEqual(call("PUT", f"/products/{product}/price", "FIN001", {"selling_price": 999, "remarks": "x"})[0], 403)
+        status, updated = call("PUT", f"/products/{product}/price", "INV001", {"selling_price": 999, "remarks": "New supplier price"})
+        self.assertEqual((status, updated["selling_price"]), (200, 999))
+        history = call("GET", f"/products/{product}/price-history", "MGT001")[1]
+        self.assertEqual((history[0]["new_price"], history[0]["remarks"], history[0]["changed_by"]), (999, "New supplier price", "INV001"))
+        # Sale edit by the inventory officer, with remarks, recorded line by line.
+        sales = call("GET", f"/sales?flight_id={leg['id']}", "INV001")[1]
+        sale = sales[0] if isinstance(sales, list) else sales["items"][0]
+        self.assertIn("segment", sale)
+        self.assertEqual(call("PUT", f"/sales/{sale['id']}", "INV001", {"seat_number": "14C", "edit_remarks": ""})[0], 400)
+        status, edited = call("PUT", f"/sales/{sale['id']}", "INV001", {"seat_number": "14C", "edit_remarks": "Seat mis-keyed"})
+        self.assertEqual((status, edited["seat_number"], edited["edit_count"]), (200, "14C", 1))
+        status, edited = call("PUT", f"/sales/{sale['id']}", "ISUP001", {"quantity": 2, "edit_remarks": "Two were sold"})
+        self.assertEqual((status, edited["edit_count"]), (200, 2))
+        hist = call("GET", f"/sales/{sale['id']}/history", "INV001")[1]
+        self.assertEqual(len(hist), 2)
+        self.assertEqual(hist[0]["changed_by"], "ISUP001")
+        self.assertTrue(any(c.startswith("quantity") for c in hist[0]["changes"]))
+        self.assertTrue(any(c.startswith("seat") for c in hist[1]["changes"]))
+
+    def test_two_ipads_share_a_trip(self):
+        """7.11: both iPads sell, both declare what is left, the sum is the return;
+        a form marked 'submitted by the other iPad' counts once that iPad files it."""
+        (leg,), product = self.make_trip("ONE_WAY")
+        status, out = call("POST", f"/trips/{leg['id']}/assign", "INV001",
+                           {"crew_account": "CREW001", "crew_account_2": "CSUP001"})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(sorted(out["devices"]), ["CREW001", "CSUP001"])
+        # Both devices see the flight; the second one can sell too.
+        self.assertTrue(any(f["id"] == leg["id"] for f in call("GET", "/flights", "CSUP001")[1]))
+        seller = self.open_leg(leg)
+        TripFlowTests.seq += 1
+        status, sale = call("POST", "/sales", "CSUP001", {
+            "order_ref": f"TRIP-{leg['id']}-{TripFlowTests.seq:03d}", "flight_id": leg["id"], "seat_number": "2B",
+            "lines": [{"product_id": product, "quantity": 1}],
+            "transaction_time": f"{date.today().isoformat()}T10:00:00"})
+        self.assertEqual(status, 200, sale)       # no seller needed for a normal sale
+        self.sell(leg, product, seller)
+        self.assertEqual(call("PUT", f"/flights/{leg['id']}/finish", "CSUP001")[0], 200)
+        # Final stock return: 5 loaded, 2 sold -> 3 expected. iPad 1 holds 2, iPad 2 holds 1.
+        pending = [p for p in call("GET", "/reconciliations/pending", "CREW001")[1] if p["flight_id"] == leg["id"]][0]
+        self.assertEqual((pending["waiting_for"], pending["my_submitted"]), (["CREW001", "CSUP001"], False))
+        status, r1 = call("POST", "/reconciliations", "CREW001",
+                          {"flight_id": leg["id"], "lines": [{"product_id": product, "declared_remaining": 2}]})
+        self.assertEqual((status, r1["status"], r1["waiting_for"]), (200, "WAITING", ["CSUP001"]), r1)
+        # Not approvable until the second iPad has declared.
+        self.assertIn(call("PUT", f"/reconciliations/{r1['id']}/review", "ISUP001", {"approve": True})[0], (400, 409))
+        self.assertEqual(call("GET", f"/flights/{leg['id']}/trip-progress", "CREW001")[1]["my_stock_return_done"], True)
+        self.assertEqual(call("GET", f"/flights/{leg['id']}/trip-progress", "CSUP001")[1]["my_stock_return_done"], False)
+        status, r2 = call("POST", "/reconciliations", "CSUP001",
+                          {"flight_id": leg["id"], "lines": [{"product_id": product, "declared_remaining": 1}]})
+        self.assertEqual((status, r2["status"], r2["waiting_for"]), (200, "PENDING", []), r2)
+        line = [i for i in r2["items"] if i["product_id"] == product][0]
+        self.assertEqual((line["expected_remaining"], line["declared_remaining"], line["by_device"]),
+                         (3, 3, {"CREW001": 2, "CSUP001": 1}))
+        self.assertEqual(call("GET", f"/flights/{leg['id']}/trip-progress", "CREW001")[1]["step"], "FORMS_LAST")
+        # Forms: iPad 1 files three, marks the fourth as the other iPad's.
+        for report_type in REPORT_TYPES[:-1]:
+            self.assertEqual(call("POST", "/flight-reports", "CREW001",
+                                  {"flight_id": leg["id"], "report_type": report_type, "payload": {}, "submit": True})[0], 200)
+        status, out = call("POST", "/flight-reports/defer", "CREW001", {"flight_id": leg["id"], "report_type": REPORT_TYPES[-1]})
+        self.assertEqual(status, 200, out)
+        sector = call("GET", f"/flights/{leg['id']}/reports", "CSUP001")[1]
+        last = [e for e in sector["reports"] if e["report_type"] == REPORT_TYPES[-1]][0]
+        self.assertEqual((last["status"], last["deferred_by"]), ("AWAITING_OTHER", ["CREW001"]))
+        self.assertEqual(sector["awaiting_other"], [REPORT_TYPES[-1]])
+        progress = call("GET", f"/flights/{leg['id']}/trip-progress", "CREW001")[1]
+        self.assertEqual((progress["step"], progress["legs"][0]["reports_awaiting_other"]), ("COMPLETE", [REPORT_TYPES[-1]]))
+        # The other iPad files it when it syncs.
+        self.assertEqual(call("POST", "/flight-reports", "CSUP001",
+                              {"flight_id": leg["id"], "report_type": REPORT_TYPES[-1], "payload": {}, "submit": True})[0], 200)
+        self.assertEqual(call("GET", f"/flights/{leg['id']}/trip-progress", "CSUP001")[1]["legs"][0]["reports_awaiting_other"], [])
+        self.assertEqual(call("POST", f"/flights/{leg['id']}/complete-trip", "CSUP001")[1]["step"], "DONE")
+
+    def test_pooled_and_combo_commission(self):
+        (leg,), product = self.make_trip("ONE_WAY")
+        seller = self.open_leg(leg)          # 4 crew
+        price = call("GET", "/products", "INV001")[1]
+        price = [p for p in price if p["id"] == product][0]["selling_price"]
+        self.sell(leg, product, None)        # normal sale: pooled, no seller
+        self.sell(leg, product, None)
+        # A combo needs a seller.
+        TripFlowTests.seq += 1
+        status, bundle = call("POST", "/bundles", "ISUP001", {"bundle_code": f"TB{TripFlowTests.seq}", "bundle_name": "Test combo",
+                                                              "bundle_price": 1000, "items": [{"product_id": product, "quantity": 1}]})
+        self.assertEqual(status, 200, bundle)
+        TripFlowTests.seq += 1
+        status, err = call("POST", "/sales", "CREW001", {
+            "order_ref": f"TRIP-{leg['id']}-{TripFlowTests.seq:03d}", "flight_id": leg["id"], "seat_number": "5A",
+            "lines": [{"bundle_id": bundle["id"], "quantity": 1}], "transaction_time": f"{date.today().isoformat()}T10:00:00"})
+        self.assertIn(status, (400, 422), err)
+        TripFlowTests.seq += 1
+        status, ok = call("POST", "/sales", "CREW001", {
+            "order_ref": f"TRIP-{leg['id']}-{TripFlowTests.seq:03d}", "flight_id": leg["id"], "seat_number": "5A",
+            "sold_by_crew_member_id": seller,
+            "lines": [{"bundle_id": bundle["id"], "quantity": 1}], "transaction_time": f"{date.today().isoformat()}T10:00:00"})
+        self.assertEqual(status, 200, ok)
+        comm = call("GET", f"/flights/{leg['id']}/commission", "CREW001")[1]
+        pool = round(2 * price * 0.10, 2)
+        self.assertAlmostEqual(comm["sector"]["commission_pool_npr"], pool, places=2)
+        self.assertAlmostEqual(comm["sector"]["share_npr"], round(pool / 4, 2), places=2)
+        self.assertAlmostEqual(comm["sector"]["combo_commission_npr"], 100.0, places=2)
+        me = [m for m in comm["members"] if m["crew_member_id"] == seller][0]
+        self.assertAlmostEqual(me["total_npr"], round(pool / 4 + 100, 2), places=2)
+        others = [m for m in comm["members"] if m["crew_member_id"] != seller]
+        self.assertTrue(all(abs(m["total_npr"] - round(pool / 4, 2)) < 0.01 for m in others))
+        ranking = call("GET", "/crew-ranking", "MGT001")[1]
+        self.assertEqual(ranking["combo_ranking"][0]["crew_member_id"], seller)
+        self.assertAlmostEqual(ranking["combo_ranking"][0]["combo_commission_npr"], 100.0, places=2)
 
     def test_duty_group_size_2_to_10(self):
         (leg,), _ = self.make_trip("ONE_WAY")
@@ -217,8 +375,8 @@ class TripFlowTests(unittest.TestCase):
         self.sell(leg, product, seller)
         self.assertEqual(call("POST", f"/flights/{leg['id']}/start-second", "CREW001")[0], 400)
         self.assertEqual(call("PUT", f"/flights/{leg['id']}/finish", "CREW001")[0], 200)
-        self.file_all(leg)
         self.assertEqual(call("GET", f"/flights/{leg['id']}/trip-progress", "CREW001")[1]["step"], "STOCK_RETURN")
+        self.file_all(leg)
         # A one-way flight has no sector count: the final stock return covers it.
         self.assertEqual(call("POST", f"/flights/{leg['id']}/sector-stock", "CREW001", {"lines": []})[0], 400)
         pending = [p for p in call("GET", "/reconciliations/pending", "CREW001")[1] if p["flight_id"] == leg["id"]][0]

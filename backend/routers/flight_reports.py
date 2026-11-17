@@ -56,9 +56,9 @@ class ReportEdit(BaseModel):
 # --------------------------------------------------------------------------- #
 def _flight(connection, flight_id: int):
     row = connection.execute(
-        """SELECT f.*, a.crew_account, d.id AS duty_group_id, d.label AS duty_group_label
+        """SELECT f.*, d.id AS duty_group_id, d.label AS duty_group_label,
+                  (SELECT GROUP_CONCAT(crew_account, ',') FROM flight_assignments a WHERE a.flight_id = f.id) AS crew_account
            FROM flights f
-           LEFT JOIN flight_assignments a ON a.flight_id = f.id
            LEFT JOIN duty_groups d ON d.flight_id = f.id
            WHERE f.id=?""",
         (flight_id,),
@@ -78,7 +78,7 @@ def _assert_device(connection, flight, user):
         return
     if not flight["crew_account"]:
         raise HTTPException(status_code=400, detail="No OBS device is assigned to this flight.")
-    if user["employee_id"] != flight["crew_account"]:
+    if user["employee_id"] not in str(flight["crew_account"]).split(","):
         raise HTTPException(
             status_code=403, detail="This device did not work that sector.",
         )
@@ -245,9 +245,18 @@ def reports_for_flight(flight_id: int, user: dict = Depends(requires("flight_rep
             ).fetchall()
         }
 
+        # "Submitted by the other iPad" marks (7.11).
+        deferrals = {}
+        for row in connection.execute(
+                "SELECT report_type, device, created_at FROM flight_report_deferrals WHERE flight_id=?", (flight_id,)):
+            deferrals.setdefault(row["report_type"], []).append({"device": row["device"], "at": row["created_at"]})
+        devices = str(flight["crew_account"] or "").split(",") if flight["crew_account"] else []
+
         entries = []
         for report_type in REPORT_TYPES:
             form = form_for(report_type)
+            status = existing.get(report_type, {}).get("status", "NOT_STARTED")
+            marks = deferrals.get(report_type, [])
             entry = {
                 "report_type": report_type,
                 "title": form["title"],
@@ -255,7 +264,10 @@ def reports_for_flight(flight_id: int, user: dict = Depends(requires("flight_rep
                 "manual": form["manual"],
                 "appendix": form["appendix"],
                 "report": existing.get(report_type),
-                "status": existing.get(report_type, {}).get("status", "NOT_STARTED"),
+                "status": "AWAITING_OTHER" if (status != "SUBMITTED" and marks) else status,
+                "deferred_by": [m["device"] for m in marks],
+                "deferred_by_me": user["employee_id"] in [m["device"] for m in marks],
+                "other_device": next((d for d in devices if d != user["employee_id"]), None),
             }
             entries.append(entry)
 
@@ -275,11 +287,64 @@ def reports_for_flight(flight_id: int, user: dict = Depends(requires("flight_rep
             "trip_type": flight["trip_type"],
             "segment": 2 if flight["direction"] == "RETURN" else 1,
             "locked": bool(flight["reports_locked_at"] or flight["trip_completed_at"]),
+            "devices": devices,
             "reports": entries,
-            "outstanding": [e["report_type"] for e in entries if e["status"] != "SUBMITTED"],
+            # Still to handle on this iPad: neither submitted nor marked as the other iPad's.
+            "outstanding": [e["report_type"] for e in entries if e["status"] not in ("SUBMITTED", "AWAITING_OTHER")],
+            "awaiting_other": [e["report_type"] for e in entries if e["status"] == "AWAITING_OTHER"],
         }
     finally:
         connection.close()
+
+
+class DeferIn(BaseModel):
+    flight_id: int
+    report_type: str
+
+
+@router.post("/flight-reports/defer")
+def defer_report(data: DeferIn, user: dict = Depends(requires("flight_reports"))):
+    """"Submitted by the other iPad": this device leaves the form to the other
+    one (7.11). The form counts as handled for the trip's progress; the other
+    iPad's own submission arrives when it syncs. Management sees it as
+    "awaiting the other iPad" until then."""
+    report_type = data.report_type.strip().upper()
+    if report_type not in REPORT_TYPES:
+        raise HTTPException(status_code=400, detail="Unknown report type.")
+    connection = get_connection()
+    try:
+        flight = _flight(connection, data.flight_id)
+        _assert_device(connection, flight, user)
+        trip_flow.assert_reports_open(connection, flight["id"], _may_review(user))
+        if connection.execute("SELECT 1 FROM flight_reports WHERE flight_id=? AND report_type=? AND status='SUBMITTED'",
+                              (data.flight_id, report_type)).fetchone():
+            raise HTTPException(status_code=400, detail="This form has already been submitted.")
+        connection.execute(
+            "INSERT OR IGNORE INTO flight_report_deferrals(flight_id,report_type,device,created_at) VALUES (?,?,?,?)",
+            (data.flight_id, report_type, user["employee_id"], now_iso()))
+        connection.commit()
+    finally:
+        connection.close()
+    log_action(user, "REPORTS", "DEFER_REPORT",
+               f"{form_for(report_type)['title']} for {flight['flight_number']} marked as submitted by the other iPad.",
+               "flight", data.flight_id, metadata={"report_type": report_type})
+    return {"status": "deferred", "report_type": report_type}
+
+
+@router.delete("/flight-reports/defer")
+def undefer_report(flight_id: int, report_type: str, user: dict = Depends(requires("flight_reports"))):
+    """Take the form back on this iPad."""
+    report_type = report_type.strip().upper()
+    connection = get_connection()
+    try:
+        flight = _flight(connection, flight_id)
+        _assert_device(connection, flight, user)
+        connection.execute("DELETE FROM flight_report_deferrals WHERE flight_id=? AND report_type=? AND device=?",
+                           (flight_id, report_type, user["employee_id"]))
+        connection.commit()
+    finally:
+        connection.close()
+    return {"status": "cleared", "report_type": report_type}
 
 
 # --------------------------------------------------------------------------- #
@@ -299,11 +364,8 @@ def file_report(data: ReportIn, user: dict = Depends(requires("flight_reports"))
         flight = _flight(connection, data.flight_id)
         _assert_device(connection, flight, user)
         trip_flow.assert_reports_open(connection, flight["id"], _may_review(user))
-        if flight["status"] == "OPEN":
-            raise HTTPException(
-                status_code=400,
-                detail="Finish the sector before filing its reports.",
-            )
+        # 7.10: forms may be filled in at any time, before or after the sector
+        # is finished. Finishing reminds the crew of any form still outstanding.
 
         existing = connection.execute(
             "SELECT * FROM flight_reports WHERE flight_id=? AND report_type=?",

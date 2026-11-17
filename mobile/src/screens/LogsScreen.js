@@ -37,6 +37,9 @@ export default function LogsScreen({ user }) {
   const [products, setProducts] = useState([]);
 
   const [editing, setEditing] = useState(null);
+  const [editSeat, setEditSeat] = useState('');
+  // Every correction of a sale, line by line (7.10), shown on request.
+  const [saleHistory, setSaleHistory] = useState({});
   const [editProduct, setEditProduct] = useState(null);
   const [editQuantity, setEditQuantity] = useState('');
   const [editRemarks, setEditRemarks] = useState('');
@@ -123,17 +126,32 @@ export default function LogsScreen({ user }) {
         body: {
           product_id: editProduct || editing.product_id,
           quantity: Number(editQuantity || editing.quantity),
+          seat_number: editSeat.trim() ? editSeat.trim().toUpperCase() : undefined,
           edit_remarks: editRemarks,
         },
       });
-      setMessage({ tone: 'success', text: 'Sale corrected. The remarks will appear in the Excel export.' });
-      setEditing(null); setEditProduct(null); setEditQuantity(''); setEditRemarks('');
+      setMessage({ tone: 'success', text: 'Sale corrected. The correction is recorded with your remarks and appears in the Excel export.' });
+      setEditing(null); setEditProduct(null); setEditQuantity(''); setEditRemarks(''); setEditSeat('');
+      setSaleHistory((h) => ({ ...h, [editing.id]: undefined }));
       sales.reload();
       load();
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
   }
+
+  async function toggleSaleHistory(saleId) {
+    if (saleHistory[saleId]) { setSaleHistory((h) => ({ ...h, [saleId]: undefined })); return; }
+    try {
+      const rows = await api(`/sales/${saleId}/history`);
+      setSaleHistory((h) => ({ ...h, [saleId]: rows }));
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+  }
+
+  const sectorLabel = (sale) => `${sale.flight_number} \u00b7 ${sale.origin}\u2192${sale.destination} \u00b7 ${sale.flight_date}`
+    + (sale.trip_type === 'ROUND_TRIP' ? ` \u00b7 ${sale.segment === 2 ? 'second' : 'first'} segment (${String(sale.direction || '').toLowerCase()})` : '');
 
   const tabs = [
     ...(canOversee ? [
@@ -195,7 +213,7 @@ export default function LogsScreen({ user }) {
           <Card>
             <SectionTitle
               title="Commission by crew member"
-              description={`Each flight pays ${(ranking.commission_rate * 100).toFixed(0)}% of its sales into the group pool, split equally between the group's members.`}
+              description={`Each sector pays ${(ranking.commission_rate * 100).toFixed(0)}% of its product sales into a pool split equally between the crew on it (NPR 100 and 4 crew = NPR 25 each). Combo sales are ranked separately below.`}
             />
             <RankBarChart
               data={ranking.ranking.filter((e) => e.commission_npr > 0).slice(0, 10).map((entry) => ({
@@ -225,12 +243,14 @@ export default function LogsScreen({ user }) {
                 },
                 { key: 'sectors', label: 'Sectors', flex: 0.8, align: 'right', render: (e) => String(e.flights) },
                 { key: 'tx', label: 'Transactions', flex: 1, align: 'right', render: (e) => String(e.transactions) },
-                { key: 'sales', label: 'Own sales', flex: 1.2, align: 'right', render: (e) => npr(e.attributed_sales_npr) },
+                { key: 'sales', label: 'Share of sales', flex: 1.2, align: 'right', render: (e) => npr(e.attributed_sales_npr) },
                 {
-                  key: 'commission', label: 'Commission', flex: 1.2, align: 'right', render: (e) => (
+                  key: 'commission', label: 'Pool commission', flex: 1.2, align: 'right', render: (e) => (
                     <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.success }}>{npr(e.commission_npr)}</Text>
                   ),
                 },
+                { key: 'combo', label: 'Combo', flex: 1, align: 'right', render: (e) => npr(e.combo_commission_npr || 0) },
+                { key: 'total', label: 'Total', flex: 1.1, align: 'right', render: (e) => <Text style={{ fontSize: 14, fontWeight: '700' }}>{npr(e.total_commission_npr ?? e.commission_npr)}</Text> },
               ]}
               renderStacked={(e) => (
                 <>
@@ -242,7 +262,7 @@ export default function LogsScreen({ user }) {
                     <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.success }}>{npr(e.commission_npr)}</Text>
                   </View>
                   <Text style={styles.mono}>
-                    {e.flights} sector(s) · {e.transactions} transaction(s) · own sales {npr(e.attributed_sales_npr)}
+                    {e.flights} sector(s) · share of sales {npr(e.attributed_sales_npr)} · combo {npr(e.combo_commission_npr || 0)} · total {npr(e.total_commission_npr ?? e.commission_npr)}
                   </Text>
                 </>
               )}
@@ -252,20 +272,50 @@ export default function LogsScreen({ user }) {
 
           <Card>
             <SectionTitle
+              title="Combo sales ranking"
+              description="Commission on combos is paid to the crew member who sold the combo, ranked here on its own."
+            />
+            {(ranking.combo_ranking || []).length ? (
+              <DataTable
+                breakpoint={760}
+                rows={ranking.combo_ranking}
+                rowKey={(e) => String(e.crew_member_id)}
+                columns={[
+                  { key: 'rank', label: '#', flex: 0.4, render: (e) => String(e.rank) },
+                  { key: 'name', label: 'Crew member', flex: 2.2, render: (e) => <CrewLink entry={e} onPress={() => setHistoryFor({ id: e.crew_member_id, name: e.name })} /> },
+                  { key: 'sectors', label: 'Sectors', flex: 0.8, align: 'right', render: (e) => String(e.flights) },
+                  { key: 'tx', label: 'Combos', flex: 0.9, align: 'right', render: (e) => String(e.transactions) },
+                  { key: 'sales', label: 'Combo sales', flex: 1.2, align: 'right', render: (e) => npr(e.combo_sales_npr) },
+                  { key: 'commission', label: 'Combo commission', flex: 1.3, align: 'right', render: (e) => <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.success }}>{npr(e.combo_commission_npr)}</Text> },
+                ]}
+                renderStacked={(e) => (
+                  <View style={styles.rowBetween}>
+                    <View style={[styles.row, { gap: 6, flex: 1 }]}>
+                      <Text style={{ fontSize: 14, fontWeight: '600' }}>{e.rank}.</Text>
+                      <CrewLink entry={e} onPress={() => setHistoryFor({ id: e.crew_member_id, name: e.name })} />
+                    </View>
+                    <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.success }}>{npr(e.combo_commission_npr)}</Text>
+                  </View>
+                )}
+              />
+            ) : <Text style={styles.empty}>No combo sold in this period.</Text>}
+          </Card>
+
+          <Card>
+            <SectionTitle
               title="By sector"
-              description={ranking.commission_model === 'POOLED'
-                ? 'Each sector pays a pool, shared equally across its duty group.'
-                : 'Each crew member earns on what they personally sold.'}
+              description="Each sector pays a pool on its product sales, shared equally across its duty group; combos are paid to their sellers."
             />
             {(ranking.sectors || []).map((sector) => (
               <View key={sector.flight_id} style={styles.listRow}>
                 <Text style={{ fontSize: 14, fontWeight: '600' }}>{sector.duty_group_label}</Text>
-                <KeyValue label="Sales" value={npr(sector.revenue_npr)} />
-                <KeyValue label="Commission" value={npr(sector.commission_pool_npr)} tone={COLORS.success} />
+                <KeyValue label="Product sales" value={npr(sector.product_revenue_npr ?? sector.revenue_npr)} />
+                <KeyValue label={`Pool \u00f7 ${sector.member_count} crew`} value={`${npr(sector.commission_pool_npr)} = ${npr(sector.share_npr || 0)} each`} tone={COLORS.success} />
+                {!!sector.combo_revenue_npr && <KeyValue label="Combo sales" value={`${npr(sector.combo_revenue_npr)} \u2192 ${npr(sector.combo_commission_npr)} commission`} />}
                 {(sector.sellers || []).map((seller) => (
                   <View key={seller.crew_member_id} style={[styles.rowBetween, { paddingVertical: 2 }]}>
-                    <Text style={{ fontSize: 13, flex: 1 }}>{seller.name}</Text>
-                    <Text style={[styles.mono, { fontSize: 11 }]}>{npr(seller.sales_npr)}</Text>
+                    <Text style={{ fontSize: 13, flex: 1 }}>{seller.name} (combo)</Text>
+                    <Text style={[styles.mono, { fontSize: 11 }]}>{npr(seller.combo_sales_npr)} → {npr(seller.combo_commission_npr)}</Text>
                   </View>
                 ))}
               </View>
@@ -334,8 +384,10 @@ export default function LogsScreen({ user }) {
       {tab === 'sales' && canSeeSales && (
         <Card>
           <SectionTitle
-            title="Correct a sale"
-            description="Fix a mis-keyed product or quantity. Remarks are mandatory and are carried into the Excel export."
+            title={canEdit ? 'Correct a sale' : 'Sales'}
+            description={canEdit
+              ? 'Fix a mis-keyed product, quantity or seat. Remarks are mandatory; every correction is recorded and carried into the Excel export.'
+              : 'Every sale recorded on board.'}
           />
           {!!sales.error && <Banner tone="danger" message={sales.error} />}
           {sales.items.map((sale) => (
@@ -347,7 +399,7 @@ export default function LogsScreen({ user }) {
                 <Text style={{ fontSize: 13, fontWeight: '600' }}>{npr(sale.npr_amount)}</Text>
               </View>
               <Text style={styles.mono}>
-                {sale.flight_number} · {sale.flight_date} · seat {sale.seat_number}
+                {sectorLabel(sale)} · seat {sale.seat_number}
                 {' · '}
                 {sale.sold_by_crew_member_id && canOversee ? (
                   <Text
@@ -363,32 +415,64 @@ export default function LogsScreen({ user }) {
                 <RemarkLine label={`${sale.sale_type} remarks`} text={sale.remarks} />
               )}
               {!!sale.edited_by && (
-                <RemarkLine label={`Edited by ${sale.edited_by}`} text={sale.edit_remarks} />
+                <RemarkLine label={`Last edited by ${sale.edited_by}`} text={sale.edit_remarks} />
               )}
-              {!sale.bundle_id && canEdit && (
-                <Button
-                  title={editing?.id === sale.id ? 'Cancel' : 'Correct this sale'}
-                  tone="ghost"
-                  small
-                  style={{ marginTop: 6, alignSelf: 'flex-start' }}
-                  onPress={() => {
-                    if (editing?.id === sale.id) return setEditing(null);
-                    setEditing(sale);
-                    setEditProduct(sale.product_id);
-                    setEditQuantity(String(sale.quantity));
-                    setEditRemarks('');
-                  }}
-                />
+              <View style={[styles.row, styles.gap8, { marginTop: 6 }]}>
+                {!sale.bundle_id && canEdit && (
+                  <Button
+                    title={editing?.id === sale.id ? 'Cancel' : 'Correct this sale'}
+                    tone="ghost"
+                    small
+                    onPress={() => {
+                      if (editing?.id === sale.id) return setEditing(null);
+                      setEditing(sale);
+                      setEditProduct(sale.product_id);
+                      setEditQuantity(String(sale.quantity));
+                      setEditSeat(sale.seat_number || '');
+                      setEditRemarks('');
+                    }}
+                  />
+                )}
+                {!!sale.edit_count && (
+                  <Button
+                    title={saleHistory[sale.id] ? 'Hide corrections' : `${sale.edit_count} correction(s)`}
+                    tone="ghost"
+                    small
+                    onPress={() => toggleSaleHistory(sale.id)}
+                  />
+                )}
+              </View>
+              {!!saleHistory[sale.id] && (
+                <View style={{ marginTop: 4 }}>
+                  {saleHistory[sale.id].map((h) => (
+                    <View key={h.id}>
+                      <Text style={styles.mono}>
+                        {String(h.changed_at || '').replace('T', ' ').slice(0, 16)} · {h.changed_by} · {h.changes.join('; ') || 'no field changed'}
+                      </Text>
+                      <RemarkLine text={h.remarks} style={{ marginTop: 2, marginBottom: 4 }} />
+                    </View>
+                  ))}
+                </View>
               )}
 
               {editing?.id === sale.id && (
                 <View style={{ marginTop: 10, backgroundColor: COLORS.surfaceAlt, padding: 12, borderRadius: 10 }}>
+                  <Text style={[styles.label, { marginBottom: 2 }]}>Sector</Text>
+                  <Text style={[styles.mono, { marginBottom: 8 }]}>
+                    {sectorLabel(sale)}
+                    {sale.aircraft ? ` · ${sale.aircraft}` : ''}
+                    {sale.duty_group_label ? ` · ${sale.duty_group_label}` : ''}
+                    {'\n'}Recorded {String(sale.transaction_time || '').replace('T', ' ').slice(0, 16)} · sold by {sale.seller_name || 'unattributed'} · {sale.sale_type} · paid {sale.transaction_currency} {sale.transaction_currency_amount}
+                  </Text>
                   <Select
                     label="Correct product"
                     valueLabel={products.find((p) => p.id === editProduct)?.product_name}
                     onPress={() => setEditPicker(true)}
                   />
-                  <Field label="Quantity" value={editQuantity} onChangeText={setEditQuantity} keyboardType="number-pad" />
+                  <View style={[styles.row, styles.gap8]}>
+                    <View style={styles.flex1}><Field label="Quantity" value={editQuantity} onChangeText={setEditQuantity} keyboardType="number-pad" /></View>
+                    <View style={styles.flex1}><Field label="Seat" value={editSeat} onChangeText={setEditSeat} autoCapitalize="characters" /></View>
+                  </View>
                   <Field
                     label="Remarks (mandatory)"
                     value={editRemarks}
