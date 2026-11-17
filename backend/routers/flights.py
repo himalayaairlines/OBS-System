@@ -91,11 +91,29 @@ def _flight_rows(connection, where="", params=()):
     ).fetchall()
 
 
+def _with_device_state(connection, rows, account):
+    """Add this iPad's own flags (7.12): my_finished_at, my_started_at,
+    my_forms_locked_at, my_completed_at. The app works from these, not from
+    the merged flight status, so the other iPad never holds it up."""
+    out = []
+    for r in rows:
+        d = dict(r)
+        state = trip_flow.device_state(connection, d["id"], account)
+        d["my_finished_at"] = state["finished_at"]
+        d["my_started_at"] = state["started_at"] if d["direction"] == "RETURN" else (d["created_at"] or "")
+        d["my_forms_locked_at"] = state["forms_locked_at"] or d["reports_locked_at"]
+        root_id = d["linked_flight_id"] if d["direction"] == "RETURN" and d["linked_flight_id"] else d["id"]
+        d["my_completed_at"] = trip_flow.device_state(connection, root_id, account)["completed_at"] or d["trip_completed_at"]
+        out.append(d)
+    return out
+
+
 def _crew_visible_rows(connection, account):
-    """The legs this iPad sees (7.11). A device may be rostered to several
-    trips on one day, but it sees only the earliest trip not yet finished with
-    "Finish whole flight" (plus that trip's other leg); the next trip appears
-    once the current one is complete."""
+    """The legs this iPad sees (7.11/7.12). A device may be rostered to several
+    trips on one day, but it sees only the earliest trip it has not yet
+    finished with "Finish whole flight" (plus that trip's other leg); the next
+    trip appears once this iPad has completed the current one. What the other
+    iPad has or has not done does not matter."""
     rows = _flight_rows(
         connection,
         """WHERE f.id IN (SELECT flight_id FROM flight_assignments WHERE crew_account=?)
@@ -103,17 +121,16 @@ def _crew_visible_rows(connection, account):
              AND f.flight_date >= date('now','-3 day')""",
         (account,),
     )
-    pending = [dict(r) for r in rows if not r["trip_completed_at"]]
+    rows = _with_device_state(connection, rows, account)
+    # A finished trip ("Finish whole flight" on this iPad) leaves the iPad altogether.
+    pending = [r for r in rows if not r["my_completed_at"]]
     if not pending:
-        return rows
-    # One trip at a time: the earliest trip (by date, then the order Inventory
-    # created them) that is not yet finished with "Finish whole flight". The
-    # next trip on the roster appears once this one is complete.
+        return []
     def root_id(r):
         return r["linked_flight_id"] if r["direction"] == "RETURN" and r["linked_flight_id"] else r["id"]
     current = min(pending, key=lambda r: (r["flight_date"], root_id(r)))
     keep = {r["id"] for r in pending if root_id(r) == root_id(current)}
-    return [r for r in rows if r["id"] in keep or r["trip_completed_at"]]
+    return [r for r in rows if r["id"] in keep]
 
 
 @router.get("/flights")
@@ -221,7 +238,9 @@ def set_aircraft(flight_id: int, data: AircraftUpdate, user: dict = Depends(requ
         if not flight:
             raise HTTPException(status_code=404, detail="Flight not found.")
         _assert_device_assigned(connection, flight, user)
-        _assert_leg_open(flight, "change aircraft")
+        if flight["aircraft_type"] == aircraft_type and (flight["aircraft"] or None) == aircraft:
+            return dict(_flight_rows(connection, "WHERE f.id=?", (flight_id,))[0])  # replayed offline save
+        _assert_leg_open(flight, "change aircraft", connection, user)
         _guard_locked_field(user, flight, "aircraft_locked", "Aircraft", data.remarks)
         sold = connection.execute(
             "SELECT COUNT(*) c FROM sales WHERE flight_id=?", (flight_id,)
@@ -262,7 +281,9 @@ def set_pax(flight_id: int, data: PaxUpdate, user: dict = Depends(requires("crew
         if not flight:
             raise HTTPException(status_code=404, detail="Flight not found.")
         _assert_device_assigned(connection, flight, user)
-        _assert_leg_open(flight, "change the PAX load")
+        if flight["passengers"] == data.passengers:
+            return dict(_flight_rows(connection, "WHERE f.id=?", (flight_id,))[0])  # replayed offline save
+        _assert_leg_open(flight, "change the PAX load", connection, user)
         _guard_locked_field(user, flight, "pax_locked", "PAX load", data.remarks)
         connection.execute(
             """UPDATE flights SET passengers=?, pax_locked=1,
@@ -306,7 +327,26 @@ def _assert_device_assigned(connection, flight, user):
         )
 
 
-def _assert_leg_open(flight, action="change"):
+def _is_device(connection, flight, user) -> bool:
+    """A cabin iPad rostered to the leg (as opposed to Management correcting)."""
+    if permissions_for(user["role"]) >= {"sales_edit"}:
+        return False
+    return user["employee_id"] in trip_flow.leg_devices(connection, flight["id"])
+
+
+def _assert_leg_open(flight, action="change", connection=None, user=None):
+    if connection is not None and user is not None and _is_device(connection, flight, user):
+        # 7.12: this iPad's own view of the leg.
+        if flight["status"] not in ("OPEN", "FLOWN"):
+            raise HTTPException(status_code=400, detail="This flight has been closed and reconciled.")
+        state = trip_flow.device_state(connection, flight["id"], user["employee_id"])
+        if flight["direction"] == "RETURN" and not state["started_at"]:
+            trip_flow.assert_started({"direction": "RETURN", "started_at": None}, action)
+        if flight["status"] == "FLOWN" or state["finished_at"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Selling is finished on this sector, so it can no longer {action}.")
+        return
     trip_flow.assert_started(flight, action)
     if flight["status"] == "FLOWN":
         raise HTTPException(
@@ -346,10 +386,9 @@ def _guard_locked_field(user, flight, lock_column, label, remarks):
 def finish_flight(flight_id: int, user: dict = Depends(requires("crew"))):
     """Close selling on a leg.
 
-    On a round trip both legs are worked from the same iPad account, so the
-    outbound group must hand over explicitly. Once finished, no further sale can
-    be recorded against this leg and the return leg becomes the active one, which
-    is what keeps each group's commission separate.
+    7.12: each iPad finishes on its own. The leg is FLOWN for Management once
+    every rostered iPad has finished it (or when Management finishes it).
+    Pressing it twice (an offline replay) is harmless.
     """
     connection = get_connection()
     try:
@@ -358,41 +397,58 @@ def finish_flight(flight_id: int, user: dict = Depends(requires("crew"))):
             raise HTTPException(status_code=404, detail="Flight not found.")
         if flight["status"] == "CLOSED":
             raise HTTPException(status_code=400, detail="This flight is already closed.")
-        if flight["status"] == "FLOWN":
-            raise HTTPException(status_code=400, detail="This flight has already been finished.")
-
         _assert_device_assigned(connection, flight, user)
-        trip_flow.assert_started(flight, "finish it")
+        is_device = _is_device(connection, flight, user)
+        device = user["employee_id"]
+        already = False
+        now = now_iso()
+        if is_device:
+            state = trip_flow.device_state(connection, flight_id, device)
+            if flight["direction"] == "RETURN" and not state["started_at"] and flight["status"] == "OPEN":
+                trip_flow.assert_started({"direction": "RETURN", "started_at": None}, "finish it")
+            already = bool(state["finished_at"]) or flight["status"] == "FLOWN"
+            trip_flow.set_device_state(connection, flight_id, device, "finished_at", now)
+            if flight["status"] == "OPEN" and trip_flow.all_devices_done(connection, flight_id, "finished_at"):
+                connection.execute(
+                    "UPDATE flights SET status='FLOWN', finished_by=?, finished_at=? WHERE id=?",
+                    (device, now, flight_id))
+        else:
+            if flight["status"] == "FLOWN":
+                already = True
+            else:
+                trip_flow.assert_started(flight, "finish it")
+                connection.execute(
+                    "UPDATE flights SET status='FLOWN', finished_by=?, finished_at=? WHERE id=?",
+                    (device, now, flight_id))
+        connection.commit()
 
         totals = connection.execute(
             """SELECT COALESCE(SUM(CASE WHEN sale_type='NORMAL' THEN npr_amount END),0) AS revenue,
                       COUNT(DISTINCT order_ref) AS orders
-               FROM sales WHERE flight_id=?""",
-            (flight_id,),
+               FROM sales WHERE flight_id=?""" + (" AND crew_id=?" if is_device else ""),
+            (flight_id, device) if is_device else (flight_id,),
         ).fetchone()
-
-        connection.execute(
-            "UPDATE flights SET status='FLOWN', finished_by=?, finished_at=? WHERE id=?",
-            (user["employee_id"], now_iso(), flight_id),
-        )
-        connection.commit()
-        row = _flight_rows(connection, "WHERE f.id=?", (flight_id,))[0]
+        rows = _flight_rows(connection, "WHERE f.id=?", (flight_id,))
+        row = _with_device_state(connection, rows, device)[0] if is_device else dict(rows[0])
         # Forms may be filled in before finishing (7.10); say how many are still open.
-        filed = trip_flow.reports_filed(connection, flight_id)
-        reports_outstanding = max(0, len(REPORT_TYPES) - filed)
+        handled, _ = trip_flow.reports_handled(connection, flight_id, device if is_device else None)
+        reports_outstanding = max(0, len(REPORT_TYPES) - handled)
     finally:
         connection.close()
 
-    log_action(user, "FLIGHT", "FINISH_FLIGHT",
-               f"Finished selling on {flight['flight_number']} ({flight['direction'].lower()}). "
-               f"{totals['orders']} transaction(s), NPR {float(totals['revenue'] or 0):,.2f}.",
-               "flight", flight_id)
+    if not already:
+        log_action(user, "FLIGHT", "FINISH_FLIGHT",
+                   f"Finished selling on {flight['flight_number']} ({flight['direction'].lower()})"
+                   + (f" on iPad {device}" if is_device else "") + ". "
+                   f"{totals['orders']} transaction(s), NPR {float(totals['revenue'] or 0):,.2f}.",
+                   "flight", flight_id)
     return {
-        **dict(row),
+        **row,
         "revenue_npr": round(float(totals["revenue"] or 0), 2),
         "transactions": int(totals["orders"] or 0),
         "reports_outstanding": reports_outstanding,
         "reports_total": len(REPORT_TYPES),
+        "already_finished": already,
     }
 
 
@@ -416,80 +472,116 @@ def trip_progress(flight_id: int, user: dict = Depends(current_user)):
 
 @router.post("/flights/{flight_id}/start-second")
 def start_second_flight(flight_id: int, user: dict = Depends(requires("crew"))):
-    """Open the return sector. The first sector's forms lock and stay with Management."""
+    """Open the return sector on THIS iPad. Its first-sector forms lock. The
+    leg counts as started for Management when the first iPad starts it; the
+    first sector's forms close to everyone once every iPad has moved on."""
     connection = get_connection()
     try:
-        state = trip_flow.progress(connection, flight_id)
-        if not state["round_trip"]:
+        probe = trip_flow.progress(connection, flight_id)
+        if not probe["round_trip"]:
             raise HTTPException(status_code=400, detail="This is a one-way flight; there is no second flight.")
-        first, second = state["legs"][0], state["legs"][-1]
-        leg = connection.execute("SELECT * FROM flights WHERE id=?", (second["id"],)).fetchone()
+        leg = connection.execute("SELECT * FROM flights WHERE id=?", (probe["legs"][-1]["id"],)).fetchone()
         _assert_device_assigned(connection, leg, user)
+        is_device = _is_device(connection, leg, user)
+        device = user["employee_id"] if is_device else None
+        state = trip_flow.progress(connection, flight_id, device=device)
+        first, second = state["legs"][0], state["legs"][-1]
         if second["started"]:
-            raise HTTPException(status_code=400, detail="The second flight has already been started.")
+            # Already done on this iPad (an offline replay): nothing to change.
+            return state
         if not first["finished"]:
             raise HTTPException(status_code=400, detail="Finish the first flight before starting the second.")
         if not first["stock_count_done"]:
-            waiting = f" Waiting for {', '.join(first['stock_count_waiting_for'])}." if first["stock_count_waiting_for"] else ""
             raise HTTPException(
                 status_code=400,
-                detail=f"Both iPads must confirm the remaining stock after {first['origin']}-{first['destination']} "
-                       f"before the second flight starts.{waiting}")
+                detail=f"Confirm the remaining stock after {first['origin']}-{first['destination']} on this iPad "
+                       "before the second flight starts.")
         if not first["reports_done"]:
             raise HTTPException(
                 status_code=400,
                 detail=f"Save all {first['reports_total']} forms for {first['origin']}-{first['destination']} "
                        f"first ({first['reports_handled']} handled so far), or mark the rest as submitted by the other iPad.")
         now = now_iso()
-        connection.execute("UPDATE flights SET started_at=?, started_by=? WHERE id=?",
-                           (now, user["employee_id"], second["id"]))
-        connection.execute("UPDATE flights SET reports_locked_at=? WHERE id=?", (now, first["id"]))
+        if is_device:
+            trip_flow.set_device_state(connection, second["id"], device, "started_at", now)
+            trip_flow.set_device_state(connection, first["id"], device, "forms_locked_at", now)
+            connection.execute("UPDATE flights SET started_at=COALESCE(started_at, ?), started_by=COALESCE(started_by, ?) WHERE id=?",
+                               (now, device, second["id"]))
+            if trip_flow.all_devices_done(connection, first["id"], "forms_locked_at"):
+                connection.execute("UPDATE flights SET reports_locked_at=COALESCE(reports_locked_at, ?) WHERE id=?",
+                                   (now, first["id"]))
+        else:
+            connection.execute("UPDATE flights SET started_at=?, started_by=? WHERE id=?",
+                               (now, user["employee_id"], second["id"]))
+            connection.execute("UPDATE flights SET reports_locked_at=? WHERE id=?", (now, first["id"]))
         connection.commit()
-        result = trip_flow.progress(connection, flight_id)
+        result = trip_flow.progress(connection, flight_id, device=device)
     finally:
         connection.close()
     log_action(user, "FLIGHT", "START_SECOND_FLIGHT",
-               f"Started {second['flight_number']} {second['origin']}-{second['destination']}; "
-               f"forms for {first['origin']}-{first['destination']} locked.", "flight", second["id"])
+               f"Started {second['flight_number']} {second['origin']}-{second['destination']}"
+               + (f" on iPad {device}" if device else "") + "; "
+               f"forms for {first['origin']}-{first['destination']} locked on it.", "flight", second["id"])
     return result
 
 
 @router.post("/flights/{flight_id}/complete-trip")
 def complete_trip(flight_id: int, user: dict = Depends(requires("crew"))):
-    """The last step: every sector finished, every form saved, stock return in.
-    After this nothing on the trip can be changed from the iPad."""
+    """The last step on THIS iPad: every sector finished, every form saved,
+    its stock return in. The trip is complete for Management once every iPad
+    has pressed it. After this nothing on the trip can be changed from the iPad."""
     connection = get_connection()
     try:
-        state = trip_flow.progress(connection, flight_id)
-        root = connection.execute("SELECT * FROM flights WHERE id=?", (state["root_id"],)).fetchone()
+        probe = trip_flow.progress(connection, flight_id)
+        root = connection.execute("SELECT * FROM flights WHERE id=?", (probe["root_id"],)).fetchone()
         _assert_device_assigned(connection, root, user)
+        is_device = _is_device(connection, root, user)
+        device = user["employee_id"] if is_device else None
+        state = trip_flow.progress(connection, flight_id, device=device)
         if state["completed"]:
-            raise HTTPException(status_code=400, detail="This flight is already finished.")
+            return state  # already done on this iPad (an offline replay)
         missing = []
         for leg in state["legs"]:
             if not leg["finished"]:
                 missing.append(f"finish {leg['origin']}-{leg['destination']}")
             elif leg["stock_count_needed"] and not leg["stock_count_done"]:
-                missing.append(f"confirm the remaining stock after {leg['origin']}-{leg['destination']}"
-                               + (f" (waiting for {', '.join(leg['stock_count_waiting_for'])})" if leg["stock_count_waiting_for"] else ""))
+                missing.append(f"confirm the remaining stock after {leg['origin']}-{leg['destination']}")
             elif not leg["reports_done"]:
                 missing.append(f"save the forms for {leg['origin']}-{leg['destination']}")
-        if state["stock_return"] not in ("PENDING", "APPROVED"):
+        if is_device:
+            if not state["my_stock_return_done"]:
+                missing.append("submit the stock return (Sync page)")
+        elif state["stock_return"] not in ("PENDING", "APPROVED"):
             missing.append("submit the stock return (Sync page)")
         if missing:
             raise HTTPException(status_code=400, detail="Before finishing the whole flight: " + "; ".join(missing) + ".")
         now = now_iso()
-        for leg in state["legs"]:
-            connection.execute(
-                "UPDATE flights SET trip_completed_at=?, trip_completed_by=?, "
-                "reports_locked_at=COALESCE(reports_locked_at, ?) WHERE id=?",
-                (now, user["employee_id"], now, leg["id"]))
+        if is_device:
+            trip_flow.set_device_state(connection, state["root_id"], device, "completed_at", now)
+            for leg in state["legs"]:
+                trip_flow.set_device_state(connection, leg["id"], device, "forms_locked_at", now)
+            if trip_flow.all_devices_done(connection, state["root_id"], "completed_at"):
+                for leg in state["legs"]:
+                    connection.execute(
+                        "UPDATE flights SET trip_completed_at=?, trip_completed_by=?, "
+                        "reports_locked_at=COALESCE(reports_locked_at, ?), "
+                        "status=CASE WHEN status='OPEN' THEN 'FLOWN' ELSE status END, "
+                        "finished_at=COALESCE(finished_at, ?), finished_by=COALESCE(finished_by, ?) WHERE id=?",
+                        (now, device, now, now, device, leg["id"]))
+        else:
+            for leg in state["legs"]:
+                connection.execute(
+                    "UPDATE flights SET trip_completed_at=?, trip_completed_by=?, "
+                    "reports_locked_at=COALESCE(reports_locked_at, ?) WHERE id=?",
+                    (now, user["employee_id"], now, leg["id"]))
         connection.commit()
-        result = trip_flow.progress(connection, flight_id)
+        result = trip_flow.progress(connection, flight_id, device=device)
     finally:
         connection.close()
     route = " / ".join(f"{l['origin']}-{l['destination']}" for l in state["legs"])
-    log_action(user, "FLIGHT", "COMPLETE_TRIP", f"Finished the whole flight {route}.", "flight", state["root_id"])
+    log_action(user, "FLIGHT", "COMPLETE_TRIP",
+               f"Finished the whole flight {route}" + (f" on iPad {device}" if device else "") + ".",
+               "flight", state["root_id"])
     return result
 
 
@@ -550,12 +642,13 @@ def submit_sector_stock(flight_id: int, data: SectorStockIn, user: dict = Depend
     """The crew confirm the remaining stock once the sector is finished and its forms are saved."""
     connection = get_connection()
     try:
-        state = trip_flow.progress(connection, flight_id)
-        leg = next((l for l in state["legs"] if l["id"] == flight_id), None)
-        if not leg:
-            raise HTTPException(status_code=404, detail="Flight not found.")
         row = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Flight not found.")
         _assert_device_assigned(connection, row, user)
+        device_user = user["employee_id"] if _is_device(connection, row, user) else None
+        state = trip_flow.progress(connection, flight_id, device=device_user)
+        leg = next((l for l in state["legs"] if l["id"] == flight_id), None)
         if not leg["finished"]:
             raise HTTPException(status_code=400, detail="Finish this sector before confirming the remaining stock.")
         if not leg["stock_count_needed"]:
@@ -563,7 +656,7 @@ def submit_sector_stock(flight_id: int, data: SectorStockIn, user: dict = Depend
         if leg["reports_locked"] or state["completed"]:
             raise HTTPException(status_code=400, detail="This sector is locked; the remaining stock can no longer be changed here.")
         legs = trip_flow.trip_legs(connection, flight_id)
-        is_device = user["employee_id"] in leg["devices"]
+        is_device = device_user is not None
         result = sector_stock.save_sector_count(
             connection, legs, flight_id, {l.product_id: l.declared_remaining for l in data.lines},
             (data.remarks or "").strip() or None, user["employee_id"], now_iso(),
@@ -910,6 +1003,23 @@ def _trip_rows(connection, where="", params=()):
         trip["fully_assigned"] = all(l.get("crew_account") for l in trip["legs"])
         trip["devices"] = (trip["legs"][0].get("crew_account") or "").split(",") if trip["legs"] and trip["legs"][0].get("crew_account") else []
         trip["groups_formed"] = sum(1 for l in trip["legs"] if l.get("duty_group_id"))
+        # 7.12: where each iPad stands, since the two work independently.
+        trip["device_status"] = {}
+        for device in trip["devices"]:
+            root_state = trip_flow.device_state(connection, outbound["id"], device)
+            if root_state["completed_at"] or outbound.get("trip_completed_at"):
+                trip["device_status"][device] = "FINISHED WHOLE FLIGHT"
+                continue
+            finished = [trip_flow.leg_finished_for(connection, l, device) for l in trip["legs"]]
+            started = [trip_flow.leg_started_for(connection, l, device) for l in trip["legs"]]
+            if all(finished):
+                trip["device_status"][device] = "ALL SECTORS FINISHED"
+            elif any(finished):
+                trip["device_status"][device] = "SECOND SECTOR" if started[-1] else "FIRST SECTOR FINISHED"
+            elif any(l["status"] != "OPEN" for l in trip["legs"]):
+                trip["device_status"][device] = "FINISHED"
+            else:
+                trip["device_status"][device] = "SELLING / NOT STARTED"
     return trips
 
 

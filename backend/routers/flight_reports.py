@@ -271,8 +271,15 @@ def reports_for_flight(flight_id: int, user: dict = Depends(requires("flight_rep
             }
             entries.append(entry)
 
+        # 7.12: the sector's state as THIS iPad sees it. A leg this iPad has
+        # finished is FLOWN for it even while the other iPad is still selling.
+        my_state = (trip_flow.device_state(connection, flight_id, user["employee_id"])
+                    if not _may_review(user) else {c: None for c in trip_flow.DEVICE_STATE_COLUMNS})
+        my_finished = flight["status"] != "OPEN" or bool(my_state["finished_at"])
         return {
             "flight_id": flight_id,
+            "my_finished": my_finished,
+            "my_started": flight["direction"] != "RETURN" or bool(my_state["started_at"]) or (_may_review(user) and bool(flight["started_at"])),
             "flight_number": flight["flight_number"],
             "flight_date": flight["flight_date"],
             "origin": flight["origin"],
@@ -283,10 +290,13 @@ def reports_for_flight(flight_id: int, user: dict = Depends(requires("flight_rep
             "aircraft_type": flight["aircraft_type"],
             "duty_group_id": flight["duty_group_id"],
             "duty_group_label": flight["duty_group_label"],
-            "flight_status": flight["status"],
+            "flight_status": "FLOWN" if (flight["status"] == "OPEN" and my_finished) else flight["status"],
+            "merged_status": flight["status"],
             "trip_type": flight["trip_type"],
             "segment": 2 if flight["direction"] == "RETURN" else 1,
-            "locked": bool(flight["reports_locked_at"] or flight["trip_completed_at"]),
+            "locked": bool(flight["reports_locked_at"] or flight["trip_completed_at"]
+                           or (not _may_review(user)
+                               and trip_flow.device_state(connection, flight_id, user["employee_id"])["forms_locked_at"])),
             "devices": devices,
             "reports": entries,
             # Still to handle on this iPad: neither submitted nor marked as the other iPad's.
@@ -315,7 +325,7 @@ def defer_report(data: DeferIn, user: dict = Depends(requires("flight_reports"))
     try:
         flight = _flight(connection, data.flight_id)
         _assert_device(connection, flight, user)
-        trip_flow.assert_reports_open(connection, flight["id"], _may_review(user))
+        trip_flow.assert_reports_open(connection, flight["id"], _may_review(user), user["employee_id"])
         if connection.execute("SELECT 1 FROM flight_reports WHERE flight_id=? AND report_type=? AND status='SUBMITTED'",
                               (data.flight_id, report_type)).fetchone():
             raise HTTPException(status_code=400, detail="This form has already been submitted.")
@@ -363,7 +373,7 @@ def file_report(data: ReportIn, user: dict = Depends(requires("flight_reports"))
     try:
         flight = _flight(connection, data.flight_id)
         _assert_device(connection, flight, user)
-        trip_flow.assert_reports_open(connection, flight["id"], _may_review(user))
+        trip_flow.assert_reports_open(connection, flight["id"], _may_review(user), user["employee_id"])
         # 7.10: forms may be filled in at any time, before or after the sector
         # is finished. Finishing reminds the crew of any form still outstanding.
 
@@ -380,6 +390,30 @@ def file_report(data: ReportIn, user: dict = Depends(requires("flight_reports"))
                 return _render(connection, connection.execute(
                     f"{REPORT_SELECT} WHERE r.id=?", (existing["id"],)).fetchone())
 
+            if existing["status"] == "SUBMITTED" and data.submit and data.client_ref \
+                    and existing["submitted_by"] != user["employee_id"]:
+                # 7.12: both iPads filled this form in on board, with no way of
+                # knowing. Nothing is lost: the second copy is kept as the next
+                # revision, marked as such, and Management sees both.
+                rev_no = int(existing["rev_no"]) + 1
+                note = f"Also filled in on iPad {user['employee_id']} while offline; merged on upload."
+                connection.execute(
+                    """UPDATE flight_reports SET payload=?, rev_no=?, status='SUBMITTED',
+                           edited_by=?, edited_at=?, edit_remarks=? WHERE id=?""",
+                    (json.dumps(payload, ensure_ascii=False), rev_no, user["employee_id"], now, note, existing["id"]))
+                connection.execute(
+                    """INSERT INTO flight_report_revisions(report_id,rev_no,payload,action,changed_by,changed_at,remarks)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (existing["id"], rev_no, json.dumps(payload, ensure_ascii=False), "MERGED",
+                     user["employee_id"], now, note))
+                connection.commit()
+                merged = _render(connection, connection.execute(
+                    f"{REPORT_SELECT} WHERE r.id=?", (existing["id"],)).fetchone())
+                log_action(user, "CABIN REPORT", "MERGE",
+                           f"{merged['title']} for {merged['flight_number']} {merged['flight_date']} was filled in on both "
+                           f"iPads; the copy from {user['employee_id']} is kept as {merged['rev_label']}.",
+                           "flight_report", existing["id"])
+                return merged
             if existing["status"] == "SUBMITTED":
                 raise HTTPException(
                     status_code=400,
@@ -475,7 +509,7 @@ def unsubmit_report(report_id: int, user: dict = Depends(requires("flight_report
             raise HTTPException(status_code=404, detail="Report not found.")
         flight = _flight(connection, row["flight_id"])
         _assert_device(connection, flight, user)
-        trip_flow.assert_reports_open(connection, flight["id"], _may_review(user))
+        trip_flow.assert_reports_open(connection, flight["id"], _may_review(user), user["employee_id"])
         if row["status"] != "SUBMITTED":
             raise HTTPException(status_code=400, detail="This report has not been filed yet.")
         if int(row["unsubmit_count"]) >= REPORT_UNSUBMIT_LIMIT:
@@ -539,7 +573,7 @@ def edit_report(report_id: int, data: ReportEdit,
         reviewer = _may_review(user)
         if not reviewer:
             _assert_device(connection, _flight(connection, row["flight_id"]), user)
-            trip_flow.assert_reports_open(connection, row["flight_id"], False)
+            trip_flow.assert_reports_open(connection, row["flight_id"], False, user["employee_id"])
             if row["status"] != "SUBMITTED":
                 raise HTTPException(status_code=400, detail="Save the form first.")
         payload = _clean_payload(row["report_type"], data.payload)

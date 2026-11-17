@@ -4,6 +4,10 @@ import { Text } from '../text';
 import Icon from '../icons';
 
 import { api, cached, enqueueSale, orderRef, saveDutyGroup, writeCache } from '../api';
+import {
+  applyJournalToFlights, applyJournalToProgress, buildLocalProgress, cachedProgress, journalLeg, journalTrip,
+  legFinished, legSellable, pruneJournal, readJournal, rootOf, tripAction,
+} from '../tripLocal';
 import { confirm, notify } from '../dialog';
 import { COLORS, money, npr, styles } from '../theme';
 import {
@@ -16,9 +20,9 @@ const DUTY_GROUP_MIN = 2;
 const DUTY_GROUP_MAX = 10;
 const groupSizeOk = (n) => n >= DUTY_GROUP_MIN && n <= DUTY_GROUP_MAX;
 
-// A return leg opens for selling only after "Start second flight" (7.5).
-const isStarted = (f) => f.direction !== 'RETURN' || !!f.started_at;
-const isSellable = (f) => !!f && f.status === 'OPEN' && isStarted(f);
+// A return leg opens for selling only after "Start second flight" on THIS
+// iPad (7.5 / 7.12); a leg this iPad has finished is no longer sellable here.
+const isSellable = (f) => legSellable(f);
 const route = (l) => `${l.origin}\u2192${l.destination}`;
 
 export default function CrewScreen({ user, online, onQueueChange, goToReports, goTo }) {
@@ -71,7 +75,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
   // Legs still in play: selling, finished but the trip not yet closed off,
   // or the second flight waiting to be started.
   const sellableFlights = flights.filter(isSellable);
-  const activeFlights = flights.filter((f) => (f.status === 'OPEN' || f.status === 'FLOWN') && !f.trip_completed_at);
+  const activeFlights = flights.filter((f) => (f.status === 'OPEN' || f.status === 'FLOWN') && !f.trip_completed_at && !f.my_completed_at);
   const flight = flights.find((f) => f.id === flightId) || null;
   const selling = isSellable(flight);
   const [trip, setTrip] = useState(null);
@@ -90,7 +94,11 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
       // no signal, so the roster has to be on the device already.
       cached('crewRoster', '/crew-roster'),
     ]);
-    setFlights(f.data || []);
+    // This iPad's own steps (taken with or without a signal) laid over the
+    // server copy; a trip finished on this iPad has left it.
+    const journal = await pruneJournal(f.data || []);
+    const list = applyJournalToFlights(f.data || [], journal);
+    setFlights(list);
     setProducts(p.data || []);
     setBundles(b.data || []);
     setRates(r.data || []);
@@ -98,10 +106,11 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
     setRoster(c.data || []);
     setStale(f.stale || p.stale || b.stale || r.stale);
     setFlightId((current) => {
-      const all = f.data || [];
-      const active = all.filter((x) => (x.status === 'OPEN' || x.status === 'FLOWN') && !x.trip_completed_at);
+      const all = list;
+      const active = all.filter((x) => (x.status === 'OPEN' || x.status === 'FLOWN') && !x.trip_completed_at && !x.my_completed_at);
       if (current && active.some((x) => x.id === current)) return current;
-      return all.filter(isSellable)[0]?.id ?? active[0]?.id ?? all[0]?.id ?? null;
+      // Never fall back to a finished trip: with nothing active the page says so.
+      return all.filter(isSellable)[0]?.id ?? active[0]?.id ?? null;
     });
   }, []);
 
@@ -120,15 +129,23 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
   useEffect(() => { loadReference(); }, [loadReference]);
 
   // Where the trip stands: which step is next, and whether it may be taken.
+  // Works with no signal too (7.12): the last server copy, or the cached
+  // flight list, with this iPad's own steps laid over it.
   const loadTrip = useCallback(async () => {
-    if (!flightId || !online) return;
-    try {
-      setTrip(await api(`/flights/${flightId}/trip-progress`));
-    } catch {
-      setTrip(null);
+    if (!flightId) return setTrip(null);
+    const journal = await readJournal();
+    let server = null;
+    if (online) {
+      try {
+        server = await api(`/flights/${flightId}/trip-progress`);
+        await writeCache(`tripProgress.${flightId}`, server);
+      } catch { /* fall back to the cached copy below */ }
     }
-  }, [flightId, online]);
-  useEffect(() => { loadTrip(); }, [loadTrip, flights]);
+    if (!server) server = await cachedProgress(flightId);
+    if (server && server.root_id !== rootOf(flights.find((x) => x.id === flightId)) && flights.length) server = null;
+    setTrip(server ? applyJournalToProgress(server, journal) : buildLocalProgress(flights, flightId, journal));
+  }, [flightId, online, flights]);
+  useEffect(() => { loadTrip(); }, [loadTrip]);
   useEffect(() => { loadInventory(flightId); }, [flightId, loadInventory]);
   useEffect(() => { loadDutyGroup(flightId); }, [flightId, loadDutyGroup]);
   useEffect(() => {
@@ -360,15 +377,19 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
   async function saveAircraft() {
     if (!flight) return;
     try {
-      const updated = await api(`/flights/${flight.id}/aircraft`, {
-        method: 'PUT',
+      const { result, queued } = await tripAction({
+        method: 'PUT', endpoint: `/flights/${flight.id}/aircraft`, label: 'Aircraft', flightId: flight.id,
         body: { aircraft_type: aircraftType, aircraft: aircraft || null, remarks: lockRemarks || null },
       });
+      await journalLeg(rootOf(flight), flight.id, { aircraft_type: aircraftType, aircraft: aircraft || null });
+      const updated = result || { id: flight.id, aircraft_type: aircraftType, aircraft: aircraft || null, aircraft_locked: 1 };
       setFlights((list) => list.map((f) => (f.id === updated.id ? { ...f, ...updated } : f)));
       setMessage({
         tone: 'success',
-        text: `Aircraft set to ${updated.aircraft_type}${updated.aircraft ? ` (${updated.aircraft})` : ''}.`,
+        text: `Aircraft set to ${updated.aircraft_type}${updated.aircraft ? ` (${updated.aircraft})` : ''}.`
+          + (queued ? ' Saved on this iPad; it uploads on Wi-Fi.' : ''),
       });
+      onQueueChange?.();
       setLockRemarks('');
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
@@ -378,12 +399,15 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
   async function savePax() {
     if (!flight) return;
     try {
-      const updated = await api(`/flights/${flight.id}/pax-load`, {
-        method: 'PUT',
+      const { result, queued } = await tripAction({
+        method: 'PUT', endpoint: `/flights/${flight.id}/pax-load`, label: 'PAX load', flightId: flight.id,
         body: { passengers: Number(pax), remarks: lockRemarks || null },
       });
+      await journalLeg(rootOf(flight), flight.id, { passengers: Number(pax) });
+      const updated = result || { id: flight.id, passengers: Number(pax), pax_locked: 1 };
       setFlights((list) => list.map((f) => (f.id === updated.id ? { ...f, ...updated } : f)));
-      setMessage({ tone: 'success', text: `PAX load saved as ${updated.passengers}.` });
+      setMessage({ tone: 'success', text: `PAX load saved as ${updated.passengers}.` + (queued ? ' Saved on this iPad; it uploads on Wi-Fi.' : '') });
+      onQueueChange?.();
       setLockRemarks('');
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
@@ -524,11 +548,17 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
     });
     if (!sure) return;
     try {
-      const state = await api(`/flights/${second.id}/start-second`, { method: 'POST' });
-      setTrip(state);
+      const { queued } = await tripAction({ endpoint: `/flights/${second.id}/start-second`, label: 'Start second flight', flightId: second.id });
+      const now = new Date().toISOString();
+      await journalLeg(trip.root_id, second.id, { started_at: now });
+      await journalLeg(trip.root_id, trip.legs[0].id, { forms_locked_at: now });
+      await writeCache(`sectorReports.${trip.legs[0].id}`, null);
       await loadReference();
       setFlightId(second.id);
-      setMessage({ tone: 'success', text: `${second.flight_number} ${route(second)} started. Enter the aircraft, PAX load and crew.` });
+      await loadTrip();
+      onQueueChange?.();
+      setMessage({ tone: 'success', text: `${second.flight_number} ${route(second)} started. Enter the aircraft, PAX load and crew.`
+        + (queued ? ' (No signal: this step uploads with the sales on Wi-Fi.)' : '') });
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -544,10 +574,14 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
     });
     if (!sure) return;
     try {
-      const state = await api(`/flights/${trip.root_id}/complete-trip`, { method: 'POST' });
-      setTrip(state);
+      const { queued } = await tripAction({ endpoint: `/flights/${trip.root_id}/complete-trip`, label: 'Finish whole flight', flightId: trip.root_id });
+      const now = new Date().toISOString();
+      await journalTrip(trip.root_id, { completed_at: now, synced: !queued });
+      for (const leg of trip.legs) await journalLeg(trip.root_id, leg.id, { forms_locked_at: now });
       await loadReference();
-      setMessage({ tone: 'success', text: 'The whole flight is finished. Thank you — nothing more to do on this trip.' });
+      onQueueChange?.();
+      setMessage({ tone: 'success', text: 'The whole flight is finished. Thank you — nothing more to do on this trip.'
+        + (queued ? ' Everything uploads by itself when the iPad reaches Wi-Fi.' : '') });
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -639,9 +673,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
             )}
             {!activeFlights.length && (
               <Text style={styles.empty}>
-                {flights.length
-                  ? 'No trip in progress on this iPad.'
-                  : 'No flight is assigned to this iPad yet. Inventory assigns the device to a trip.'}
+                No trip in progress on this iPad. Inventory assigns the device to a trip; it appears here by itself.
               </Text>
             )}
           </>
@@ -658,8 +690,8 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
                   <Pill label={`${dutyMembers.length} crew`} tone={dutyGroup.pending ? 'warning' : 'muted'} />
                 )}
                 <Pill
-                  label={selling ? 'SELLING' : flight.status === 'OPEN' ? 'NOT STARTED' : flight.status === 'FLOWN' ? 'FINISHED' : 'CLOSED'}
-                  tone={selling ? 'success' : flight.status === 'OPEN' ? 'muted' : flight.status === 'FLOWN' ? 'warning' : 'muted'}
+                  label={selling ? 'SELLING' : legFinished(flight) ? (flight.status === 'CLOSED' ? 'CLOSED' : 'FINISHED') : 'NOT STARTED'}
+                  tone={selling ? 'success' : legFinished(flight) && flight.status !== 'CLOSED' ? 'warning' : 'muted'}
                 />
               </View>
             )}
@@ -758,9 +790,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
                 />
               </>
             )}
-            {!selling && !trip && !online && (
-              <Text style={styles.mono}>Connect to Wi-Fi to see the next step for this trip.</Text>
-            )}
+
           </>
         )}
       </Card>
@@ -1047,7 +1077,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
           value: f.id,
           label: `${f.flight_number} · ${f.origin}→${f.destination}`,
           sub: `${f.flight_date} · ${f.direction} · `
-            + (isSellable(f) ? 'selling' : f.status === 'OPEN' ? 'not started yet' : 'finished'),
+            + (isSellable(f) ? 'selling' : legFinished(f) ? 'finished' : 'not started yet'),
         }))}
         selectedValue={flightId}
         onSelect={(value) => { setFlightId(value); setCart({}); setFlightPicker(false); }}
@@ -1155,18 +1185,17 @@ function Stepper({ label, onPress, disabled }) {
 /* ------------------------------------------------------------------ */
 function TripSteps({ trip }) {
   const [first, second] = trip.legs;
-  const stock = { NOT_SUBMITTED: false, WAITING: false, REJECTED: false, PENDING: true, APPROVED: true }[trip.stock_return];
+  // This iPad's own steps (7.12): the other iPad never holds it up.
+  const stock = trip.my_stock_return_done ?? ({ NOT_SUBMITTED: false, WAITING: false, REJECTED: false, PENDING: true, APPROVED: true }[trip.stock_return]);
   const steps = [];
   trip.legs.forEach((leg, index) => {
     const label = trip.round_trip ? (index === 0 ? 'first segment' : 'second segment') : 'this flight';
     if (index === 1) steps.push({ label: `Start second flight ${route(leg)}`, done: leg.started });
     steps.push({ label: `Sell and finish ${route(leg)}`, done: leg.finished });
     if (leg.stock_count_needed) {
-      const waiting = (leg.stock_count_waiting_for || []).length ? ` (waiting for ${leg.stock_count_waiting_for.join(', ')})` : '';
-      steps.push({ label: `Remaining stock after ${route(leg)} confirmed by both iPads${leg.stock_count_done ? '' : waiting}`, done: !!leg.stock_count_done });
+      steps.push({ label: `Remaining stock after ${route(leg)} confirmed on this iPad`, done: !!leg.stock_count_done });
     } else {
-      const waiting = (trip.stock_return_waiting_for || []).length ? ` (waiting for ${trip.stock_return_waiting_for.join(', ')})` : '';
-      steps.push({ label: `Final stock return from both iPads${stock ? '' : waiting}`, done: stock });
+      steps.push({ label: 'Final stock return from this iPad', done: !!stock });
     }
     steps.push({
       label: `Forms (${label}) ${leg.reports_handled ?? leg.reports_filed}/${leg.reports_total} handled`
@@ -1197,7 +1226,7 @@ function TripSteps({ trip }) {
 function TripAction({ trip, online, onStartSecond, onComplete, goToReports, goTo }) {
   const [first, second] = trip.legs;
   const last = trip.legs[trip.legs.length - 1];
-  const need = !online ? ' Needs a connection.' : '';
+  const need = !online ? ' (No signal: the step is saved on this iPad and uploads on Wi-Fi.)' : '';
 
   if (trip.step === 'DONE') {
     return <Banner tone="success" message="The whole flight is finished. Nothing on this trip can be edited any more." />;
@@ -1209,14 +1238,13 @@ function TripAction({ trip, online, onStartSecond, onComplete, goToReports, goTo
           title={`Start second flight ${route(second)}`}
           tone="primary"
           onPress={onStartSecond}
-          disabled={!online || !trip.can_start_second}
+          disabled={!trip.can_start_second}
         />
         <Text style={[styles.mono, { marginTop: 6 }]}>
           {trip.can_start_second
             ? `The forms and the remaining stock for ${route(first)} lock and stay with Management when you start.`
             : trip.step === 'STOCK_FIRST'
-              ? `Both iPads confirm the remaining stock after ${route(first)} on the Reports page first`
-                + (first.my_stock_count_done ? ` (yours is in; waiting for ${(first.stock_count_waiting_for || []).join(', ')}).` : '.')
+              ? `Confirm the remaining stock on this iPad after ${route(first)} on the Reports page first.`
               : `Handle all ${first.reports_total} forms for ${route(first)} first `
                 + `(${first.reports_handled ?? first.reports_filed} handled): fill them in or mark them as submitted by the other iPad.`}
           {need}
@@ -1235,14 +1263,13 @@ function TripAction({ trip, online, onStartSecond, onComplete, goToReports, goTo
           title="Finish whole flight"
           tone="danger"
           onPress={onComplete}
-          disabled={!online || !trip.can_complete}
+          disabled={!trip.can_complete}
         />
         <Text style={[styles.mono, { marginTop: 6 }]}>
           {trip.step === 'FORMS_LAST'
             ? `Handle all ${last.reports_total} forms for ${route(last)} first (${last.reports_handled ?? last.reports_filed} handled).`
             : trip.step === 'STOCK_RETURN'
-              ? 'Both iPads submit the final stock return first'
-                + (trip.my_stock_return_done ? ` (yours is in; waiting for ${(trip.stock_return_waiting_for || []).join(', ')}).` : ' (Sync page).')
+              ? 'Submit this iPad\u2019s final stock return first (Sync page).'
               : 'Everything is in. Finishing locks the whole trip.'}
           {need}
         </Text>

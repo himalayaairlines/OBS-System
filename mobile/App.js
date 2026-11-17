@@ -9,6 +9,7 @@ import {
   API_BASE, KEYS, api, checkBackendVersion, flushAll, readQueue,
   readReconQueue, setSessionEndedHandler, setToken,
 } from './src/api';
+import { flushTripActions, outboxCount } from './src/tripLocal';
 import { notify } from './src/dialog';
 import { COLORS, CONTENT_MAX_WIDTH, ROLE_LABELS, initials, styles } from './src/theme';
 import { Banner, Button, Card, DialogHost, Field, Pill } from './src/ui';
@@ -211,8 +212,8 @@ function AppContent() {
 
   /* -------------------------- connectivity ------------------------ */
   const refreshQueue = useCallback(async () => {
-    const [sales, recon] = await Promise.all([readQueue(), readReconQueue()]);
-    setQueueCount(sales.length + recon.length);
+    const [sales, recon, steps] = await Promise.all([readQueue(), readReconQueue(), outboxCount()]);
+    setQueueCount(sales.length + recon.length + steps);
   }, []);
 
   useEffect(() => { refreshQueue(); }, [refreshQueue]);
@@ -245,15 +246,20 @@ function AppContent() {
   // without NetInfo firing.
   const autoSync = useCallback(async () => {
     if (autoSyncBusy.current || !user) return;
-    const [queue, reconQueue] = await Promise.all([readQueue(), readReconQueue()]);
-    if (!queue.length && !reconQueue.length) return;
+    const [queue, reconQueue, steps] = await Promise.all([readQueue(), readReconQueue(), outboxCount()]);
+    if (!queue.length && !reconQueue.length && !steps) return;
     autoSyncBusy.current = true;
     try {
       const result = await flushAll();
+      // The trip steps (finish, remaining stock, forms, start second, stock
+      // return, finish whole flight) go up only once every sale is in, so the
+      // server never sees a sector finished before its last sale.
+      const stepsResult = result.remaining ? { accepted: 0 } : await flushTripActions();
       await refreshQueue();
       const parts = [];
       if (result.accepted) parts.push(`${result.accepted} sale(s)`);
       if (result.reconciliations) parts.push(`${result.reconciliations} stock count(s)`);
+      if (stepsResult.accepted) parts.push(`${stepsResult.accepted} trip step(s)`);
       if (parts.length) {
         setSyncNotice(`Uploaded ${parts.join(' and ')}.`);
         setTimeout(() => setSyncNotice(null), 6000);

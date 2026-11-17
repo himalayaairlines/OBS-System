@@ -63,7 +63,14 @@ export default function LogsScreen({ user }) {
 
   // Audit log and sales ledger are paged on the server; both grow without limit.
   const logs = usePaged(`/logs?${query().replace(/&?destination=[^&]*/, '')}`, { enabled: canOversee && tab === 'logs' });
-  const sales = usePaged('/sales', { enabled: canSeeSales && tab === 'sales' });
+  // 7.12: a trip is worked by two iPad logins; Management can look at one at a time.
+  const [deviceFilter, setDeviceFilter] = useState('');
+  const [devices, setDevices] = useState([]);
+  useEffect(() => {
+    if (!canSeeSales) return;
+    api('/crew-accounts').then((rows) => setDevices((rows || []).map((r) => r.employee_id).filter(Boolean))).catch(() => {});
+  }, [canSeeSales]);
+  const sales = usePaged(`/sales${deviceFilter ? `?device=${encodeURIComponent(deviceFilter)}` : ''}`, { enabled: canSeeSales && tab === 'sales' });
 
   // Each tab exports exactly what it is showing, filters included.
   const EXPORTS = {
@@ -389,6 +396,12 @@ export default function LogsScreen({ user }) {
               ? 'Fix a mis-keyed product, quantity or seat. Remarks are mandatory; every correction is recorded and carried into the Excel export.'
               : 'Every sale recorded on board.'}
           />
+          <Select
+            label="iPad login"
+            valueLabel={deviceFilter || 'All iPads'}
+            onPress={() => setPicker('device')}
+            style={{ marginBottom: 10 }}
+          />
           {!!sales.error && <Banner tone="danger" message={sales.error} />}
           {sales.items.map((sale) => (
             <View key={sale.id} style={styles.listRow}>
@@ -400,6 +413,7 @@ export default function LogsScreen({ user }) {
               </View>
               <Text style={styles.mono}>
                 {sectorLabel(sale)} · seat {sale.seat_number}
+                {sale.crew_id ? ` · iPad ${sale.crew_id}` : ''}
                 {' · '}
                 {sale.sold_by_crew_member_id && canOversee ? (
                   <Text
@@ -513,6 +527,14 @@ export default function LogsScreen({ user }) {
           ...Array.from({ length: 31 }, (_, i) => ({ value: i + 1, label: String(i + 1) }))]}
         selectedValue={filter.day}
         onSelect={(value) => { setFilter({ ...filter, day: value }); setPicker(null); }}
+        onClose={() => setPicker(null)}
+      />
+      <OptionModal
+        visible={picker === 'device'}
+        title="iPad login"
+        options={[{ value: '', label: 'All iPads' }, ...[...new Set([...devices, ...sales.items.map((x) => x.crew_id).filter(Boolean)])].sort().map((d) => ({ value: d, label: d }))]}
+        selectedValue={deviceFilter}
+        onSelect={(value) => { setDeviceFilter(value); setPicker(null); }}
         onClose={() => setPicker(null)}
       />
       <OptionModal

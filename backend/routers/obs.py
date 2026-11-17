@@ -10,6 +10,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+import trip_flow
 from database import get_connection
 from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from routers.warehouse import move_stock
@@ -359,7 +360,7 @@ def my_pending_return(user: dict = Depends(requires("sync"))):
             # and the next one on the roster stay off the page.
             from routers.flights import _crew_visible_rows
             visible = {trip_root(connection, r["id"]) for r in _crew_visible_rows(connection, user["employee_id"])
-                       if not r["trip_completed_at"]}
+                       if not r["my_completed_at"]}
             roots &= visible
 
         pending = []
@@ -383,7 +384,12 @@ def my_pending_return(user: dict = Depends(requires("sync"))):
 def _pending_entry(connection, root_id, user):
     """One trip's outstanding stock return, or None if it is not due."""
     legs = _trip_label(connection, root_id)
-    if not legs or any(leg["status"] == "OPEN" for leg in legs):
+    if not legs:
+        return None
+    devices = _trip_devices(connection, root_id)
+    own = user["employee_id"] if user["employee_id"] in devices else None
+    # 7.12: due once THIS iPad has finished every leg (Management: once the leg is FLOWN).
+    if any(not trip_flow.leg_finished_for(connection, leg, own) for leg in legs):
         return None  # still flying, or nothing to report
 
     existing = connection.execute(
@@ -459,13 +465,17 @@ def submit_reconciliation(
         legs = _trip_label(connection, root_id)
         if not legs:
             raise HTTPException(status_code=404, detail="Flight not found.")
-        if any(l["status"] == "OPEN" for l in legs):
-            raise HTTPException(
-                status_code=400,
-                detail="Finish every sector of the trip before declaring the stock return.",
-            )
-
         devices = _trip_devices(connection, root_id)
+        own_device = user["employee_id"] if user["employee_id"] in devices else None
+        for l in legs:
+            # 7.12: this iPad must have finished its own selling on every leg;
+            # the other iPad's progress does not hold it up.
+            if not trip_flow.leg_finished_for(connection, l, own_device):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Finish every sector of the trip before declaring the stock return.",
+                )
+
         if devices and user["employee_id"] not in devices \
                 and "reconcile_approve" not in permissions_for(user["role"]):
             raise HTTPException(

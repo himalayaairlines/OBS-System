@@ -5,7 +5,11 @@ import { Text, TextInput } from '../text';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 
-import { api, cached, downloadReport, writeCache } from '../api';
+import { api, cached, downloadReport, readCache, writeCache } from '../api';
+import {
+  applyJournalToFlights, applyJournalToPosition, applyJournalToSector, buildLocalPosition, buildLocalSector,
+  amendQueuedReport, findLeg, journalLeg, legFinished, legStarted, loadProgress, readJournal, rootOf, tripAction,
+} from '../tripLocal';
 import { usePaged } from '../paging';
 import { confirm, notify } from '../dialog';
 import { COLORS, npr, styles, todayString } from '../theme';
@@ -232,8 +236,9 @@ function FormField({ field, value, onChange, readOnly, onPickDate }) {
 /* The screen                                                          */
 /* ------------------------------------------------------------------ */
 // A sector the iPad is working: selling now, or finished but not yet locked.
-const crewSector = (f) => !f.trip_completed_at && !f.reports_locked_at
-  && (f.status === 'FLOWN' || (f.status === 'OPEN' && (f.direction !== 'RETURN' || !!f.started_at)));
+// 7.12: judged by what THIS iPad has done (my_* flags), never by the other iPad.
+const crewSector = (f) => !f.trip_completed_at && !f.my_completed_at && !f.reports_locked_at && !f.my_forms_locked_at
+  && (legFinished(f) || (f.status === 'OPEN' && legStarted(f)));
 
 export default function ReportsScreen({ user, online, initialFlightId, onHandled, goTo }) {
   const canReview = user.permissions?.includes('reports_review');
@@ -276,28 +281,48 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
 
   const loadFlights = useCallback(async () => {
     const result = await cached('flights', '/flights');
-    const list = result.data || [];
+    const list = canReview ? (result.data || []) : applyJournalToFlights(result.data || [], await readJournal());
     setFlights(list);
     setFlightId((current) => {
       if (current && list.some((f) => f.id === current)) return current;
       // The crew care about the sector they are selling on or have just finished.
       const open = list.filter((f) => crewSector(f));
-      if (!canReview) return (open.find((f) => f.status === 'FLOWN') || open[0])?.id ?? null;
+      if (!canReview) return (open.find((f) => legFinished(f)) || open[0])?.id ?? null;
       const finished = list.filter((f) => f.status === 'FLOWN');
       return finished[0]?.id ?? list[0]?.id ?? null;
     });
   }, []);
 
+  // The server copy when there is one, otherwise the cached copy, otherwise a
+  // list built on the iPad; this iPad's own saves and hand-overs on top (7.12).
   const loadSector = useCallback(async (id) => {
     if (!id) return setSector(null);
     try {
       const result = await cached(`sectorReports.${id}`, `/flights/${id}/reports`, null);
-      setSector(result.data || null);
-      return result.data || null;
+      let data = result.data || null;
+      if (!canReview) {
+        const journal = await readJournal();
+        if (!data) {
+          const flight = ((await readCache('flights', [])) || []).find((f) => f.id === id);
+          const defs = forms.length ? forms : ((await readCache('reportForms', [])) || []);
+          data = buildLocalSector(applyJournalToFlights(flight ? [flight] : [], journal)[0] || flight, defs, user.employee_id);
+        }
+        data = applyJournalToSector(data, journal, user.employee_id);
+      }
+      setSector(data);
+      return data;
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
-  }, []);
+  }, [canReview, forms, user.employee_id]);
+
+  // Where the trip stands for this iPad (needed for the final return card).
+  const [trip, setTrip] = useState(null);
+  useEffect(() => {
+    if (canReview || !flightId) return setTrip(null);
+    loadProgress(flightId, flights, online).then(setTrip).catch(() => setTrip(null));
+  }, [canReview, flightId, flights, online, sector]);
+  const rootId = rootOf(flights.find((f) => f.id === flightId));
 
   // Every report ever filed, so the management list is paged on the server.
   const filedParts = [];
@@ -366,39 +391,34 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
 
     setBusy(true);
     try {
-      const saved = await api('/flight-reports', {
-        method: 'POST',
-        body: {
-          flight_id: sector.flight_id,
-          report_type: openType,
-          payload: draft,
-          submit: true,
-          client_ref: `RPT-${sector.flight_id}-${openType}-${Date.now().toString(36)}`,
-        },
-      });
-      setOpenType(null);
-      const fresh = await loadSector(sector.flight_id);
-      await loadFiled();
-      onHandled?.();
-      const left = (fresh?.outstanding || []).length;
-      if (!canReview && fresh && left === 0) {
-        const roundFirst = fresh.trip_type === 'ROUND_TRIP' && fresh.segment === 1;
-        const go = await confirm({
-          title: 'All forms handled',
-          message: `All forms for ${fresh.sector} are saved and sent to Management.\n\n`
-            + (roundFirst
-              ? 'Next: go to the Sales page and press \u201cStart second flight\u201d (both iPads must have confirmed the remaining stock).'
-              : 'Next: press \u201cFinish whole flight\u201d on the Sales page (both iPads must have submitted the final stock return).'),
-          confirmText: 'Go to Sales',
-          cancelText: 'Later',
-        });
-        if (go) goTo?.('crew');
+      const body = {
+        flight_id: sector.flight_id,
+        report_type: openType,
+        payload: draft,
+        submit: true,
+        client_ref: `RPT-${sector.flight_id}-${openType}-${Date.now().toString(36)}`,
+      };
+      let saved = null;
+      if (canReview) {
+        saved = await api('/flight-reports', { method: 'POST', body });
       } else {
-        setMessage({
-          tone: 'success',
-          text: `${form.title} saved and sent to Management — ${saved.issue_label}, ${saved.rev_label}.`
-            + (left ? ` ${left} form(s) still to fill in for this sector.` : ''),
-        });
+        // The crew's form is saved on the iPad first and uploads on Wi-Fi if there is no signal (7.12).
+        const { result } = await tripAction({ endpoint: '/flight-reports', body, label: `${form.title}`, flightId: sector.flight_id });
+        saved = result;
+        await journalLeg(rootId, sector.flight_id, (leg) => ({
+          ...leg,
+          forms: { ...(leg.forms || {}), [openType]: 'mine' },
+          payloads: { ...(leg.payloads || {}), [openType]: draft },
+        }));
+      }
+      setOpenType(null);
+      await loadSector(sector.flight_id);
+      if (online) await loadFiled();
+      onHandled?.();
+      // No pop-up per form (7.11): the list shows what is saved, and the
+      // "Submit all forms" button at the bottom closes the set.
+      if (canReview && saved) {
+        setMessage({ tone: 'success', text: `${form.title} saved — ${saved.issue_label}, ${saved.rev_label}.` });
       }
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
@@ -435,6 +455,23 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     }
     setBusy(true);
     try {
+      if (target.local) {
+        // Saved on this iPad and not uploaded yet: the queued copy is simply replaced.
+        const stillQueued = await amendQueuedReport(sector.flight_id, openType, draft);
+        await journalLeg(rootId, sector.flight_id, (leg) => ({ ...leg, payloads: { ...(leg.payloads || {}), [openType]: draft } }));
+        if (!stillQueued) {
+          // It has uploaded in the meantime: a fresh copy has the server id to correct.
+          const fresh = await loadSector(sector.flight_id);
+          const uploaded = fresh?.reports?.find((r) => r.report_type === openType)?.report;
+          if (uploaded && !uploaded.local) return saveCorrection(uploaded);
+        }
+        setMessage({ tone: 'success', text: `Changes saved on this iPad. ${form.title} uploads on Wi-Fi.` });
+        setOpenType(null);
+        setEditRemarks('');
+        await loadSector(flightId);
+        setBusy(false);
+        return;
+      }
       const saved = await api(`/flight-reports/${target.id}`, {
         method: 'PUT',
         body: { payload: draft, remarks: editRemarks.trim() },
@@ -453,6 +490,21 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     setBusy(false);
   }
 
+  /** All forms handled: one confirmation at the end, then on to the Sales page. */
+  async function submitAllForms() {
+    const roundFirst = sector.trip_type === 'ROUND_TRIP' && sector.segment === 1;
+    const go = await confirm({
+      title: 'All forms handled',
+      message: `All forms for ${sector.sector} are saved and sent to Management.\n\n`
+        + (roundFirst
+          ? 'Next: go to the Sales page and press \u201cStart second flight\u201d.'
+          : 'Next: press \u201cFinish whole flight\u201d on the Sales page.'),
+      confirmText: 'Go to Sales',
+      cancelText: 'Later',
+    });
+    if (go) goTo?.('crew');
+  }
+
   /** "Submitted by the other iPad" (7.11): this device leaves the form to the other one. */
   async function deferForm(item) {
     const sure = await confirm({
@@ -463,8 +515,9 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     });
     if (!sure) return;
     try {
-      await api('/flight-reports/defer', { method: 'POST', body: { flight_id: sector.flight_id, report_type: item.report_type } });
-      await writeCache(`sectorReports.${sector.flight_id}`, null);
+      await tripAction({ endpoint: '/flight-reports/defer', body: { flight_id: sector.flight_id, report_type: item.report_type },
+        label: `${item.title}: other iPad`, flightId: sector.flight_id });
+      await journalLeg(rootId, sector.flight_id, (leg) => ({ ...leg, forms: { ...(leg.forms || {}), [item.report_type]: 'other' } }));
       await loadSector(sector.flight_id);
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
@@ -473,7 +526,13 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
 
   async function undeferForm(reportType) {
     try {
-      await api(`/flight-reports/defer?flight_id=${sector.flight_id}&report_type=${encodeURIComponent(reportType)}`, { method: 'DELETE' });
+      await tripAction({ method: 'DELETE', endpoint: `/flight-reports/defer?flight_id=${sector.flight_id}&report_type=${encodeURIComponent(reportType)}`,
+        label: 'Take a form back', flightId: sector.flight_id });
+      await journalLeg(rootId, sector.flight_id, (leg) => {
+        const forms = { ...(leg.forms || {}) };
+        if (forms[reportType] === 'other') delete forms[reportType];
+        return { ...leg, forms };
+      });
       await writeCache(`sectorReports.${sector.flight_id}`, null);
       await loadSector(sector.flight_id);
     } catch (error) {
@@ -511,18 +570,21 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     if (!sure) return;
     setBusy(true);
     try {
-      const result = await api(`/flights/${sector.flight_id}/finish`, { method: 'PUT' });
-      await writeCache(`sectorReports.${sector.flight_id}`, null);
+      const { result, queued } = await tripAction({ method: 'PUT', endpoint: `/flights/${sector.flight_id}/finish`,
+        label: `Finish ${sector.flight_number} ${sector.sector}`, flightId: sector.flight_id });
+      await journalLeg(rootId, sector.flight_id, { finished_at: new Date().toISOString() });
       await loadFlights();
       await loadSector(sector.flight_id);
-      const left = result.reports_outstanding ?? 0;
+      const left = result ? (result.reports_outstanding ?? 0) : outstanding.length;
       await notify({
         title: 'Sector finished',
-        message: `${sector.flight_number}: ${result.transactions} transaction(s), ${npr(result.revenue_npr)}.\n\n`
-          + 'Next, in order: 1) confirm the remaining stock on this iPad, 2) see the commission, 3) the forms'
-          + (left ? ` (${left} of ${result.reports_total} still to handle on this sector)` : ' (all already saved)')
+        message: (result ? `${sector.flight_number}: ${result.transactions} transaction(s), ${npr(result.revenue_npr)}.` 
+          : `${sector.flight_number} is finished on this iPad. (No signal: this uploads with the sales on Wi-Fi.)`)
+          + '\n\nNext, in order: 1) confirm the remaining stock on this iPad, 2) see the commission, 3) the forms'
+          + (left ? ` (${left} still to handle on this sector)` : ' (all already saved)')
           + ', then the final step on the Sales page.',
       });
+      if (queued) onHandled?.();
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -548,7 +610,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
           right={(
             <View style={[styles.row, styles.gap8]}>
               <Pill label={form.form_code} tone="muted" />
-              {!!report && report.status === 'SUBMITTED' && (
+              {!!report && report.status === 'SUBMITTED' && !report.local && (
                 <Button title="Download PDF" tone="secondary" small onPress={downloadPdf} disabled={!online} />
               )}
             </View>
@@ -633,7 +695,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
               <Button
                 title={busy ? 'Saving…' : 'Save changes'}
                 onPress={() => saveCorrection(report)}
-                disabled={busy || !online || !dirty}
+                disabled={busy || (!online && !report.local) || !dirty}
               />
             )}
           </Card>
@@ -675,14 +737,16 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
                 tone="primary"
                 style={styles.flex1}
                 onPress={submitForm}
-                disabled={busy || !online}
+                disabled={busy || (!online && canReview)}
               />
             )}
 
           </View>
           {!online && (
             <Text style={[styles.mono, { marginTop: 8 }]}>
-              Reports need a connection. Fill this in once the iPad is back on Wi-Fi.
+              {canReview
+                ? 'Corrections need a connection.'
+                : 'No signal: the form is saved on this iPad and uploads with the sales on Wi-Fi.'}
             </Text>
           )}
           {locked && !canReview && (
@@ -771,17 +835,18 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
             title={busy ? 'Finishing\u2026' : `Finish this flight \u00b7 ${sector.flight_number} ${sector.sector}`}
             tone="warning"
             onPress={finishFlight}
-            disabled={busy || !online}
+            disabled={busy}
           />
-          {!online && <Text style={[styles.mono, { marginTop: 6 }]}>Needs a connection.</Text>}
+          {!online && <Text style={[styles.mono, { marginTop: 6 }]}>No signal: the step is saved on this iPad and uploads on Wi-Fi.</Text>}
         </Card>
       )}
 
       {!canReview && !!sector && sector.flight_status !== 'OPEN' && (
         sector.trip_type === 'ROUND_TRIP' && sector.segment === 1 ? (
-          <SectorStockCard flightId={sector.flight_id} online={online} locked={locked} goTo={goTo} user={user} />
+          <SectorStockCard flightId={sector.flight_id} rootId={rootId} online={online} locked={locked} goTo={goTo} user={user}
+            flight={flights.find((f) => f.id === sector.flight_id)} onChanged={() => loadSector(sector.flight_id)} />
         ) : (
-          <FinalReturnCard flightId={sector.flight_id} online={online} goTo={goTo} user={user} />
+          <FinalReturnCard trip={trip} goTo={goTo} user={user} />
         )
       )}
 
@@ -837,12 +902,13 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
           {!!(sector.awaiting_other || []).length && (
             <Banner tone="info" message={`${sector.awaiting_other.length} form(s) are marked as submitted by the other iPad. They turn to SAVED when that iPad uploads them.`} />
           )}
-          {!outstanding.length && sector.flight_status !== 'OPEN' && !sector.locked && (
-            <Banner
-              tone="success"
-              message={sector.trip_type === 'ROUND_TRIP' && sector.segment === 1
-                ? 'All forms handled. Next: go to Sales and press \u201cStart second flight\u201d once both iPads have confirmed the remaining stock.'
-                : 'All forms handled. Next: press \u201cFinish whole flight\u201d on the Sales page once both iPads have submitted the final stock return.'}
+          {sector.flight_status !== 'OPEN' && !sector.locked && (
+            <Button
+              title={outstanding.length ? `Submit all forms (${outstanding.length} still to handle)` : 'Submit all forms'}
+              tone="primary"
+              style={{ marginTop: 12 }}
+              disabled={!!outstanding.length}
+              onPress={submitAllForms}
             />
           )}
         </Card>
@@ -944,7 +1010,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
 /* ------------------------------------------------------------------ */
 /* Remaining stock after a sector (7.9)                                */
 /* ------------------------------------------------------------------ */
-function SectorStockCard({ flightId, online, locked, goTo, user }) {
+function SectorStockCard({ flightId, rootId, flight, online, locked, goTo, user, onChanged }) {
   const me = user?.employee_id;
   const [position, setPosition] = useState(null);
   const [declared, setDeclared] = useState({});
@@ -960,20 +1026,34 @@ function SectorStockCard({ flightId, online, locked, goTo, user }) {
     return otherIn ? Math.max(0, i.expected_remaining - others) : i.expected_remaining;
   };
 
+  // Server copy when there is a signal; otherwise the cached copy or the
+  // trolley stock this iPad knows. This iPad's own confirmation on top (7.12).
   const load = useCallback(async () => {
-    try {
-      const p = await api(`/flights/${flightId}/sector-stock`);
-      setPosition(p);
-      setDeclared(Object.fromEntries(p.items.map((i) => [i.product_id,
-        String((i.by_device || {})[me] ?? mineDefault(p, i))])));
-      setRemarks((p.device_remarks || {})[me] || '');
-      setEditing(!p.my_submitted);
-      setError(null);
-    } catch (e) {
-      setError(e.message);
+    let p = null;
+    if (online) {
+      try {
+        p = await api(`/flights/${flightId}/sector-stock`);
+        await writeCache(`sectorStock.${flightId}`, p);
+      } catch (e) {
+        if (e.permanent) { setError(e.message); return; }
+      }
     }
-  }, [flightId, me]);
-  useEffect(() => { if (online) load(); }, [load, online]);
+    if (!p) p = await readCache(`sectorStock.${flightId}`, null);
+    if (!p) {
+      const inventory = await readCache(`inventory.${flightId}`, null) || await readCache(`inventory.${rootId}`, []);
+      p = buildLocalPosition(flight, inventory, me);
+    }
+    if (!p) { setError('The trolley stock is not on this iPad yet. Open the Sales page once with a connection.'); return; }
+    const leg = findLeg(await readJournal(), flightId);
+    p = applyJournalToPosition(p, leg, me);
+    setPosition(p);
+    setDeclared(Object.fromEntries(p.items.map((i) => [i.product_id,
+      String((i.by_device || {})[me] ?? mineDefault(p, i))])));
+    setRemarks((p.device_remarks || {})[me] || '');
+    setEditing(!p.my_submitted);
+    setError(null);
+  }, [flightId, rootId, flight, me, online]);
+  useEffect(() => { load(); }, [load]);
 
   async function submit() {
     const lines = position.items.map((i) => ({ product_id: i.product_id, declared_remaining: Number(declared[i.product_id] || 0) }));
@@ -987,22 +1067,28 @@ function SectorStockCard({ flightId, online, locked, goTo, user }) {
     const others = (position.devices || []).filter((d) => d !== me);
     const sure = await confirm({
       title: 'Confirm the remaining stock on this iPad?',
-      message: `${position.flight_number} ${position.origin}\u2192${position.destination}: `
+      message: `${position.flight_number} ${position.origin}→${position.destination}: `
         + `${lines.reduce((a, l) => a + l.declared_remaining, 0)} unit(s) left on this iPad after this sector.`
-        + (others.length ? ` ${others.join(', ')} declares its own part; the two are added together.` : '')
-        + ' Management and Inventory can see this at once.',
+        + (others.length ? ` ${others.join(', ')} declares its own part; the two are added together on upload.` : '')
+        + ' Management and Inventory see it once it is uploaded.',
       confirmText: 'Confirm',
     });
     if (!sure) return;
     setBusy(true);
     try {
-      const result = await api(`/flights/${flightId}/sector-stock`, { method: 'POST', body: { lines, remarks: remarks.trim() || null } });
+      const { queued } = await tripAction({ endpoint: `/flights/${flightId}/sector-stock`, body: { lines, remarks: remarks.trim() || null },
+        label: `Remaining stock ${position.flight_number}`, flightId });
+      await journalLeg(rootId, flightId, {
+        stock_count_at: new Date().toISOString(),
+        stock_lines: Object.fromEntries(lines.map((l) => [l.product_id, l.declared_remaining])),
+        stock_remarks: remarks.trim() || null,
+      });
       await load();
-      const waiting = (result.waiting_for || []).filter((d) => d !== me);
+      onChanged?.();
       await notify({
         title: 'Remaining stock confirmed',
-        message: (waiting.length ? `Waiting for ${waiting.join(', ')} to confirm its part. ` : 'Both iPads have confirmed. ')
-          + 'Next: see the commission below, then the forms, then \u201cStart second flight\u201d on the Sales page.',
+        message: (queued ? 'Saved on this iPad; it uploads with the sales on Wi-Fi. ' : 'Your count is in. ')
+          + 'Next: see the commission below, then the forms, then “Start second flight” on the Sales page.',
       });
     } catch (e) {
       setError(e.message);
@@ -1010,14 +1096,11 @@ function SectorStockCard({ flightId, online, locked, goTo, user }) {
     setBusy(false);
   }
 
-  if (!online) {
-    return <Card><SectionTitle title="Remaining stock after this sector" description="Needs a connection." /></Card>;
-  }
   if (error) return <Card><Banner tone="danger" message={error} /></Card>;
   if (!position) return null;
   const readOnly = locked || !editing;
   const others = (position.devices || []).filter((d) => d !== me);
-  const waiting = (position.waiting_for || []).filter((d) => d !== me);
+  const otherIn = (position.submitted_devices || []).some((d) => d !== me);
 
   return (
     <Card>
@@ -1026,16 +1109,21 @@ function SectorStockCard({ flightId, online, locked, goTo, user }) {
         description={position.my_submitted
           ? (position.submitted
             ? `Both iPads have confirmed. ${position.total_declared} unit(s) left in total.`
-            : `Your part is in. Waiting for ${waiting.join(', ')} to confirm its part.`)
-          : 'Count what is left on THIS iPad. The system figure is calculated from the load and every sale on both iPads; change a line only if the trolley says otherwise.'}
-        right={<Pill label={position.submitted ? 'Confirmed' : position.my_submitted ? 'Waiting for other iPad' : 'To confirm'}
-                     tone={position.submitted ? 'success' : position.my_submitted ? 'info' : 'warning'} />}
+            : position.local
+              ? 'Confirmed on this iPad. It uploads with the sales on Wi-Fi.'
+              : `Your part is in.${others.length ? ' The other iPad confirms its own part when it uploads.' : ''}`)
+          : 'Count what is left on THIS iPad. The system figure comes from the load and the sales this iPad knows about; change a line only if the trolley says otherwise.'}
+        right={<Pill label={position.submitted ? 'Confirmed' : position.my_submitted ? 'Confirmed on this iPad' : 'To confirm'}
+                     tone={position.submitted || position.my_submitted ? 'success' : 'warning'} />}
       />
+      {position.offline_built && (
+        <Banner tone="info" message="No signal: the figures are what this iPad knows (its load and its own sales). The server adds the other iPad's sales on upload." />
+      )}
       <View style={[styles.row, { paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: COLORS.border }]}>
         <Text style={[styles.mono, { flex: 2 }]}>Product</Text>
         <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>Loaded</Text>
         <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>Sold</Text>
-        <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>{others.length ? 'Should be here' : 'Should be left'}</Text>
+        <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>{otherIn ? 'Should be here' : 'Should be left'}</Text>
         <Text style={[styles.mono, { flex: 1.2, textAlign: 'right' }]}>{others.length ? 'On this iPad' : 'Left'}</Text>
       </View>
       {position.items.map((i) => {
@@ -1050,7 +1138,7 @@ function SectorStockCard({ flightId, online, locked, goTo, user }) {
               {otherQty.length > 0 && <Text style={styles.mono}>{otherQty.map(([d, q]) => `${d}: ${q}`).join(' · ')}</Text>}
             </View>
             <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{i.loaded_quantity}</Text>
-            <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{i.sold_before + i.sold_quantity}</Text>
+            <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{(i.sold_before || 0) + (i.sold_quantity || 0)}</Text>
             <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{expectedHere}</Text>
             <View style={{ flex: 1.2, alignItems: 'flex-end' }}>
               {readOnly ? (
@@ -1076,14 +1164,14 @@ function SectorStockCard({ flightId, online, locked, goTo, user }) {
       {!readOnly ? (
         <>
           <Field label="Remarks (required if a figure differs from the system)" value={remarks} onChangeText={setRemarks} multiline placeholder="e.g. one can damaged" />
-          <Button title={busy ? 'Saving\u2026' : 'Confirm remaining stock on this iPad'} onPress={submit} disabled={busy} />
+          <Button title={busy ? 'Saving…' : 'Confirm remaining stock on this iPad'} onPress={submit} disabled={busy} />
           {position.my_submitted && (
             <Button title="Cancel" tone="ghost" small style={{ marginTop: 8 }} onPress={() => { setEditing(false); load(); }} />
           )}
         </>
       ) : (
         <>
-          {!!position.remarks && <Text style={[styles.mono, { marginTop: 4 }]}>Remarks: {position.remarks}</Text>}
+          {!!(position.device_remarks || {})[me] && <Text style={[styles.mono, { marginTop: 4 }]}>Remarks: {(position.device_remarks || {})[me]}</Text>}
           {!locked && (
             <Button title="Correct this iPad's count" tone="ghost" small style={{ marginTop: 8 }} onPress={() => setEditing(true)} />
           )}
@@ -1094,27 +1182,18 @@ function SectorStockCard({ flightId, online, locked, goTo, user }) {
 }
 
 /** The last sector: the final stock return is on the Sync page (per iPad). */
-function FinalReturnCard({ flightId, online, goTo, user }) {
-  const [trip, setTrip] = useState(null);
-  useEffect(() => {
-    if (!online) return;
-    api(`/flights/${flightId}/trip-progress`).then(setTrip).catch(() => setTrip(null));
-  }, [flightId, online]);
-  const done = trip && ['PENDING', 'APPROVED'].includes(trip.stock_return);
-  const mine = trip?.my_stock_return_done;
-  const waiting = (trip?.stock_return_waiting_for || []).filter((d) => d !== user?.employee_id);
+function FinalReturnCard({ trip, goTo }) {
+  const mine = !!trip?.my_stock_return_done;
   return (
     <Card>
       <SectionTitle
         title="1. Final stock return"
-        description={done
-          ? 'Both iPads have submitted the final stock return. It is with the Inventory Supervisor.'
-          : mine
-            ? `Your part is in. Waiting for ${waiting.join(', ')} to submit its part.`
-            : 'Each iPad submits what is left on it; the two counts are added together and go to Inventory.'}
-        right={<Pill label={done ? 'Submitted' : mine ? 'Waiting for other iPad' : 'To submit'} tone={done ? 'success' : mine ? 'info' : 'warning'} />}
+        description={mine
+          ? 'This iPad’s final stock return is in. The other iPad submits its own part; the two are added together for Inventory.'
+          : 'Submit what is left on this iPad (Sync page). The other iPad submits its own part; the two are added together.'}
+        right={<Pill label={mine ? 'Submitted' : 'To submit'} tone={mine ? 'success' : 'warning'} />}
       />
-      {!done && !mine && <Button title="Open the final stock return" tone="secondary" onPress={() => goTo?.('sync')} />}
+      {!mine && <Button title="Open the final stock return" tone="secondary" onPress={() => goTo?.('sync')} />}
     </Card>
   );
 }

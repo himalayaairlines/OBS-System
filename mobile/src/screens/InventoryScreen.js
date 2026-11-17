@@ -183,6 +183,13 @@ function FlightsTab({ notify }) {
               </View>
             </View>
             <Text style={styles.mono}>{trip.flight_date} · {trip.flight_numbers}</Text>
+            {!!trip.device_status && !!Object.keys(trip.device_status).length && (
+              <View style={[styles.wrap, { marginTop: 4 }]}>
+                {Object.entries(trip.device_status).map(([device, state]) => (
+                  <Pill key={device} label={`${device}: ${state}`} tone={state === 'FINISHED WHOLE FLIGHT' ? 'success' : 'muted'} />
+                ))}
+              </View>
+            )}
             {trip.legs.map((leg) => (
               <Text key={leg.id} style={[styles.mono, { marginTop: 2 }]}>
                 {'   '}{leg.direction === 'OUTBOUND' ? 'Going  ' : 'Return '}

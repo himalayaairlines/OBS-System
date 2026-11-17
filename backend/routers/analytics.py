@@ -567,11 +567,15 @@ def group_summary(user: dict, date: str | None = None):
         conditions = ["f.flight_date=?"]
         params = [target]
         if device_scope:
-            conditions.append(
-                """f.id IN (SELECT flight_id FROM flight_assignments
-                            WHERE crew_account=?)"""
-            )
-            params.append(user["employee_id"])
+            # Only the trip this iPad is working now (7.11). A finished trip, or
+            # no trip at all, shows nothing here.
+            from routers.flights import _crew_visible_rows
+            ids = [r["id"] for r in _crew_visible_rows(connection, user["employee_id"])]
+            if not ids:
+                conditions.append("1=0")
+            else:
+                conditions.append(f"f.id IN ({','.join('?' * len(ids))})")
+                params.extend(ids)
 
         entries, sectors = _commission_entries(connection, conditions, params)
 

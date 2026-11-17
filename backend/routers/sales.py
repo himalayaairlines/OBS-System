@@ -147,8 +147,14 @@ def _expand_lines(connection, transaction: SaleTransaction):
     return expanded
 
 
-def _record(connection, transaction: SaleTransaction, user: dict):
-    """Write one passenger transaction. Raises PermanentError for unretryable input."""
+def _record(connection, transaction: SaleTransaction, user: dict, replay: bool = False):
+    """Write one passenger transaction. Raises PermanentError for unretryable input.
+
+    `replay` marks an offline upload (7.12): the sale was taken on board before
+    the iPad finished the sector, so the per-iPad "started / not finished"
+    checks do not apply to it, and a leg Management has since finished still
+    accepts it. Only a CLOSED (reconciled) flight refuses it.
+    """
     if connection.execute(
         "SELECT 1 FROM sales WHERE order_ref=? LIMIT 1", (transaction.order_ref,)
     ).fetchone():
@@ -173,13 +179,24 @@ def _record(connection, transaction: SaleTransaction, user: dict):
     ).fetchone()
     if not flight:
         raise PermanentError("Flight not found.")
-    if flight["status"] == "FLOWN":
+    if flight["status"] == "FLOWN" and not replay:
         raise PermanentError(
             "Selling has been finished on this leg. Switch to the return flight."
         )
-    if flight["status"] != "OPEN":
+    if flight["status"] not in ("OPEN", "FLOWN"):
         raise PermanentError("This flight has been closed and reconciled.")
-    if not trip_flow.leg_started(flight):
+    accounts = [r["crew_account"] for r in connection.execute(
+        "SELECT crew_account FROM flight_assignments WHERE flight_id=?", (transaction.flight_id,))]
+    if replay:
+        pass  # taken on board before this iPad finished; accepted as recorded
+    elif user["employee_id"] in accounts and "sell_any_flight" not in permissions_for(user["role"]):
+        # 7.12: an iPad sells on its own timetable. It must have started the leg
+        # itself and not yet finished it; the other iPad does not come into it.
+        try:
+            trip_flow.assert_device_may_sell(connection, flight, user["employee_id"])
+        except HTTPException as exc:
+            raise PermanentError(exc.detail)
+    elif not trip_flow.leg_started(flight):
         raise PermanentError("Start the second flight on the Sales page before selling on it.")
     if not flight["passengers"]:
         raise PermanentError("The PAX load has not been entered for this flight.")
@@ -188,8 +205,6 @@ def _record(connection, transaction: SaleTransaction, user: dict):
             f"Seat {seat} does not exist on a {flight['aircraft_type'] or 'this'} aircraft."
         )
 
-    accounts = [r["crew_account"] for r in connection.execute(
-        "SELECT crew_account FROM flight_assignments WHERE flight_id=?", (transaction.flight_id,))]
     if "sell_any_flight" not in permissions_for(user["role"]):
         if not accounts:
             raise PermanentError("No OBS device is assigned to this flight.")
@@ -318,7 +333,7 @@ def sync_sales(data: SyncRequest, user: dict = Depends(requires("crew"))):
     for transaction in data.transactions:
         connection = get_connection()
         try:
-            outcome = _record(connection, transaction, user)
+            outcome = _record(connection, transaction, user, replay=True)
             connection.commit()
             results.append({**outcome, "permanent": False})
         except PermanentError as exc:
@@ -378,6 +393,7 @@ LEFT JOIN crew_members cm ON cm.id = s.sold_by_crew_member_id
 @router.get("/sales")
 def list_sales(flight_id: int | None = None, date: str | None = None,
                duty_group_id: int | None = None, crew_member_id: int | None = None,
+               device: str | None = None,
                limit: int = 500,
                page: int | None = PageParam, page_size: int = PageSizeParam,
                # Transaction-level detail is an oversight function, not a
@@ -400,6 +416,11 @@ def list_sales(flight_id: int | None = None, date: str | None = None,
         if crew_member_id:
             conditions.append("s.sold_by_crew_member_id=?")
             params.append(crew_member_id)
+        if device:
+            # 7.12: the iPad login that recorded the sale, so Management can
+            # look at one iPad's sales on a trip worked by two.
+            conditions.append("s.crew_id=?")
+            params.append(device.strip().upper())
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         if page:
             return paginate_sql(connection, f"{SALE_SELECT} {where} ORDER BY s.id DESC", params, page, page_size)
