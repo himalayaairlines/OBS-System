@@ -41,18 +41,66 @@ CREATE TABLE IF NOT EXISTS sector_stock_items (
 
 def initialize_sector_stock(connection):
     connection.executescript(SCHEMA)
-    # 7.9 kept one count per sector; 7.11 keeps one per iPad.
+    # 7.9 kept one count per sector; 7.11 keeps one per iPad. Rebuild with the
+    # new shape (create new, copy, drop old, rename) and never RENAME the old
+    # table: SQLite rewrites foreign keys in other tables to follow a rename,
+    # which left sector_stock_items pointing at a table that was then dropped.
     cols = [r[1] for r in connection.execute("PRAGMA table_info('sector_stock_counts')").fetchall()]
-    if "device" not in cols:
-        connection.executescript("""
-            ALTER TABLE sector_stock_counts RENAME TO sector_stock_counts_old;
-        """)
-        connection.executescript(SCHEMA)
-        connection.executescript("""
-            INSERT INTO sector_stock_counts(id,flight_id,device,submitted_by,submitted_at,remarks)
-                SELECT id,flight_id,submitted_by,submitted_by,submitted_at,remarks FROM sector_stock_counts_old;
-            DROP TABLE sector_stock_counts_old;
-        """)
+    items_sql = (connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sector_stock_items'").fetchone() or [""])[0] or ""
+    broken_items = "sector_stock_counts_old" in items_sql
+    if "device" not in cols or broken_items:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            if "device" not in cols:
+                connection.executescript("""
+                    CREATE TABLE sector_stock_counts_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        flight_id INTEGER NOT NULL,
+                        device TEXT NOT NULL DEFAULT '',
+                        submitted_by TEXT NOT NULL,
+                        submitted_at TEXT NOT NULL,
+                        remarks TEXT,
+                        UNIQUE(flight_id, device),
+                        FOREIGN KEY(flight_id) REFERENCES flights(id) ON DELETE CASCADE
+                    );
+                    INSERT INTO sector_stock_counts_new(id,flight_id,device,submitted_by,submitted_at,remarks)
+                        SELECT id,flight_id,submitted_by,submitted_by,submitted_at,remarks FROM sector_stock_counts;
+                    DROP TABLE sector_stock_counts;
+                    ALTER TABLE sector_stock_counts_new RENAME TO sector_stock_counts;
+                """)
+            if broken_items:
+                # Repair a database migrated by the first 7.11 build.
+                connection.executescript("""
+                    CREATE TABLE sector_stock_items_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        count_id INTEGER NOT NULL,
+                        product_id INTEGER NOT NULL,
+                        loaded_quantity INTEGER NOT NULL DEFAULT 0,
+                        sold_before INTEGER NOT NULL DEFAULT 0,
+                        sold_quantity INTEGER NOT NULL DEFAULT 0,
+                        wasted_quantity INTEGER NOT NULL DEFAULT 0,
+                        expected_remaining INTEGER NOT NULL DEFAULT 0,
+                        declared_remaining INTEGER NOT NULL DEFAULT 0,
+                        variance INTEGER NOT NULL DEFAULT 0,
+                        UNIQUE(count_id, product_id),
+                        FOREIGN KEY(count_id) REFERENCES sector_stock_counts(id) ON DELETE CASCADE
+                    );
+                    INSERT INTO sector_stock_items_new SELECT * FROM sector_stock_items;
+                    DROP TABLE sector_stock_items;
+                    ALTER TABLE sector_stock_items_new RENAME TO sector_stock_items;
+                """)
+            leftover = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sector_stock_counts_old'").fetchone()
+            if leftover:
+                # An interrupted first-build migration: bring the rows across before dropping it.
+                connection.executescript("""
+                    INSERT OR IGNORE INTO sector_stock_counts(id,flight_id,device,submitted_by,submitted_at,remarks)
+                        SELECT id,flight_id,submitted_by,submitted_by,submitted_at,remarks FROM sector_stock_counts_old;
+                    DROP TABLE sector_stock_counts_old;
+                """)
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
 
 
 def devices_for(connection, flight_id: int) -> list[str]:
