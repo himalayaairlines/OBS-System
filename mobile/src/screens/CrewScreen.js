@@ -603,9 +603,6 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
               </View>
               <Icon name={infoOpen ? 'chevronDown' : 'chevronRight'} size={18} color={COLORS.muted} />
             </Pressable>
-            {!infoOpen && (
-              <Text style={[styles.mono, { marginTop: 6 }]}>Saved. Tap Flight info to change the flight, aircraft, PAX load or crew.</Text>
-            )}
             {infoOpen && <View style={{ height: 12 }} />}
           </>
         )}
@@ -733,7 +730,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
             </>
             )}
 
-            {selling && (
+            {selling && infoOpen && (
               <>
                 <View style={styles.divider} />
                 <Button
@@ -980,6 +977,15 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
               <Button title="Clear cart" tone="ghost" small style={{ marginTop: 8 }} onPress={() => setCart({})} />
             )}
           </Card>
+          {!infoOpen && (
+            <Button
+              title="Sector over? Go to Reports to finish this flight"
+              tone="ghost"
+              small
+              style={{ marginBottom: 12 }}
+              onPress={() => goToReports?.(flight.id)}
+            />
+          )}
         </>
       )}
 
