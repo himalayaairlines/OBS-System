@@ -62,8 +62,8 @@ CREATE TABLE IF NOT EXISTS qr_menu_settings (
 DEFAULT_SETTINGS = {
     "title_en": "Koseli Onboard Menu", "title_zh": "机上精选菜单",
     "subtitle_en": "Himalaya Airlines", "subtitle_zh": "喜马拉雅航空",
-    "note_en": "Tap an item and show it to the cabin crew to order.",
-    "note_zh": "点击商品并向乘务员出示即可点单。",
+    "note_en": "Explore the Koseli On board sales menu, pre-purchase your favorites at the sales counter, present your receipt onboard, and enjoy your journey with Himalaya Airlines.",
+    "note_zh": "浏览 Koseli 机上销售菜单，在销售柜台预购您喜爱的商品，登机后出示收据，与喜马拉雅航空一起享受旅程。",
     "footer_en": "Prices are in Nepalese Rupees. Other currencies accepted at the day's rate.",
     "footer_zh": "价格以尼泊尔卢比计。可按当日汇率使用其他货币支付。",
     "currency": "NPR", "logo": "", "banner": "",
@@ -74,6 +74,13 @@ def initialize_qr_menu(connection):
     connection.executescript(SCHEMA)
     for key, value in DEFAULT_SETTINGS.items():
         connection.execute("INSERT OR IGNORE INTO qr_menu_settings(key,value) VALUES (?,?)", (key, value))
+    # The old "tap an item" wording no longer fits: purchases are made at the
+    # sales counter, and the page explains that in "How Koseli Works".
+    for key, stale in (("note_en", ("Tap an item",)), ("note_zh", ("点击商品",))):
+        row = connection.execute("SELECT value FROM qr_menu_settings WHERE key=?", (key,)).fetchone()
+        if row and any(row["value"].startswith(x) for x in stale):
+            connection.execute("UPDATE qr_menu_settings SET value=? WHERE key=?", (DEFAULT_SETTINGS[key], key))
+    connection.commit()
     # First start: load the printed Koseli menu so the QR page is never empty.
     from menu_seed import load_koseli_menu, menu_is_empty
     if menu_is_empty(connection) and not connection.execute(
@@ -134,9 +141,23 @@ def public_menu_page():
         data = _public_data(connection)
     finally:
         connection.close()
-    html = render_menu(data, "/menu/media/", _logo_html(data["settings"], "/menu/media/"))
+    html = render_menu(data, "/menu/media/", _logo_html(data["settings"], "/menu/media/"), "/menu/koseli-menu.pdf")
     return HTMLResponse(html, headers={"Cache-Control": "no-cache", "X-Robots-Tag": "noindex",
                                        "Referrer-Policy": "no-referrer"})
+
+
+@router.get("/public/menu/koseli-menu.pdf")
+def public_menu_pdf():
+    """The whole menu as one PDF (posters, then every item and price) for the
+    passenger to keep on the phone during the flight."""
+    connection = get_connection()
+    try:
+        data = _public_data(connection)
+    finally:
+        connection.close()
+    from menu_pdf import build_menu_pdf
+    return Response(build_menu_pdf(data, MEDIA_DIR), media_type="application/pdf",
+                    headers={"Content-Disposition": 'inline; filename="koseli-menu.pdf"', "Cache-Control": "no-cache"})
 
 
 @router.get("/public/menu/media/{name}")
@@ -398,7 +419,9 @@ def offline_package(user: dict = Depends(requires("qr_menu"))):
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("koseli-menu/public/index.html",
-                   render_menu(data, "assets/media/", _logo_html(data["settings"], "assets/media/")))
+                   render_menu(data, "assets/media/", _logo_html(data["settings"], "assets/media/"), "assets/koseli-menu.pdf"))
+        from menu_pdf import build_menu_pdf
+        z.writestr("koseli-menu/public/assets/koseli-menu.pdf", build_menu_pdf(data, MEDIA_DIR))
         z.writestr("koseli-menu/public/menu.json", json.dumps(data, ensure_ascii=False, indent=1))
         for name in sorted(used):
             path = MEDIA_DIR / name

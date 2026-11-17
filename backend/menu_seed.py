@@ -13,8 +13,8 @@ ASSETS = Path(__file__).resolve().parent / "menu_assets"
 SETTINGS = {
     "title_en": "Koseli", "title_zh": "Koseli 机上精选",
     "subtitle_en": "Himalaya Airlines onboard menu", "subtitle_zh": "喜马拉雅航空机上菜单",
-    "note_en": "Tap an item to see it in full and add it to your selection, then show the list to the cabin crew.",
-    "note_zh": "点击商品查看详情并加入选择，然后向乘务员出示清单。",
+    "note_en": "Explore the Koseli On board sales menu, pre-purchase your favorites at the sales counter, present your receipt onboard, and enjoy your journey with Himalaya Airlines.",
+    "note_zh": "浏览 Koseli 机上销售菜单，在销售柜台预购您喜爱的商品，登机后出示收据，与喜马拉雅航空一起享受旅程。",
     "footer_en": (
         "Passengers can purchase maximum 4 cans of 330ml beer, or 3 cans of 500ml beer, or 2 miniature bottles of whiskey/vodka.\n"
         "यात्रुहरूले ३३० मिलिलिटरको ४ क्यान बियर, वा ५०० मिलिलिटरको ३ क्यान बियर, वा २ मिनिएचर ह्वीस्की वा भोड्काका बोतलहरू मात्र किन्न पाउनु हुने छ\n"
@@ -36,6 +36,12 @@ SETTINGS = {
 
 # (section EN, section ZH, [(name EN, name ZH, price, photo, description EN, description ZH)])
 SECTIONS = [
+    ("Dashain Dhamaka Offer", "达赛节特惠", [
+        ("Playing Cards + Carlsberg Elephant 500ml", "扑克牌 + 嘉士伯大象啤酒 500毫升", 1200, "offer-cards-carlsberg.jpg", "", ""),
+        ("Cashew + Carlsberg Elephant 500ml", "腰果 + 嘉士伯大象啤酒 500毫升", 1300, "offer-cashew-carlsberg.jpg", "", ""),
+        ("Red Bull + Chips + Playing Cards", "红牛 + 薯片 + 扑克牌", 1400, "offer-redbull-chips-cards.jpg", "", ""),
+        ("Carlsberg Elephant 500ml + Chips + Playing Cards", "嘉士伯大象啤酒 500毫升 + 薯片 + 扑克牌", 1600, "offer-carlsberg-chips-cards.jpg", "", ""),
+    ]),
     ("Snacks", "小吃", [
         ("Cup Noodles (Wai Wai/Current)", "杯面（Wai Wai / Current）", 200, "cup-noodles.jpg", "Hot water served on board.", "机上提供热水。"),
         ("Buff / Chicken Sitan (50gm)", "水牛肉 / 鸡肉干 Sitan（50克）", 300, "sitan.jpg", "Nepali dried meat snack.", "尼泊尔风味肉干。"),
@@ -80,12 +86,6 @@ SECTIONS = [
         ("Playing Cards + Canned Coffee", "扑克牌 + 罐装咖啡", 1100, "combo-cards-coffee.jpg", "", ""),
         ("Playing Cards + Smoothie", "扑克牌 + 果昔", 1150, "combo-cards-smoothie.jpg", "", ""),
         ("Playing Cards + Canned Juice", "扑克牌 + 罐装果汁", 1100, "combo-cards-juice.jpg", "", ""),
-    ]),
-    ("Dashain Dhamaka Offer", "达赛节特惠", [
-        ("Playing Cards + Carlsberg Elephant 500ml", "扑克牌 + 嘉士伯大象啤酒 500毫升", 1200, "offer-cards-carlsberg.jpg", "", ""),
-        ("Cashew + Carlsberg Elephant 500ml", "腰果 + 嘉士伯大象啤酒 500毫升", 1300, "offer-cashew-carlsberg.jpg", "", ""),
-        ("Red Bull + Chips + Playing Cards", "红牛 + 薯片 + 扑克牌", 1400, "offer-redbull-chips-cards.jpg", "", ""),
-        ("Carlsberg Elephant 500ml + Chips + Playing Cards", "嘉士伯大象啤酒 500毫升 + 薯片 + 扑克牌", 1600, "offer-carlsberg-chips-cards.jpg", "", ""),
     ]),
 ]
 

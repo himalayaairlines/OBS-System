@@ -10,6 +10,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OBS_DB_PATH=/data/obs.db \
     OBS_SECRET_KEY_FILE=/data/.obs_secret.key
 
+# A Chinese-capable font for the passenger menu PDF ("Download Menu").
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-wqy-microhei \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY requirements.txt .

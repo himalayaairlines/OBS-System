@@ -632,7 +632,7 @@ function PostersTab({ menu, reload }) {
 const TEXT_FIELDS = [
   ['title', 'Menu title', 120],
   ['subtitle', 'Subtitle', 160],
-  ['note', 'Note at the top', 400],
+  ['note', 'How Koseli Works – intro line', 400],
   ['footer', 'Footer (one line per note)', 1500],
 ];
 
