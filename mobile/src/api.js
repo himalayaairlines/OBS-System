@@ -172,6 +172,17 @@ export async function readCache(name, fallback = null) {
   }
 }
 
+/** The cached copy with the time it was written, or null. */
+export async function readCacheEntry(name) {
+  const raw = await AsyncStorage.getItem(KEYS.cache + name);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 export async function writeCache(name, data) {
   await AsyncStorage.setItem(KEYS.cache + name, JSON.stringify({ at: Date.now(), data }));
 }
@@ -213,6 +224,31 @@ export async function enqueueSale(payload) {
     queue.push({ payload, queuedAt: new Date().toISOString(), attempts: 0 });
     await writeQueue(queue);
     return queue.length;
+  });
+}
+
+/**
+ * Change a sale that is still in the outbox (7.14). `mutate` gets the payload
+ * and returns the new one; the previous shape and the remarks are kept on
+ * the payload as a device edit, which the server records in the sale's
+ * history when it uploads. Returns false if the sale has already gone up.
+ */
+export async function editQueuedSale(orderRef, mutate, remarks) {
+  return withQueueLock(async () => {
+    const queue = await readQueue();
+    const index = queue.findIndex((item) => item.payload.order_ref === orderRef);
+    if (index < 0) return false;
+    const before = queue[index].payload;
+    const after = mutate({ ...before, lines: before.lines.map((l) => ({ ...l })) });
+    const edit = {
+      at: new Date().toISOString(),
+      remarks,
+      before: { seat_number: before.seat_number, lines: before.lines },
+      after: { seat_number: after.seat_number, lines: after.lines },
+    };
+    queue[index] = { ...queue[index], payload: { ...after, device_edits: [...(before.device_edits || []), edit] }, editedAt: edit.at };
+    await writeQueue(queue);
+    return true;
   });
 }
 

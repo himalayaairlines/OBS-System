@@ -3,13 +3,13 @@ import { ScrollView, View } from 'react-native';
 import { Text, TextInput } from '../text';
 
 import {
-  api, readCache, readQueue, readReconQueue, readRejected, withQueueLock,
+  api, editQueuedSale, readCache, readQueue, readReconQueue, readRejected, withQueueLock, writeCache,
   writeQueue, writeRejected,
 } from '../api';
 import {
   applyJournalToFlights, clearFailed, journalTrip, legFinished, readFailed, readJournal, readOutbox, rootOf, tripAction,
 } from '../tripLocal';
-import { confirm } from '../dialog';
+import { confirm, notify } from '../dialog';
 import { usePaged } from '../paging';
 import { COLORS, npr, styles, todayString } from '../theme';
 import {
@@ -38,6 +38,16 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
   const [reconQueue, setReconQueue] = useState([]);
   const [outbox, setOutbox] = useState([]);      // trip steps waiting to upload (7.12)
   const [failedSteps, setFailedSteps] = useState([]);
+  // Reference data on the iPad, so queued sales show names and totals offline (7.14).
+  const [products, setProducts] = useState([]);
+  const [bundles, setBundles] = useState([]);
+  const [flights, setFlights] = useState([]);
+  const [groups, setGroups] = useState({});
+  // Correcting a queued sale.
+  const [editingRef, setEditingRef] = useState(null);
+  const [editLines, setEditLines] = useState({});
+  const [editSeat, setEditSeat] = useState('');
+  const [editRemarks, setEditRemarks] = useState('');
   // What the crew physically counted, per trip and product, before submitting.
   const [counts, setCounts] = useState({});
   const [countRemarks, setCountRemarks] = useState({});
@@ -53,7 +63,17 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
     setReconQueue(await readReconQueue());
     setOutbox(await readOutbox());
     setFailedSteps(await readFailed());
-  }, []);
+    if (isCrew) {
+      const [p, b, f] = await Promise.all([readCache('products', []), readCache('bundles', []), readCache('flights', [])]);
+      setProducts(p || []); setBundles(b || []); setFlights(f || []);
+      const g = {};
+      for (const flight of f || []) {
+        const group = await readCache(`dutyGroup.${flight.id}`, null);
+        if (group) g[flight.id] = group;
+      }
+      setGroups(g);
+    }
+  }, [isCrew]);
 
   const refreshRemote = useCallback(async () => {
     if (isInventory) {
@@ -67,10 +87,17 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
       ]);
       setSummary(s);
       setSales(list);
+      if (isCrew) await writeCache(`mySalesSummary.${date}`, s);
     } catch (error) {
-      setMessage({ tone: 'warning', inline: true, text: `Live totals unavailable: ${error.message}` });
+      // With no signal the crew still see the last uploaded totals plus what
+      // is on this iPad (below); nothing to warn about then.
+      if (isCrew) {
+        const last = await readCache(`mySalesSummary.${date}`, null);
+        if (last) setSummary({ ...last, cached: true });
+      }
+      if (online) setMessage({ tone: 'warning', inline: true, text: `Live totals unavailable: ${error.message}` });
     }
-  }, [date, isInventory, reloadReturns]);
+  }, [date, isInventory, isCrew, online, reloadReturns]);
 
   async function saveAdjustment() {
     try {
@@ -235,6 +262,85 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
       : item.expected_remaining;
   }
 
+  /* ----------------------- queued sales (7.14) ------------------------ */
+  const nameOf = (line) => (line.product_id
+    ? (products.find((p) => p.id === line.product_id)?.product_name || `Product #${line.product_id}`)
+    : (bundles.find((b) => b.id === line.bundle_id)?.bundle_name || `Combo #${line.bundle_id}`));
+  const priceOf = (line) => (line.product_id
+    ? Number(products.find((p) => p.id === line.product_id)?.selling_price || 0)
+    : Number(bundles.find((b) => b.id === line.bundle_id)?.bundle_price || 0));
+  const lineTotal = (line) => priceOf(line) * Number(line.quantity || 0);
+  const saleTotal = (payload) => (payload.sale_type === 'NORMAL' ? payload.lines.reduce((a, l) => a + lineTotal(l), 0) : 0);
+  const flightOf = (id) => flights.find((f) => f.id === id);
+  const sectorLabel = (id) => { const f = flightOf(id); return f ? `${f.flight_number} ${f.origin}\u2192${f.destination}` : `Flight #${id}`; };
+
+  // What is on this iPad and not yet uploaded, sector by sector, with the
+  // pooled commission it would earn: live, with or without a signal.
+  const local = React.useMemo(() => {
+    const bySector = {};
+    let transactions = 0; let units = 0; let revenue = 0;
+    queue.forEach((item) => {
+      const p = item.payload;
+      const t = saleTotal(p);
+      const u = p.sale_type === 'CANCELLATION' ? 0 : p.lines.reduce((a, l) => a + Number(l.quantity || 0), 0);
+      const row = bySector[p.flight_id] || (bySector[p.flight_id] = { flight_id: p.flight_id, transactions: 0, units: 0, revenue_npr: 0 });
+      row.transactions += 1; row.units += u; row.revenue_npr += t;
+      transactions += 1; units += u; revenue += t;
+    });
+    const rate = summary?.commission_rate ?? 0.10;
+    const sectors = Object.values(bySector).map((row) => {
+      const members = (groups[row.flight_id]?.members || []).length;
+      const pool = row.revenue_npr * rate;
+      return { ...row, label: sectorLabel(row.flight_id), member_count: members, pool_npr: pool, share_npr: members ? pool / members : null };
+    });
+    return { transactions, units, revenue_npr: revenue, pool_npr: revenue * rate, rate, sectors };
+  }, [queue, products, bundles, flights, groups, summary]);
+
+  function startEdit(item) {
+    setEditingRef(item.payload.order_ref);
+    setEditSeat(item.payload.seat_number || '');
+    setEditLines(Object.fromEntries(item.payload.lines.map((l, i) => [i, String(l.quantity)])));
+    setEditRemarks('');
+  }
+
+  async function saveQueuedEdit(item) {
+    if (!editRemarks.trim()) {
+      return notify({ title: 'Remarks required', message: 'Say why the sale is being changed. The remarks are kept with the sale and shown to Management.' });
+    }
+    const seat = editSeat.trim().toUpperCase();
+    if (!seat) return notify({ title: 'Seat required', message: 'Enter the seat number.' });
+    const newLines = item.payload.lines
+      .map((l, i) => ({ ...l, quantity: Number(editLines[i] === '' || editLines[i] === undefined ? l.quantity : editLines[i]) }))
+      .filter((l) => l.quantity > 0);
+    if (!newLines.length) return notify({ title: 'Nothing left in the sale', message: 'A sale needs at least one item. To cancel it entirely, record a cancellation on the Sales page.' });
+    if (newLines.some((l) => Number.isNaN(l.quantity))) return notify({ title: 'Check the quantities', message: 'Quantities must be whole numbers.' });
+    // Stock on the iPad follows the change, so the trolley figure stays right.
+    const delta = {};
+    const addDelta = (line, sign) => {
+      if (line.product_id) delta[line.product_id] = (delta[line.product_id] || 0) + sign * line.quantity;
+      else (bundles.find((b) => b.id === line.bundle_id)?.items || []).forEach((it) => { delta[it.product_id] = (delta[it.product_id] || 0) + sign * it.quantity * line.quantity; });
+    };
+    if (item.payload.sale_type !== 'CANCELLATION') {
+      item.payload.lines.forEach((l) => addDelta(l, +1));   // given back
+      newLines.forEach((l) => addDelta(l, -1));             // taken again
+    }
+    const ok = await editQueuedSale(item.payload.order_ref, (p) => ({ ...p, seat_number: seat, lines: newLines }), editRemarks.trim());
+    if (!ok) {
+      setEditingRef(null);
+      return setMessage({ tone: 'info', text: 'This sale has already uploaded. Ask Management to correct it.' });
+    }
+    const flight = flightOf(item.payload.flight_id);
+    const root = flight ? rootOf(flight) : item.payload.flight_id;
+    for (const leg of flights.filter((f) => rootOf(f) === root)) {
+      const inv = await readCache(`inventory.${leg.id}`, null);
+      if (inv) await writeCache(`inventory.${leg.id}`, inv.map((r) => (delta[r.product_id] ? { ...r, remaining_quantity: Math.max(0, r.remaining_quantity + delta[r.product_id]) } : r)));
+    }
+    setEditingRef(null);
+    await refreshLocal();
+    onQueueChange?.();
+    setMessage({ tone: 'success', text: 'Sale changed on this iPad. The change and your remarks upload with it and stay in its history.' });
+  }
+
   async function confirmReturn(trip) {
     const sure = await confirm({
       title: 'Submit the stock return?',
@@ -335,23 +441,61 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
             message="No connection. These will upload by themselves as soon as the device is back online."
           />
         )}
-        {queue.slice(0, 8).map((item) => (
-          <View key={item.payload.order_ref} style={styles.listRow}>
-            <Text style={{ fontSize: 13, fontWeight: '600', color: COLORS.text }}>
-              Seat {item.payload.seat_number} · {item.payload.lines.length} item(s)
-            </Text>
+        {queue.map((item) => {
+          const p = item.payload;
+          const editing = editingRef === p.order_ref;
+          return (
+          <View key={p.order_ref} style={styles.listRow}>
+            <View style={styles.rowBetween}>
+              <Text style={{ fontSize: 13, fontWeight: '600', color: COLORS.text, flex: 1 }}>
+                {sectorLabel(p.flight_id)} · seat {p.seat_number}{p.sale_type !== 'NORMAL' ? ` · ${p.sale_type}` : ''}
+              </Text>
+              <Text style={{ fontSize: 13, fontWeight: '700', color: COLORS.primary }}>{npr(saleTotal(p))}</Text>
+            </View>
+            {p.lines.map((l, i) => (
+              <Text key={i} style={[styles.mono, { marginTop: 2 }]}>
+                {nameOf(l)} × {l.quantity}{p.sale_type === 'NORMAL' ? ` · ${npr(lineTotal(l))}` : ''}
+              </Text>
+            ))}
             <Text style={styles.mono}>
               Queued {new Date(item.queuedAt).toLocaleString()}
               {item.attempts ? ` · ${item.attempts} attempt(s)` : ''}
+              {(p.device_edits || []).length ? ` · ${p.device_edits.length} change(s) on this iPad` : ''}
             </Text>
+            {(p.device_edits || []).map((e) => (
+              <RemarkLine key={e.at} label={`Changed ${new Date(e.at).toLocaleTimeString()}`} text={e.remarks} />
+            ))}
             {!!item.lastError && (
               <Text style={{ fontSize: 11, color: COLORS.warning, marginTop: 2 }}>{item.lastError}</Text>
             )}
+            {isCrew && (
+              <Button title={editing ? 'Cancel' : 'Correct this sale'} tone="ghost" small style={{ marginTop: 6, alignSelf: 'flex-start' }}
+                onPress={() => (editing ? setEditingRef(null) : startEdit(item))} />
+            )}
+            {editing && (
+              <View style={{ marginTop: 8, backgroundColor: COLORS.surfaceAlt, padding: 12, borderRadius: 10 }}>
+                <Text style={[styles.mono, { marginBottom: 8 }]}>
+                  Change the quantities (0 removes the item) or the seat. The sale has not uploaded yet, so the change goes up with it; your remarks are kept in its history.
+                </Text>
+                {p.lines.map((l, i) => (
+                  <View key={i} style={[styles.rowBetween, { paddingVertical: 4 }]}>
+                    <Text style={{ flex: 1, fontSize: 13 }}>{nameOf(l)} · {npr(priceOf(l))} each</Text>
+                    <TextInput
+                      value={editLines[i] ?? ''}
+                      onChangeText={(v) => setEditLines((c) => ({ ...c, [i]: v.replace(/[^0-9]/g, '') }))}
+                      keyboardType="number-pad"
+                      style={[styles.input, { width: 64, textAlign: 'center', paddingVertical: 4, marginBottom: 0 }]}
+                    />
+                  </View>
+                ))}
+                <Field label="Seat" value={editSeat} onChangeText={setEditSeat} autoCapitalize="characters" />
+                <Field label="Remarks (mandatory)" value={editRemarks} onChangeText={setEditRemarks} multiline placeholder="e.g. passenger took one can, not two" />
+                <Button title="Save change" onPress={() => saveQueuedEdit(item)} disabled={!editRemarks.trim()} />
+              </View>
+            )}
           </View>
-        ))}
-        {queue.length > 8 && (
-          <Text style={[styles.mono, { marginTop: 8 }]}>…and {queue.length - 8} more.</Text>
-        )}
+          );
+        })}
         {!queue.length && !outbox.length && !reconQueue.length && <Text style={styles.empty}>Nothing waiting to upload.</Text>}
       </Card>
       )}
@@ -390,6 +534,39 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
               </View>
             </View>
           ))}
+        </Card>
+      )}
+
+      {isCrew && (
+        <Card>
+          <SectionTitle
+            title="Live sales & commission on this iPad"
+            description="Updates as sales are recorded, with or without a signal: what has uploaded plus what is still on this iPad."
+            right={<Pill label={online ? 'LIVE' : 'OFFLINE · LIVE'} tone={online ? 'success' : 'warning'} />}
+          />
+          <View style={[styles.wrap, { marginBottom: 10 }]}>
+            <Metric label="Uploaded (server)" value={npr(summary?.total_sales_npr || 0)} sub={summary?.cached ? 'last known' : undefined} />
+            <Metric label="On this iPad, not uploaded" value={npr(local.revenue_npr)} tone={local.transactions ? 'warning' : 'default'} sub={`${local.transactions} transaction(s) · ${local.units} unit(s)`} />
+            <Metric label="Total so far" value={npr((summary?.total_sales_npr || 0) + local.revenue_npr)} tone="primary" />
+            <Metric label={`Pool commission (${Math.round(local.rate * 100)}%)`} value={npr((summary?.total_commission_npr || 0) + local.pool_npr)} tone="success" />
+          </View>
+          {local.sectors.map((sec) => (
+            <View key={sec.flight_id} style={[styles.listRow, { paddingVertical: 8 }]}>
+              <View style={styles.rowBetween}>
+                <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }}>{sec.label}</Text>
+                {!!sec.member_count && <Pill label={`${sec.member_count} crew`} tone="muted" />}
+              </View>
+              <KeyValue label="Not yet uploaded" value={`${npr(sec.revenue_npr)} · ${sec.transactions} transaction(s)`} />
+              <KeyValue
+                label={sec.member_count ? `Pool ÷ ${sec.member_count} crew` : 'Pool (crew not entered yet)'}
+                value={sec.member_count ? `${npr(sec.pool_npr)} = ${npr(sec.share_npr)} each` : npr(sec.pool_npr)}
+                tone={COLORS.success}
+              />
+            </View>
+          ))}
+          <Text style={[styles.mono, { marginTop: 6 }]}>
+            Combo sales pay their commission to the crew member who sold them; the server works that out on upload. The figures here are the pooled estimate.
+          </Text>
         </Card>
       )}
 
@@ -513,7 +690,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
         </Card>
       ) : (
       <Card>
-        <SectionTitle title="Sales & commission" />
+        <SectionTitle title={isCrew ? 'Uploaded sales & commission' : 'Sales & commission'} description={isCrew && summary?.cached ? 'Last totals received from the server; refreshes on Wi-Fi.' : undefined} />
         <Select label="Date" valueLabel={date} onPress={() => setCalendar(true)} />
         {summary ? (
           <>
@@ -587,7 +764,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
             )}
           </>
         ) : (
-          <Text style={styles.empty}>Connect to load sales totals.</Text>
+          <Text style={styles.empty}>{isCrew ? 'No uploaded sales for this date yet. The live figures above include what is on this iPad.' : 'Connect to load sales totals.'}</Text>
         )}
       </Card>
       )}

@@ -50,6 +50,15 @@ class SaleLine(BaseModel):
     quantity: int = Field(gt=0)
 
 
+class DeviceEdit(BaseModel):
+    """A correction the crew made to a queued sale on the iPad before it
+    uploaded (7.14). Kept in the sale's history like any other correction."""
+    at: str
+    remarks: str = Field(min_length=1, max_length=500)
+    before: dict = {}
+    after: dict = {}
+
+
 class SaleTransaction(BaseModel):
     order_ref: str = Field(min_length=6, max_length=64)
     flight_id: int
@@ -64,6 +73,7 @@ class SaleTransaction(BaseModel):
     sale_type: str = "NORMAL"
     remarks: str | None = None
     transaction_time: str
+    device_edits: list[DeviceEdit] = []
 
 
 class SyncRequest(BaseModel):
@@ -250,6 +260,7 @@ def _record(connection, transaction: SaleTransaction, user: dict, replay: bool =
     records_revenue = sale_type == "NORMAL"
 
     total_npr = 0.0
+    inserted = []
     for index, line in enumerate(expanded):
         if consumes_stock:
             # Conditional update: the stock check and the decrement are one
@@ -270,7 +281,7 @@ def _record(connection, transaction: SaleTransaction, user: dict, replay: bool =
 
         npr_amount = line["npr_amount"] if records_revenue else 0.0
         total_npr += npr_amount
-        connection.execute(
+        inserted.append(connection.execute(
             """INSERT INTO sales
                (transaction_id,order_ref,flight_id,duty_group_id,sold_by_crew_member_id,
                 product_id,bundle_id,crew_id,
@@ -286,7 +297,22 @@ def _record(connection, transaction: SaleTransaction, user: dict, replay: bool =
                 transaction.payment_currency.strip().upper(), rate,
                 round(npr_amount / rate, 2) if rate else 0, npr_amount, sale_type, remarks,
             ),
-        )
+        ).lastrowid)
+
+    # 7.14: corrections the crew made on the iPad while the sale was still in
+    # the upload queue. Each is kept against every line of the sale, with its
+    # mandatory remarks, so Management sees exactly what changed and why.
+    for edit in transaction.device_edits:
+        for sale_id in inserted:
+            connection.execute(
+                "INSERT INTO sale_edit_history(sale_id,changed_by,changed_at,remarks,before_json,after_json) VALUES (?,?,?,?,?,?)",
+                (sale_id, user["employee_id"], edit.at, edit.remarks.strip(),
+                 json.dumps(edit.before, ensure_ascii=False), json.dumps(edit.after, ensure_ascii=False)))
+    if transaction.device_edits:
+        last = transaction.device_edits[-1]
+        for sale_id in inserted:
+            connection.execute("UPDATE sales SET edited_by=?, edited_at=?, edit_remarks=? WHERE id=?",
+                               (user["employee_id"], last.at, last.remarks.strip(), sale_id))
 
     return {
         "status": "success",
@@ -393,7 +419,8 @@ LEFT JOIN crew_members cm ON cm.id = s.sold_by_crew_member_id
 @router.get("/sales")
 def list_sales(flight_id: int | None = None, date: str | None = None,
                duty_group_id: int | None = None, crew_member_id: int | None = None,
-               device: str | None = None,
+               device: str | None = None, product_id: int | None = None,
+               sale_type: str | None = None, seller_name: str | None = None,
                limit: int = 500,
                page: int | None = PageParam, page_size: int = PageSizeParam,
                # Transaction-level detail is an oversight function, not a
@@ -421,6 +448,15 @@ def list_sales(flight_id: int | None = None, date: str | None = None,
             # look at one iPad's sales on a trip worked by two.
             conditions.append("s.crew_id=?")
             params.append(device.strip().upper())
+        if product_id:
+            conditions.append("(s.product_id=? OR s.bundle_id=?)")
+            params.extend([product_id, -product_id])
+        if sale_type:
+            conditions.append("s.sale_type=?")
+            params.append(sale_type.strip().upper())
+        if seller_name:
+            conditions.append("cm.name LIKE ?")
+            params.append(f"%{seller_name.strip()}%")
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         if page:
             return paginate_sql(connection, f"{SALE_SELECT} {where} ORDER BY s.id DESC", params, page, page_size)
@@ -430,6 +466,120 @@ def list_sales(flight_id: int | None = None, date: str | None = None,
         return [dict(r) for r in rows]
     finally:
         connection.close()
+
+
+@router.get("/sales/flights")
+def sales_by_flight(year: int | None = None, month: int | None = None, day: int | None = None,
+                    destination: str | None = None, flight_number: str | None = None,
+                    page: int | None = PageParam, page_size: int = PageSizeParam,
+                    user: dict = Depends(requires("sales_view"))):
+    """Every sector in the period with its sales total (7.13): the Sales page
+    for Management, Inventory and the administrator. Newest first."""
+    connection = get_connection()
+    try:
+        conditions, params = [], []
+        if year:
+            conditions.append("substr(f.flight_date,1,4)=?")
+            params.append(f"{year:04d}")
+        if month:
+            conditions.append("substr(f.flight_date,6,2)=?")
+            params.append(f"{month:02d}")
+        if day:
+            conditions.append("substr(f.flight_date,9,2)=?")
+            params.append(f"{day:02d}")
+        if destination:
+            conditions.append("(f.destination=? OR f.origin=?)")
+            params.extend([destination.upper(), destination.upper()])
+        if flight_number:
+            conditions.append("f.flight_number LIKE ?")
+            params.append(f"%{flight_number.strip().upper()}%")
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = f"""
+            SELECT f.id, f.flight_number, f.flight_date, f.origin, f.destination, f.direction, f.trip_type,
+                   f.status, f.aircraft_type, f.passengers, f.trip_completed_at,
+                   CASE WHEN f.direction='RETURN' THEN 2 ELSE 1 END AS segment,
+                   (SELECT GROUP_CONCAT(a.crew_account, ',') FROM flight_assignments a WHERE a.flight_id=f.id) AS devices,
+                   (SELECT COUNT(DISTINCT s.order_ref) FROM sales s WHERE s.flight_id=f.id AND s.sale_type='NORMAL') AS transactions,
+                   (SELECT COALESCE(SUM(s.quantity),0) FROM sales s WHERE s.flight_id=f.id AND s.sale_type='NORMAL') AS units,
+                   (SELECT COALESCE(SUM(s.npr_amount),0) FROM sales s WHERE s.flight_id=f.id AND s.sale_type='NORMAL') AS revenue_npr,
+                   (SELECT COUNT(DISTINCT s.order_ref) FROM sales s WHERE s.flight_id=f.id AND s.sale_type='COMPLEMENTARY') AS complementary,
+                   (SELECT COUNT(DISTINCT s.order_ref) FROM sales s WHERE s.flight_id=f.id AND s.sale_type='CANCELLATION') AS cancellations,
+                   (SELECT COUNT(*) FROM sale_edit_history h JOIN sales s ON s.id=h.sale_id WHERE s.flight_id=f.id) AS edits
+            FROM flights f {where}
+            ORDER BY f.flight_date DESC, f.flight_number, f.direction"""
+        if page:
+            out = paginate_sql(connection, sql, params, page, page_size)
+            out["items"] = [_round_flight(r) for r in out["items"]]
+            return out
+        return [_round_flight(dict(r)) for r in connection.execute(sql, params).fetchall()]
+    finally:
+        connection.close()
+
+
+def _round_flight(row):
+    row = dict(row)
+    row["revenue_npr"] = round(float(row.get("revenue_npr") or 0), 2)
+    row["devices"] = [d for d in str(row.get("devices") or "").split(",") if d]
+    return row
+
+
+@router.get("/sales/flights/{flight_id}/summary")
+def flight_sales_summary(flight_id: int, user: dict = Depends(requires("sales_view"))):
+    """One sector's sales broken down by product, by iPad login, by seller
+    and by payment currency (7.13)."""
+    connection = get_connection()
+    try:
+        flight = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if not flight:
+            raise HTTPException(status_code=404, detail="Flight not found.")
+        normal = "s.flight_id=? AND s.sale_type='NORMAL'"
+        by_product = [dict(r) for r in connection.execute(f"""
+            SELECT COALESCE(p.id, -b.id) AS product_id, COALESCE(p.product_name, b.bundle_name) AS product_name,
+                   COALESCE(p.category, 'Combo') AS category, s.bundle_id IS NOT NULL AS is_combo,
+                   SUM(s.quantity) AS units, COUNT(DISTINCT s.order_ref) AS transactions,
+                   ROUND(SUM(s.npr_amount), 2) AS revenue_npr
+            FROM sales s LEFT JOIN products p ON p.id=s.product_id LEFT JOIN bundles b ON b.id=s.bundle_id
+            WHERE {normal} GROUP BY 1, 2, 3, 4 ORDER BY revenue_npr DESC, product_name""", (flight_id,))]
+        by_device = [dict(r) for r in connection.execute(f"""
+            SELECT s.crew_id AS device, COUNT(DISTINCT s.order_ref) AS transactions, SUM(s.quantity) AS units,
+                   ROUND(SUM(s.npr_amount), 2) AS revenue_npr,
+                   MIN(s.transaction_time) AS first_sale, MAX(s.transaction_time) AS last_sale
+            FROM sales s WHERE {normal} GROUP BY s.crew_id ORDER BY revenue_npr DESC""", (flight_id,))]
+        by_seller = [dict(r) for r in connection.execute(f"""
+            SELECT COALESCE(cm.name, 'Not attributed') AS seller_name, cm.id AS crew_member_id,
+                   COUNT(DISTINCT s.order_ref) AS transactions, SUM(s.quantity) AS units,
+                   ROUND(SUM(s.npr_amount), 2) AS revenue_npr,
+                   SUM(CASE WHEN s.bundle_id IS NOT NULL THEN s.quantity ELSE 0 END) AS combo_units
+            FROM sales s LEFT JOIN crew_members cm ON cm.id=s.sold_by_crew_member_id
+            WHERE {normal} GROUP BY 1, 2 ORDER BY revenue_npr DESC""", (flight_id,))]
+        by_currency = [dict(r) for r in connection.execute(f"""
+            SELECT s.transaction_currency AS currency, COUNT(DISTINCT s.order_ref) AS transactions,
+                   ROUND(SUM(s.transaction_currency_amount), 2) AS amount, ROUND(SUM(s.npr_amount), 2) AS revenue_npr
+            FROM sales s WHERE {normal} GROUP BY s.transaction_currency ORDER BY revenue_npr DESC""", (flight_id,))]
+        by_type = [dict(r) for r in connection.execute("""
+            SELECT s.sale_type, COUNT(DISTINCT s.order_ref) AS transactions, SUM(s.quantity) AS units,
+                   ROUND(SUM(s.npr_amount), 2) AS revenue_npr
+            FROM sales s WHERE s.flight_id=? GROUP BY s.sale_type""", (flight_id,))]
+        totals = connection.execute(f"""
+            SELECT COUNT(DISTINCT s.order_ref) AS transactions, COALESCE(SUM(s.quantity),0) AS units,
+                   ROUND(COALESCE(SUM(s.npr_amount),0), 2) AS revenue_npr,
+                   COUNT(DISTINCT s.seat_number) AS seats
+            FROM sales s WHERE {normal}""", (flight_id,)).fetchone()
+        edits = connection.execute(
+            "SELECT COUNT(*) c FROM sale_edit_history h JOIN sales s ON s.id=h.sale_id WHERE s.flight_id=?",
+            (flight_id,)).fetchone()["c"]
+        devices = [r["crew_account"] for r in connection.execute(
+            "SELECT crew_account FROM flight_assignments WHERE flight_id=? ORDER BY id", (flight_id,))]
+        group = connection.execute("SELECT id, label FROM duty_groups WHERE flight_id=?", (flight_id,)).fetchone()
+    finally:
+        connection.close()
+    return {
+        "flight": {**dict(flight), "devices": devices, "duty_group_label": group["label"] if group else None,
+                   "segment": 2 if flight["direction"] == "RETURN" else 1},
+        "totals": {**dict(totals), "edits": edits},
+        "by_product": by_product, "by_device": by_device, "by_seller": by_seller,
+        "by_currency": by_currency, "by_type": by_type,
+    }
 
 
 @router.get("/my-sales")
@@ -493,6 +643,18 @@ def sale_history(sale_id: int, user: dict = Depends(requires("sales_view"))):
                 "SELECT * FROM sale_edit_history WHERE sale_id=? ORDER BY changed_at DESC, id DESC", (sale_id,)):
             before, after = json.loads(row["before_json"]), json.loads(row["after_json"])
             changes = []
+            if "lines" in before or "lines" in after:
+                # An iPad correction made before upload: whole-sale shape.
+                def _lines(d):
+                    return ", ".join(f"{products.get(l.get('product_id'), l.get('bundle_name') or l.get('name') or 'combo')} x{l.get('quantity')}"
+                                     for l in (d.get("lines") or []))
+                if before.get("seat_number") != after.get("seat_number"):
+                    changes.append(f"seat: {before.get('seat_number')} \u2192 {after.get('seat_number')}")
+                if _lines(before) != _lines(after):
+                    changes.append(f"items: {_lines(before)} \u2192 {_lines(after)}")
+                out.append({"id": row["id"], "changed_by": row["changed_by"], "changed_at": row["changed_at"],
+                            "remarks": row["remarks"], "changes": changes, "on_device": True})
+                continue
             for key, label in (("product_id", "product"), ("quantity", "quantity"), ("seat_number", "seat"),
                                ("sold_by_crew_member_id", "sold by"), ("unit_price", "unit price")):
                 if before.get(key) != after.get(key):

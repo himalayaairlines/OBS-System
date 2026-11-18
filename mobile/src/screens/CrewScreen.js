@@ -3,7 +3,7 @@ import { Pressable, ScrollView, View } from 'react-native';
 import { Text } from '../text';
 import Icon from '../icons';
 
-import { api, cached, enqueueSale, orderRef, saveDutyGroup, writeCache } from '../api';
+import { api, cached, enqueueSale, orderRef, readCacheEntry, readQueue, saveDutyGroup, writeCache } from '../api';
 import {
   applyJournalToFlights, applyJournalToProgress, buildLocalProgress, cachedProgress, journalLeg, journalTrip,
   legFinished, legSellable, pruneJournal, readJournal, rootOf, tripAction,
@@ -114,11 +114,51 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
     });
   }, []);
 
+  // Both legs of a round trip sell from the same trolley, so with no signal
+  // the second flight takes the newest copy any leg of the trip has (7.14):
+  // the stock left after the first flight, less what was sold since.
+  const tripLegIds = useCallback((id) => {
+    const me = flights.find((f) => f.id === id);
+    if (!me) return [id];
+    const root = rootOf(me);
+    return flights.filter((f) => rootOf(f) === root).map((f) => f.id);
+  }, [flights]);
+
   const loadInventory = useCallback(async (id) => {
     if (!id) return setInventory([]);
     const result = await cached(`inventory.${id}`, `/inventory/${id}`);
-    setInventory(result.data || []);
-  }, []);
+    let rows = result.data || [];
+    if (result.stale) {
+      let newest = (await readCacheEntry(`inventory.${id}`)) || { at: 0, data: rows };
+      for (const legId of tripLegIds(id)) {
+        if (legId === id) continue;
+        const other = await readCacheEntry(`inventory.${legId}`);
+        if (other && other.data?.length && (!newest.data?.length || other.at > newest.at)) newest = other;
+      }
+      rows = newest.data || [];
+      if (rows.length && !(result.data || []).length) await writeCache(`inventory.${id}`, rows);
+    } else {
+      // Fresh from the server, which does not yet know the sales still queued
+      // on this iPad: take those off so the trolley figure stays honest.
+      const legs = new Set(tripLegIds(id));
+      const queued = (await readQueue()).filter((q) => legs.has(q.payload.flight_id) && q.payload.sale_type !== 'CANCELLATION');
+      if (queued.length) {
+        const used = {};
+        queued.forEach((q) => q.payload.lines.forEach((l) => {
+          if (l.product_id) used[l.product_id] = (used[l.product_id] || 0) + l.quantity;
+          else if (l.bundle_id) {
+            (bundles.find((b) => b.id === l.bundle_id)?.items || []).forEach((item) => {
+              used[item.product_id] = (used[item.product_id] || 0) + item.quantity * l.quantity;
+            });
+          }
+        }));
+        rows = rows.map((r) => (used[r.product_id] ? { ...r, remaining_quantity: Math.max(0, r.remaining_quantity - used[r.product_id]) } : r));
+      }
+      // Every leg of the trip starts from the same copy.
+      for (const legId of tripLegIds(id)) await writeCache(`inventory.${legId}`, rows);
+    }
+    setInventory(rows);
+  }, [tripLegIds, bundles]);
 
   const loadDutyGroup = useCallback(async (id) => {
     if (!id) return setDutyGroup(null);
@@ -514,7 +554,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
         return used ? { ...row, remaining_quantity: row.remaining_quantity - used } : row;
       });
       setInventory(reduced);
-      await writeCache(`inventory.${flight.id}`, reduced);
+      for (const legId of tripLegIds(flight.id)) await writeCache(`inventory.${legId}`, reduced);
     }
 
     setCart({});

@@ -547,3 +547,82 @@ class IndependentDevicesTests(TripFlowTests.__bases__[0]):
         sales = call("GET", f"/sales?flight_id={out['id']}", "MGT001")[1]
         rows = sales if isinstance(sales, list) else sales["items"]
         self.assertEqual(sorted({r["crew_id"] for r in rows} if rows and "crew_id" in rows[0] else {a, b}), [a, b])
+
+
+class SalesOverviewAndFormsTests(TripFlowTests.__bases__[0]):
+    """7.13: the flight-wise Sales page and the administrator's form switches."""
+
+    tearDown = TripFlowTests.tearDown
+    make_trip = TripFlowTests.make_trip
+    open_leg = TripFlowTests.open_leg
+    sell = TripFlowTests.sell
+
+    def test_sales_by_flight_and_summary(self):
+        (leg,), product = self.make_trip("ONE_WAY")
+        seller = self.open_leg(leg)
+        self.sell(leg, product, seller)
+        self.sell(leg, product, seller)
+        status, rows = call("GET", f"/sales/flights?flight_number={leg['flight_number']}", "MGT001")
+        self.assertEqual(status, 200, rows)
+        row = [r for r in rows if r["id"] == leg["id"]][0]
+        self.assertEqual((row["transactions"], row["units"], row["devices"]), (2, 2, ["CREW001"]))
+        self.assertGreater(row["revenue_npr"], 0)
+        status, summary = call("GET", f"/sales/flights/{leg['id']}/summary", "MGT001")
+        self.assertEqual(status, 200, summary)
+        self.assertEqual(summary["totals"]["transactions"], 2)
+        self.assertEqual(summary["by_device"][0]["device"], "CREW001")
+        self.assertEqual(summary["by_product"][0]["product_id"], product)
+        self.assertEqual(summary["by_product"][0]["units"], 2)
+        # Filters on the sales list: by device and by product.
+        page = call("GET", f"/sales?flight_id={leg['id']}&device=CREW001&product_id={product}&page=1&page_size=10", "MGT001")[1]
+        self.assertEqual(page["total"], 2)
+        self.assertEqual(call("GET", f"/sales?flight_id={leg['id']}&device=CSUP001&page=1", "MGT001")[1]["total"], 0)
+        # Crew cannot read the overview.
+        self.assertEqual(call("GET", "/sales/flights", "CREW001")[0], 403)
+
+    def test_admin_switches_forms_for_crew(self):
+        (leg,), product = self.make_trip("ONE_WAY")
+        self.open_leg(leg)
+        self.assertEqual(len(call("GET", "/report-forms", "CREW001")[1]), len(REPORT_TYPES))
+        # Only the administrator may change the switches.
+        self.assertEqual(call("PUT", "/report-forms/visibility", "MGT001", {"enabled": REPORT_TYPES[:2]})[0], 403)
+        status, out = call("PUT", "/report-forms/visibility", "ADMIN001", {"enabled": REPORT_TYPES[:2]})
+        self.assertEqual(status, 200, out)
+        self.assertEqual([f["enabled"] for f in out], [True, True, False, False])
+        try:
+            self.assertEqual([f["type"] for f in call("GET", "/report-forms", "CREW001")[1]], REPORT_TYPES[:2])
+            self.assertEqual(len(call("GET", "/report-forms", "MGT001")[1]), len(REPORT_TYPES))
+            sector = call("GET", f"/flights/{leg['id']}/reports", "CREW001")[1]
+            self.assertEqual([e["report_type"] for e in sector["reports"]], REPORT_TYPES[:2])
+            # A switched-off form cannot be filed by the crew, and does not count.
+            self.assertEqual(call("POST", "/flight-reports", "CREW001",
+                                  {"flight_id": leg["id"], "report_type": REPORT_TYPES[-1], "payload": {}})[0], 400)
+            progress = call("GET", f"/flights/{leg['id']}/trip-progress", "CREW001")[1]
+            self.assertEqual(progress["legs"][0]["reports_total"], 2)
+            for report_type in REPORT_TYPES[:2]:
+                self.assertEqual(call("POST", "/flight-reports", "CREW001",
+                                      {"flight_id": leg["id"], "report_type": report_type, "payload": {}})[0], 200)
+            self.assertTrue(call("GET", f"/flights/{leg['id']}/trip-progress", "CREW001")[1]["legs"][0]["reports_done"])
+        finally:
+            call("PUT", "/report-forms/visibility", "ADMIN001", {"enabled": REPORT_TYPES})
+
+    def test_queued_sale_edits_are_kept_in_history(self):
+        (leg,), product = self.make_trip("ONE_WAY")
+        self.open_leg(leg)
+        TripFlowTests.seq += 1
+        ref = f"QE-{leg['id']}-{TripFlowTests.seq:03d}"
+        status, out = call("POST", "/sales/sync", "CREW001", {"transactions": [{
+            "order_ref": ref, "flight_id": leg["id"], "seat_number": "9C",
+            "lines": [{"product_id": product, "quantity": 1}],
+            "transaction_time": f"{date.today().isoformat()}T10:00:00",
+            "device_edits": [{"at": "2026-11-18T10:05:00", "remarks": "Passenger took one, not two",
+                              "before": {"seat_number": "9C", "lines": [{"product_id": product, "quantity": 2}]},
+                              "after": {"seat_number": "9C", "lines": [{"product_id": product, "quantity": 1}]}}],
+        }]})
+        self.assertEqual((status, out["results"][0]["status"]), (200, "success"), out)
+        rows = call("GET", f"/sales?flight_id={leg['id']}&page=1", "MGT001")[1]["items"]
+        sale = [r for r in rows if r["order_ref"] == ref][0]
+        self.assertEqual((sale["edit_count"], sale["edit_remarks"]), (1, "Passenger took one, not two"))
+        hist = call("GET", f"/sales/{sale['id']}/history", "MGT001")[1]
+        self.assertTrue(hist[0]["on_device"])
+        self.assertTrue(any(c.startswith("items:") for c in hist[0]["changes"]), hist)
