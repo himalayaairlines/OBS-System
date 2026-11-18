@@ -914,6 +914,8 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
         </Card>
       )}
 
+      {canReview && user.permissions?.includes('users') && <FormsVisibilityCard />}
+
       {canReview && <SectorStockList />}
 
       {canReview && (
@@ -1294,6 +1296,64 @@ function SectorStockList() {
       {!!pager.error && <Banner tone="danger" message={pager.error} />}
       {!pager.items.length && !pager.loading && <Text style={styles.empty}>No sector count yet.</Text>}
       <Pagination pager={pager} label="counts" />
+    </Card>
+  );
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Administrator: which forms the crew see (7.13)                      */
+/* ------------------------------------------------------------------ */
+function FormsVisibilityCard() {
+  const [rows, setRows] = useState([]);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(() => {
+    api('/report-forms/visibility').then((r) => { setRows(r); setError(null); }).catch((e) => setError(e.message));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  async function toggle(type) {
+    const next = rows.map((r) => (r.type === type ? { ...r, enabled: !r.enabled } : r));
+    const enabled = next.filter((r) => r.enabled).map((r) => r.type);
+    const turningOff = rows.find((r) => r.type === type)?.enabled;
+    if (turningOff) {
+      const sure = await confirm({
+        title: 'Switch this form off for the crew?',
+        message: `${rows.find((r) => r.type === type)?.title} disappears from every crew iPad and no longer counts towards \u201call forms handled\u201d. Forms already filed stay with Management.`,
+        confirmText: 'Switch off',
+        tone: 'danger',
+      });
+      if (!sure) return;
+    }
+    setBusy(true);
+    try {
+      setRows(await api('/report-forms/visibility', { method: 'PUT', body: { enabled } }));
+      setError(null);
+    } catch (e) {
+      setError(e.message);
+    }
+    setBusy(false);
+  }
+
+  return (
+    <Card>
+      <SectionTitle
+        title="Forms shown to the crew"
+        description="A form switched on is on every crew iPad; switched off, it is on none. The change is recorded in the audit log."
+      />
+      {!!error && <Banner tone="danger" message={error} />}
+      {rows.map((r) => (
+        <View key={r.type} style={[styles.listRow, styles.rowBetween, { paddingVertical: 10 }]}>
+          <View style={{ flex: 1 }}>
+            <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }}>{r.title}</Text>
+            <Text style={styles.mono}>{r.form_code}</Text>
+          </View>
+          <Pill label={r.enabled ? 'ON FOR CREW' : 'OFF'} tone={r.enabled ? 'success' : 'muted'} />
+          <Button title={r.enabled ? 'Switch off' : 'Switch on'} tone={r.enabled ? 'ghost' : 'secondary'} small style={{ marginLeft: 8 }} disabled={busy} onPress={() => toggle(r.type)} />
+        </View>
+      ))}
+      {!rows.length && !error && <Text style={styles.empty}>Loading\u2026</Text>}
     </Card>
   );
 }

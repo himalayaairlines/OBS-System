@@ -25,7 +25,7 @@ from pydantic import BaseModel
 
 from database import REPORT_UNSUBMIT_LIMIT, get_connection
 from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
-from report_forms import REPORT_FORMS, REPORT_TYPES, field_index, form_for
+from report_forms import REPORT_FORMS, REPORT_TYPES, enabled_report_types, field_index, form_for, set_enabled_report_types
 import trip_flow
 from security import (
     current_user, log_action, now_iso, permissions_for, requires, today_iso,
@@ -153,8 +153,56 @@ LEFT JOIN duty_groups d ON d.id = r.duty_group_id
 # --------------------------------------------------------------------------- #
 @router.get("/report-forms")
 def report_forms(user: dict = Depends(requires("flight_reports"))):
-    """The definition of every form, so the client renders it from the schema."""
-    return REPORT_FORMS
+    """The definition of every form, so the client renders it from the schema.
+    The crew get only the forms the administrator has switched on (7.13);
+    Management get them all, so a form filed before it was switched off can
+    still be read."""
+    if _may_review(user):
+        return REPORT_FORMS
+    connection = get_connection()
+    try:
+        enabled = set(enabled_report_types(connection))
+    finally:
+        connection.close()
+    return [f for f in REPORT_FORMS if f["type"] in enabled]
+
+
+@router.get("/report-forms/visibility")
+def report_forms_visibility(user: dict = Depends(requires("reports_review"))):
+    """Which forms the crew see, for the administrator's switches."""
+    connection = get_connection()
+    try:
+        enabled = set(enabled_report_types(connection))
+    finally:
+        connection.close()
+    return [{"type": f["type"], "title": f["title"], "form_code": f["form_code"], "enabled": f["type"] in enabled}
+            for f in REPORT_FORMS]
+
+
+class VisibilityIn(BaseModel):
+    enabled: list[str]
+
+
+@router.put("/report-forms/visibility")
+def set_report_forms_visibility(data: VisibilityIn, user: dict = Depends(requires("users"))):
+    """Administrator only. A form switched off disappears from every crew iPad
+    at once and no longer counts towards "all forms handled"; switched on, it
+    is back for every crew iPad."""
+    connection = get_connection()
+    try:
+        before = set(enabled_report_types(connection))
+        chosen = set_enabled_report_types(connection, data.enabled, user["employee_id"])
+    finally:
+        connection.close()
+    turned_on = [t for t in chosen if t not in before]
+    turned_off = [t for t in before if t not in chosen]
+    if turned_on or turned_off:
+        log_action(user, "CABIN REPORT", "FORMS_VISIBILITY",
+                   "Crew forms changed: " + "; ".join(filter(None, [
+                       "on: " + ", ".join(turned_on) if turned_on else "",
+                       "off: " + ", ".join(turned_off) if turned_off else ""])) + ".",
+                   None, None, metadata={"enabled": chosen})
+    return report_forms_visibility(user)
 
 
 # --------------------------------------------------------------------------- #
@@ -253,7 +301,12 @@ def reports_for_flight(flight_id: int, user: dict = Depends(requires("flight_rep
         devices = str(flight["crew_account"] or "").split(",") if flight["crew_account"] else []
 
         entries = []
-        for report_type in REPORT_TYPES:
+        # The crew see the forms switched on for them; Management every form
+        # that is on or already filed for this sector.
+        visible = enabled_report_types(connection)
+        if _may_review(user):
+            visible = [t for t in REPORT_TYPES if t in visible or t in existing]
+        for report_type in visible:
             form = form_for(report_type)
             status = existing.get(report_type, {}).get("status", "NOT_STARTED")
             marks = deferrals.get(report_type, [])
@@ -373,6 +426,8 @@ def file_report(data: ReportIn, user: dict = Depends(requires("flight_reports"))
     try:
         flight = _flight(connection, data.flight_id)
         _assert_device(connection, flight, user)
+        if not _may_review(user) and report_type not in enabled_report_types(connection):
+            raise HTTPException(status_code=400, detail="This form is switched off for the crew at the moment.")
         trip_flow.assert_reports_open(connection, flight["id"], _may_review(user), user["employee_id"])
         # 7.10: forms may be filled in at any time, before or after the sector
         # is finished. Finishing reminds the crew of any form still outstanding.

@@ -406,3 +406,40 @@ def field_index(report_type: str):
             if field["type"] != "note":
                 index[field["key"]] = field
     return index
+
+
+# --------------------------------------------------------------------------- #
+# Which forms the crew see (7.13)
+# --------------------------------------------------------------------------- #
+# The administrator can switch a form off for every crew iPad at once; it then
+# neither appears on the Reports page nor counts towards "all forms handled".
+# Management still see every form ever filed. Stored in app_settings as a
+# JSON list under this key; absent = every form on.
+CREW_FORMS_KEY = "crew_report_types"
+
+
+def enabled_report_types(connection) -> list[str]:
+    import json
+    try:
+        row = connection.execute("SELECT value FROM app_settings WHERE key=?", (CREW_FORMS_KEY,)).fetchone()
+    except Exception:  # noqa: BLE001 - table missing on a very old database
+        return list(REPORT_TYPES)
+    if not row or not row["value"]:
+        return list(REPORT_TYPES)
+    try:
+        chosen = json.loads(row["value"])
+    except ValueError:
+        return list(REPORT_TYPES)
+    return [t for t in REPORT_TYPES if t in chosen]
+
+
+def set_enabled_report_types(connection, types: list[str], by: str) -> list[str]:
+    import json
+    from datetime import datetime
+    chosen = [t for t in REPORT_TYPES if t in types]
+    connection.execute(
+        "INSERT INTO app_settings(key,value,updated_by,updated_at) VALUES (?,?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+        (CREW_FORMS_KEY, json.dumps(chosen), by, datetime.now().replace(microsecond=0).isoformat()))
+    connection.commit()
+    return chosen

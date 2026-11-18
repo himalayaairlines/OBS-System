@@ -30,6 +30,7 @@ import CommsScreen from './src/screens/comms/CommsScreen';
 import NotificationsScreen from './src/screens/NotificationsScreen';
 import { BellIcon } from './src/screens/comms/shared';
 import CrewScreen from './src/screens/CrewScreen';
+import FlightSalesScreen from './src/screens/FlightSalesScreen';
 import DashboardScreen from './src/screens/DashboardScreen';
 import FinanceScreen from './src/screens/FinanceScreen';
 import InventoryScreen from './src/screens/InventoryScreen';
@@ -42,14 +43,16 @@ import WarehouseScreen from './src/screens/WarehouseScreen';
 const NAV = [
   // Administrators land on the user-analytics dashboard.
   { key: 'overview', label: 'Dashboard', icon: 'analytics', permission: 'security_view' },
-  { key: 'crew', label: 'Sales', icon: 'sales', permission: 'crew' },
+  // The crew iPad sells here; Management, Inventory and the administrator get
+  // the sector-wise sales overview instead (7.13).
+  { key: 'crew', label: 'Sales', icon: 'sales', anyPermission: ['crew', 'sales_view'] },
   { key: 'inventory', label: 'Inventory', icon: 'inventory', permission: 'inventory' },
   { key: 'warehouse', label: 'Warehouse', icon: 'warehouse', permission: 'warehouse' },
   { key: 'dashboard', label: 'Dashboard', icon: 'dashboard', permission: 'dashboard' },
   { key: 'sync', label: 'Sync', icon: 'sync', permission: 'sync' },
   // Management see the whole screen; the inventory supervisor reaches it for
   // the sales ledger alone, so the tab is labelled for what they actually get.
-  { key: 'logs', label: 'Performance & Sales Logs', icon: 'ledger', permission: 'sales_view', fullPermission: 'logs', altLabel: 'Sales' },
+  { key: 'logs', label: 'Performance & Sales Logs', icon: 'ledger', permission: 'sales_view', fullPermission: 'logs', altLabel: 'Sales Logs' },
   { key: 'rates', label: 'Rates', icon: 'rates', permission: 'rates' },
   // Crew file the post-flight cabin reports here; management read and correct them.
   { key: 'reports', label: 'Reports', icon: 'reports', permission: 'flight_reports' },
@@ -411,7 +414,9 @@ function AppContent() {
   const content = (
     <>
       {page === 'overview' && <OverviewScreen {...screenProps} />}
-      {page === 'crew' && <CrewScreen {...screenProps} />}
+      {page === 'crew' && (user.role === 'crew_supervisor'
+        ? <CrewScreen {...screenProps} />
+        : <FlightSalesScreen {...screenProps} />)}
       {page === 'inventory' && <InventoryScreen {...screenProps} />}
       {page === 'warehouse' && <WarehouseScreen {...screenProps} />}
       {page === 'dashboard' && <DashboardScreen {...screenProps} />}

@@ -19,7 +19,7 @@ from database import (
 from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 import sector_stock
 import trip_flow
-from report_forms import REPORT_TYPES
+from report_forms import REPORT_TYPES, enabled_report_types
 from security import (
     current_user, log_action, now_iso, permissions_for, requires, today_iso, validate_date,
 )
@@ -432,7 +432,8 @@ def finish_flight(flight_id: int, user: dict = Depends(requires("crew"))):
         row = _with_device_state(connection, rows, device)[0] if is_device else dict(rows[0])
         # Forms may be filled in before finishing (7.10); say how many are still open.
         handled, _ = trip_flow.reports_handled(connection, flight_id, device if is_device else None)
-        reports_outstanding = max(0, len(REPORT_TYPES) - handled)
+        reports_total = len(enabled_report_types(connection))
+        reports_outstanding = max(0, reports_total - handled)
     finally:
         connection.close()
 
@@ -447,7 +448,7 @@ def finish_flight(flight_id: int, user: dict = Depends(requires("crew"))):
         "revenue_npr": round(float(totals["revenue"] or 0), 2),
         "transactions": int(totals["orders"] or 0),
         "reports_outstanding": reports_outstanding,
-        "reports_total": len(REPORT_TYPES),
+        "reports_total": reports_total,
         "already_finished": already,
     }
 

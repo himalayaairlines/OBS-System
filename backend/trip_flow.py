@@ -38,7 +38,7 @@ and per iPad in trip_device_state:
 
 from fastapi import HTTPException
 
-from report_forms import REPORT_TYPES
+from report_forms import REPORT_TYPES, enabled_report_types
 from sector_stock import sector_count_submitted
 
 FLIGHT_COLUMNS = (
@@ -194,10 +194,11 @@ def trip_legs(connection, flight_id: int) -> list[dict]:
 
 
 def reports_filed(connection, flight_id: int) -> int:
+    types = enabled_report_types(connection) or REPORT_TYPES
     return connection.execute(
         f"SELECT COUNT(*) c FROM flight_reports WHERE flight_id=? AND status='SUBMITTED' "
-        f"AND report_type IN ({','.join('?' * len(REPORT_TYPES))})",
-        (flight_id, *REPORT_TYPES)).fetchone()["c"]
+        f"AND report_type IN ({','.join('?' * len(types))})",
+        (flight_id, *types)).fetchone()["c"]
 
 
 def reports_handled(connection, flight_id: int, device: str | None = None) -> tuple[int, list[str]]:
@@ -218,9 +219,11 @@ def report_types_state(connection, flight_id: int, device: str | None = None):
     else:
         deferred = {r["report_type"] for r in connection.execute(
             "SELECT DISTINCT report_type FROM flight_report_deferrals WHERE flight_id=?", (flight_id,))}
-    handled = [t for t in REPORT_TYPES if t in submitted or t in deferred]
-    awaiting = [t for t in REPORT_TYPES if t in deferred and t not in submitted]
-    return handled, awaiting, [t for t in REPORT_TYPES if t in submitted]
+    # Only the forms the administrator has switched on for the crew count (7.13).
+    types = enabled_report_types(connection)
+    handled = [t for t in types if t in submitted or t in deferred]
+    awaiting = [t for t in types if t in deferred and t not in submitted]
+    return handled, awaiting, [t for t in types if t in submitted]
 
 
 def stock_return_status(connection, root_id: int) -> str:
@@ -247,7 +250,7 @@ def progress(connection, flight_id: int, device: str | None = None) -> dict:
     legs = trip_legs(connection, flight_id)
     root = legs[0]
     round_trip = len(legs) > 1
-    total = len(REPORT_TYPES)
+    total = len(enabled_report_types(connection))
     out = []
     for index, leg in enumerate(legs):
         handled_types, awaiting, filed_types = report_types_state(connection, leg["id"], device)
