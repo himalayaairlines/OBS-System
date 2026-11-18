@@ -618,8 +618,17 @@ def movements(product_id: int | None = None, limit: int = 200,
               user: dict = Depends(requires("warehouse"))):
     connection = get_connection()
     try:
-        sql = """SELECT t.*, p.product_code, p.product_name
-                 FROM main_inventory_txn t JOIN products p ON p.id = t.product_id"""
+        # 7.15: a post-flight return links back to its stock return, so the
+        # ledger can open it and show which iPad returned what.
+        sql = """SELECT t.*, p.product_code, p.product_name,
+                        rc.id AS reconciliation_id, rc.status AS reconciliation_status,
+                        (SELECT COUNT(*) FROM reconciliation_items ri WHERE ri.reconciliation_id=rc.id AND ri.variance<>0) AS variance_lines,
+                        (SELECT ri.variance FROM reconciliation_items ri WHERE ri.reconciliation_id=rc.id AND ri.product_id=t.product_id) AS line_variance
+                 FROM main_inventory_txn t JOIN products p ON p.id = t.product_id
+                 LEFT JOIN reconciliations rc ON t.reason IN ('OBS_RETURN','OBS_RETURN_ADJ')
+                      AND rc.flight_id = (SELECT f.id FROM flights f
+                                          WHERE t.reference LIKE 'Trip ' || f.flight_number || ' ' || f.flight_date || '%'
+                                            AND f.direction <> 'RETURN' LIMIT 1)"""
         params, conditions = [], []
         if product_id:
             conditions.append("t.product_id=?")

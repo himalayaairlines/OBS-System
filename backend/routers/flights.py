@@ -240,6 +240,20 @@ def set_aircraft(flight_id: int, data: AircraftUpdate, user: dict = Depends(requ
         _assert_device_assigned(connection, flight, user)
         if flight["aircraft_type"] == aircraft_type and (flight["aircraft"] or None) == aircraft:
             return dict(_flight_rows(connection, "WHERE f.id=?", (flight_id,))[0])  # replayed offline save
+        if (_is_device(connection, flight, user) and flight["aircraft_locked"]
+                and flight["aircraft_entered_by"] and flight["aircraft_entered_by"] != user["employee_id"]):
+            # 7.15: the other iPad set it first (both worked offline). Keep that
+            # value and show the difference to Management instead of overwriting.
+            label = f"{aircraft_type}{f' ({aircraft})' if aircraft else ''}"
+            kept = f"{flight['aircraft_type']}{f' ({flight['aircraft']})' if flight['aircraft'] else ''}"
+            trip_flow.record_conflict(connection, flight_id, user["employee_id"], "aircraft", kept,
+                                      flight["aircraft_entered_by"], label, now_iso())
+            connection.commit()
+            log_action(user, "FLIGHT", "AIRCRAFT_CONFLICT",
+                       f"iPad {user['employee_id']} sent aircraft {label} for {flight['flight_number']}; "
+                       f"{kept} from {flight['aircraft_entered_by']} kept. Shown to Management as a difference.",
+                       "flight", flight_id, status="WARNING")
+            return {**dict(_flight_rows(connection, "WHERE f.id=?", (flight_id,))[0]), "conflict": True}
         _assert_leg_open(flight, "change aircraft", connection, user)
         _guard_locked_field(user, flight, "aircraft_locked", "Aircraft", data.remarks)
         sold = connection.execute(
@@ -283,6 +297,16 @@ def set_pax(flight_id: int, data: PaxUpdate, user: dict = Depends(requires("crew
         _assert_device_assigned(connection, flight, user)
         if flight["passengers"] == data.passengers:
             return dict(_flight_rows(connection, "WHERE f.id=?", (flight_id,))[0])  # replayed offline save
+        if (_is_device(connection, flight, user) and flight["pax_locked"]
+                and flight["pax_entered_by"] and flight["pax_entered_by"] != user["employee_id"]):
+            trip_flow.record_conflict(connection, flight_id, user["employee_id"], "passengers", flight["passengers"],
+                                      flight["pax_entered_by"], data.passengers, now_iso())
+            connection.commit()
+            log_action(user, "FLIGHT", "PAX_CONFLICT",
+                       f"iPad {user['employee_id']} sent PAX {data.passengers} for {flight['flight_number']}; "
+                       f"{flight['passengers']} from {flight['pax_entered_by']} kept. Shown to Management as a difference.",
+                       "flight", flight_id, status="WARNING")
+            return {**dict(_flight_rows(connection, "WHERE f.id=?", (flight_id,))[0]), "conflict": True}
         _assert_leg_open(flight, "change the PAX load", connection, user)
         _guard_locked_field(user, flight, "pax_locked", "PAX load", data.remarks)
         connection.execute(

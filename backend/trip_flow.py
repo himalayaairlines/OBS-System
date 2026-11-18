@@ -73,7 +73,36 @@ def initialize_trip_flow(connection, add_column, columns_of):
                forms_locked_at TEXT,
                completed_at TEXT,
                UNIQUE(flight_id, device))""")
+    # 7.15: a value the second iPad uploaded that differs from what the first
+    # iPad already set (PAX load, aircraft). The first value is kept; the
+    # difference is shown to Management until someone settles it, with remarks.
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS flight_conflicts (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               flight_id INTEGER NOT NULL REFERENCES flights(id) ON DELETE CASCADE,
+               device TEXT NOT NULL,
+               field TEXT NOT NULL,
+               kept_value TEXT,
+               kept_by TEXT,
+               device_value TEXT,
+               created_at TEXT NOT NULL,
+               resolved_by TEXT,
+               resolved_at TEXT,
+               resolution TEXT,
+               remarks TEXT)""")
     connection.commit()
+
+
+def record_conflict(connection, flight_id: int, device: str, field: str, kept_value, kept_by, device_value, now: str):
+    """Keep the first iPad's value and note what the other iPad sent (idempotent per iPad and field)."""
+    if connection.execute(
+            "SELECT 1 FROM flight_conflicts WHERE flight_id=? AND device=? AND field=? AND resolved_at IS NULL",
+            (flight_id, device, field)).fetchone():
+        return
+    connection.execute(
+        "INSERT INTO flight_conflicts(flight_id,device,field,kept_value,kept_by,device_value,created_at) VALUES (?,?,?,?,?,?,?)",
+        (flight_id, device, field, str(kept_value) if kept_value is not None else None, kept_by,
+         str(device_value) if device_value is not None else None, now))
 
 
 # --------------------------------------------------------------------------- #

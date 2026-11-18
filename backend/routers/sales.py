@@ -504,7 +504,15 @@ def sales_by_flight(year: int | None = None, month: int | None = None, day: int 
                    (SELECT COALESCE(SUM(s.npr_amount),0) FROM sales s WHERE s.flight_id=f.id AND s.sale_type='NORMAL') AS revenue_npr,
                    (SELECT COUNT(DISTINCT s.order_ref) FROM sales s WHERE s.flight_id=f.id AND s.sale_type='COMPLEMENTARY') AS complementary,
                    (SELECT COUNT(DISTINCT s.order_ref) FROM sales s WHERE s.flight_id=f.id AND s.sale_type='CANCELLATION') AS cancellations,
-                   (SELECT COUNT(*) FROM sale_edit_history h JOIN sales s ON s.id=h.sale_id WHERE s.flight_id=f.id) AS edits
+                   (SELECT COUNT(*) FROM sale_edit_history h JOIN sales s ON s.id=h.sale_id WHERE s.flight_id=f.id) AS edits,
+                   (SELECT COUNT(*) FROM flight_conflicts c WHERE c.flight_id=f.id AND c.resolved_at IS NULL) AS open_conflicts,
+                   (SELECT COUNT(*) FROM flight_report_revisions rv JOIN flight_reports r ON r.id=rv.report_id
+                     WHERE r.flight_id=f.id AND rv.action='MERGED') AS merged_forms,
+                   (SELECT COUNT(*) FROM sector_stock_items si JOIN sector_stock_counts sc ON sc.id=si.count_id
+                     WHERE sc.flight_id=f.id AND si.variance<>0) AS stock_variances,
+                   (SELECT COUNT(*) FROM reconciliation_items ri JOIN reconciliations r ON r.id=ri.reconciliation_id
+                     WHERE r.flight_id=CASE WHEN f.direction='RETURN' THEN f.linked_flight_id ELSE f.id END
+                       AND ri.variance<>0 AND ri.override_by IS NULL) AS return_variances
             FROM flights f {where}
             ORDER BY f.flight_date DESC, f.flight_number, f.direction"""
         if page:
@@ -520,7 +528,112 @@ def _round_flight(row):
     row = dict(row)
     row["revenue_npr"] = round(float(row.get("revenue_npr") or 0), 2)
     row["devices"] = [d for d in str(row.get("devices") or "").split(",") if d]
+    # 7.15: anything the two iPads disagreed on, or that does not add up, is
+    # highlighted on the sector until Management has looked at it.
+    row["differences"] = int(row.get("open_conflicts") or 0) + int(row.get("merged_forms") or 0) \
+        + int(row.get("stock_variances") or 0) + int(row.get("return_variances") or 0)
     return row
+
+
+@router.get("/sales/flights/{flight_id}/differences")
+def flight_differences(flight_id: int, user: dict = Depends(requires("sales_view"))):
+    """What the two iPads disagreed on, and what does not add up, on one sector (7.15)."""
+    connection = get_connection()
+    try:
+        flight = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if not flight:
+            raise HTTPException(status_code=404, detail="Flight not found.")
+        root_id = flight["linked_flight_id"] if flight["direction"] == "RETURN" and flight["linked_flight_id"] else flight["id"]
+        conflicts = [dict(r) for r in connection.execute(
+            "SELECT * FROM flight_conflicts WHERE flight_id=? ORDER BY resolved_at IS NOT NULL, id DESC", (flight_id,))]
+        merged = [dict(r) for r in connection.execute("""
+            SELECT rv.id, rv.rev_no, rv.changed_by, rv.changed_at, rv.remarks, r.report_type, r.submitted_by, r.id AS report_id
+            FROM flight_report_revisions rv JOIN flight_reports r ON r.id=rv.report_id
+            WHERE r.flight_id=? AND rv.action='MERGED' ORDER BY rv.id DESC""", (flight_id,))]
+        # Remaining stock after this sector, per iPad, lines that do not add up.
+        counts = {r["id"]: dict(r) for r in connection.execute(
+            "SELECT * FROM sector_stock_counts WHERE flight_id=?", (flight_id,))}
+        stock_lines = {}
+        for r in connection.execute("""
+                SELECT si.*, p.product_name FROM sector_stock_items si JOIN products p ON p.id=si.product_id
+                WHERE si.count_id IN (SELECT id FROM sector_stock_counts WHERE flight_id=?)""", (flight_id,)):
+            line = stock_lines.setdefault(r["product_id"], {
+                "product_id": r["product_id"], "product_name": r["product_name"],
+                "expected_remaining": r["expected_remaining"], "by_device": {}, "declared_total": 0})
+            device = counts[r["count_id"]]["device"]
+            line["by_device"][device] = r["declared_remaining"]
+            line["declared_total"] += int(r["declared_remaining"])
+        sector_stock = []
+        for line in stock_lines.values():
+            line["variance"] = line["declared_total"] - int(line["expected_remaining"])
+            if line["variance"] != 0:
+                sector_stock.append(line)
+        stock_remarks = {c["device"]: c["remarks"] for c in counts.values() if c.get("remarks")}
+        # The trip's final stock return, lines that do not add up.
+        stock_return = None
+        recon = connection.execute("SELECT * FROM reconciliations WHERE flight_id=?", (root_id,)).fetchone()
+        if recon:
+            from routers.obs import _recon
+            full = _recon(connection, recon_id=recon["id"])
+            stock_return = {
+                "id": full["id"], "status": full["status"], "devices": full.get("devices"),
+                "submitted_devices": full.get("submitted_devices"), "device_remarks": full.get("device_remarks"),
+                "items": [i for i in full["items"] if i["variance"] != 0 or i.get("overridden")],
+            }
+    finally:
+        connection.close()
+    return {
+        "flight_id": flight_id, "root_id": root_id,
+        "conflicts": conflicts, "merged_forms": merged,
+        "sector_stock": sector_stock, "sector_stock_remarks": stock_remarks,
+        "stock_return": stock_return,
+        "total": len([c for c in conflicts if not c["resolved_at"]]) + len(merged) + len(sector_stock)
+                 + (len([i for i in stock_return["items"] if not i.get("overridden")]) if stock_return else 0),
+    }
+
+
+class ResolveIn(BaseModel):
+    apply_device_value: bool = False
+    remarks: str = Field(min_length=1, max_length=500)
+
+
+@router.put("/flight-conflicts/{conflict_id}/resolve")
+def resolve_conflict(conflict_id: int, data: ResolveIn, user: dict = Depends(requires("sales_edit"))):
+    """Settle a PAX / aircraft difference: keep the first iPad's value or apply
+    the other iPad's, always with remarks and an audit entry."""
+    connection = get_connection()
+    try:
+        c = connection.execute("SELECT * FROM flight_conflicts WHERE id=?", (conflict_id,)).fetchone()
+        if not c:
+            raise HTTPException(status_code=404, detail="Difference not found.")
+        if c["resolved_at"]:
+            raise HTTPException(status_code=400, detail="This difference has already been settled.")
+        now = now_iso()
+        if data.apply_device_value:
+            if c["field"] == "passengers":
+                connection.execute("UPDATE flights SET passengers=?, pax_entered_by=?, pax_entered_at=? WHERE id=?",
+                                   (int(c["device_value"]), user["employee_id"], now, c["flight_id"]))
+            elif c["field"] == "aircraft":
+                value = str(c["device_value"] or "")
+                aircraft_type = value.split(" (")[0].strip() or None
+                aircraft = value[value.index("(") + 1:-1].strip() if "(" in value and value.endswith(")") else None
+                connection.execute("UPDATE flights SET aircraft_type=?, aircraft=?, aircraft_entered_by=?, aircraft_entered_at=? WHERE id=?",
+                                   (aircraft_type, aircraft, user["employee_id"], now, c["flight_id"]))
+        connection.execute(
+            "UPDATE flight_conflicts SET resolved_by=?, resolved_at=?, resolution=?, remarks=? WHERE id=?",
+            (user["employee_id"], now, "APPLIED_DEVICE_VALUE" if data.apply_device_value else "KEPT",
+             data.remarks.strip(), conflict_id))
+        connection.commit()
+        flight = connection.execute("SELECT flight_number FROM flights WHERE id=?", (c["flight_id"],)).fetchone()
+    finally:
+        connection.close()
+    log_action(user, "FLIGHT", "RESOLVE_DIFFERENCE",
+               f"{flight['flight_number']}: {c['field']} difference settled — "
+               + (f"applied iPad {c['device']}'s value {c['device_value']}" if data.apply_device_value
+                  else f"kept {c['kept_value']} (iPad {c['device']} had {c['device_value']})")
+               + f". Remarks: {data.remarks.strip()}", "flight", c["flight_id"],
+               metadata={"conflict_id": conflict_id, "apply_device_value": data.apply_device_value})
+    return {"ok": True, "conflict_id": conflict_id}
 
 
 @router.get("/sales/flights/{flight_id}/summary")

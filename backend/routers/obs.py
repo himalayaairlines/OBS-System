@@ -275,7 +275,9 @@ def _recon(connection, recon_id=None, flight_id=None):
     items = []
     for line in _inventory_rows(connection, root_id):
         override = overrides.get(line["product_id"])
-        expected = line["remaining_quantity"]
+        # Once approved, the returned units are already off the trolley figure;
+        # the expectation the count is judged against must not shrink by them.
+        expected = int(line["remaining_quantity"]) + (int(line.get("returned_quantity") or 0) if recon["status"] == "APPROVED" else 0)
         # What the crew counted, unless a supervisor has since corrected it.
         if override is not None:
             declared = int(override["declared_remaining"])
@@ -604,11 +606,27 @@ def adjust_reconciliation(recon_id: int, data: ReconAdjust,
     connection = get_connection()
     try:
         recon = _recon(connection, recon_id=recon_id)
-        if recon["status"] == "APPROVED":
-            raise HTTPException(status_code=400, detail="Already approved.")
         line = next((i for i in recon["items"] if i["product_id"] == data.product_id), None)
         if not line:
             raise HTTPException(status_code=404, detail="That product was not loaded on this trip.")
+        approved = recon["status"] == "APPROVED"
+        # After approval the returned units are already off the trolley figure,
+        # so the system expectation is loaded less sold less wasted.
+        expected = (int(line["loaded_quantity"]) - int(line["sold_quantity"]) - int(line.get("wasted_quantity") or 0)
+                    if approved else int(line["expected_remaining"]))
+        if approved:
+            # 7.15: the return has already gone back into the warehouse, so a
+            # correction moves the difference in the ledger as well.
+            old_credit = max(0, min(int(line["declared_remaining"]), expected))
+            new_credit = max(0, min(int(data.declared_remaining), expected))
+            delta = new_credit - old_credit
+            if delta:
+                move_stock(connection, data.product_id, delta, "OBS_RETURN_ADJ",
+                           f"Trip {recon['flight_number']} {recon['flight_date']} — corrected by {user['employee_id']}: {data.remarks.strip()}",
+                           user["employee_id"], stock_date=recon["flight_date"])
+                connection.execute(
+                    "UPDATE inventory SET returned_quantity = returned_quantity + ? WHERE flight_id=? AND product_id=?",
+                    (delta, recon["flight_id"], data.product_id))
 
         connection.execute(
             """INSERT INTO reconciliation_items
@@ -623,8 +641,8 @@ def adjust_reconciliation(recon_id: int, data: ReconAdjust,
                    override_by=excluded.override_by, override_at=excluded.override_at,
                    override_remarks=excluded.override_remarks""",
             (recon_id, data.product_id, line["loaded_quantity"], line["sold_quantity"],
-             line["expected_remaining"], data.declared_remaining,
-             data.declared_remaining - line["expected_remaining"],
+             expected, data.declared_remaining,
+             data.declared_remaining - expected,
              user["employee_id"], now_iso(), data.remarks.strip()),
         )
         connection.commit()
@@ -634,9 +652,30 @@ def adjust_reconciliation(recon_id: int, data: ReconAdjust,
 
     log_action(user, "RECONCILIATION", "ADJUST_STOCK_RETURN",
                f"{line['product_name']}: system said {line['expected_remaining']}, "
-               f"recorded {data.declared_remaining}. Remarks: {data.remarks.strip()}",
+               f"recorded {data.declared_remaining}" + (" (after approval; warehouse stock moved accordingly)" if approved else "")
+               + f". Remarks: {data.remarks.strip()}",
                "flight", recon["flight_id"], status="EDITED")
     return result
+
+
+@router.get("/reconciliations/{recon_id}")
+def get_reconciliation(recon_id: int, user: dict = Depends(requires("sync"))):
+    """One stock return in full: which iPad on which sector returned what,
+    the merged total, and the lines that do not add up (7.15)."""
+    connection = get_connection()
+    try:
+        recon = _recon(connection, recon_id=recon_id)
+        legs = _trip_label(connection, recon["flight_id"])
+        assignments = {}
+        for leg in legs:
+            for r in connection.execute("SELECT crew_account FROM flight_assignments WHERE flight_id=? ORDER BY id", (leg["id"],)):
+                assignments.setdefault(r["crew_account"], []).append(f"{leg['flight_number']} {leg['origin']}-{leg['destination']}")
+        recon["legs"] = legs
+        recon["device_sectors"] = assignments
+        recon["variance_lines"] = [i for i in recon["items"] if i["variance"] != 0]
+        return recon
+    finally:
+        connection.close()
 
 
 @router.put("/reconciliations/{recon_id}/review")

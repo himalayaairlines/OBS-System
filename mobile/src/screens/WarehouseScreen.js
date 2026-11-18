@@ -60,6 +60,8 @@ export default function WarehouseScreen({ user }) {
     .filter((key) => poFilter[key]).map((key) => `${key}=${encodeURIComponent(poFilter[key])}`).join('&');
   const po = usePaged(`/orders${poQuery ? `?${poQuery}` : ''}`, { enabled: tab === 'po' });
   const moves = usePaged('/main-inventory/movements', { enabled: tab === 'ledger' });
+  // A post-flight return opened from the ledger (7.15).
+  const [openReturn, setOpenReturn] = useState(null);
 
   const load = useCallback(async () => {
     try {
@@ -858,9 +860,10 @@ export default function WarehouseScreen({ user }) {
           <SectionTitle title="Stock movements" description="Every automatic and manual change to main inventory, newest first." />
           {!!moves.error && <Banner tone="danger" message={moves.error} />}
           {moves.items.map((move) => (
-            <View key={move.id} style={styles.listRow}>
+            <View key={move.id} style={[styles.listRow, move.line_variance ? { backgroundColor: COLORS.warningSoft, borderRadius: 8, paddingHorizontal: 8 } : null]}>
               <View style={styles.rowBetween}>
                 <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }}>{move.product_name}</Text>
+                {!!move.line_variance && <Pill label={`DIFFERENCE ${move.line_variance > 0 ? '+' : ''}${move.line_variance}`} tone="warning" />}
                 <Text style={{
                   fontWeight: '600',
                   color: move.change_qty > 0 ? COLORS.success : COLORS.danger,
@@ -872,6 +875,19 @@ export default function WarehouseScreen({ user }) {
                 {move.reason} · balance {move.balance_after} · {move.created_by} · {move.created_at?.slice(0, 16).replace('T', ' ')}
               </Text>
               {!!move.reference && <Text style={styles.mono}>{move.reference}</Text>}
+              {!!move.reconciliation_id && (
+                <Button
+                  title={openReturn?.id === move.reconciliation_id ? 'Hide the return' : `Open the stock return${move.variance_lines ? ` (${move.variance_lines} line(s) differ)` : ''}`}
+                  tone="ghost" small style={{ marginTop: 4, alignSelf: 'flex-start' }}
+                  onPress={async () => {
+                    if (openReturn?.id === move.reconciliation_id) return setOpenReturn(null);
+                    try { setOpenReturn(await api(`/reconciliations/${move.reconciliation_id}`)); } catch (e) { setMessage({ tone: 'danger', text: e.message }); }
+                  }}
+                />
+              )}
+              {openReturn?.id === move.reconciliation_id && (
+                <ReturnDetail recon={openReturn} canAdjust={canApprove} onChanged={async () => { setOpenReturn(await api(`/reconciliations/${move.reconciliation_id}`)); moves.reload(); }} onMessage={setMessage} />
+              )}
             </View>
           ))}
           {!moves.items.length && !moves.loading && <Text style={styles.empty}>No movements recorded.</Text>}
@@ -956,5 +972,87 @@ export default function WarehouseScreen({ user }) {
         onClose={() => setAdjustPicker(false)}
       />
     </ScrollView>
+  );
+}
+
+
+/* ------------------------------------------------------------------ */
+/* A post-flight stock return opened from the ledger (7.15)            */
+/* ------------------------------------------------------------------ */
+function ReturnDetail({ recon, canAdjust, onChanged, onMessage }) {
+  const [editing, setEditing] = useState(null);     // product_id
+  const [value, setValue] = useState('');
+  const [remarks, setRemarks] = useState('');
+  const devices = recon.devices || [];
+
+  async function save(item) {
+    if (!remarks.trim()) return onMessage({ tone: 'danger', text: 'Remarks are mandatory when correcting a return.' });
+    try {
+      await api(`/reconciliations/${recon.id}/adjust`, { method: 'PUT', body: { product_id: item.product_id, declared_remaining: Number(value || 0), remarks: remarks.trim() } });
+      setEditing(null); setRemarks(''); setValue('');
+      onMessage({ tone: 'success', text: recon.status === 'APPROVED'
+        ? 'Return corrected. The difference has been moved in main inventory and recorded with your remarks.'
+        : 'Return corrected and recorded with your remarks.' });
+      onChanged?.();
+    } catch (e) {
+      onMessage({ tone: 'danger', text: e.message });
+    }
+  }
+
+  return (
+    <View style={{ marginTop: 8, backgroundColor: COLORS.surfaceAlt, padding: 12, borderRadius: 10 }}>
+      <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text }}>
+        Stock return \u00b7 {recon.flight_number} \u00b7 {recon.flight_date} \u00b7 {recon.status}
+      </Text>
+      <Text style={[styles.mono, { marginTop: 2 }]}>
+        {(recon.legs || []).map((l) => `${l.flight_number} ${l.origin}\u2192${l.destination}`).join('  |  ')}
+      </Text>
+      {Object.entries(recon.device_sectors || {}).map(([device, sectors]) => (
+        <Text key={device} style={styles.mono}>
+          iPad {device}: {sectors.join(', ')}{(recon.submitted_devices || []).includes(device) ? ' \u00b7 declared' : ' \u00b7 not declared'}
+          {recon.device_remarks?.[device] ? ` \u00b7 remarks: ${recon.device_remarks[device]}` : ''}
+        </Text>
+      ))}
+      <View style={[styles.rowBetween, { paddingVertical: 6, marginTop: 6, borderBottomWidth: 1, borderBottomColor: COLORS.border }]}>
+        <Text style={[styles.mono, { flex: 2 }]}>Product</Text>
+        <Text style={[styles.mono, { width: 60, textAlign: 'right' }]}>Expected</Text>
+        {devices.map((d) => <Text key={d} style={[styles.mono, { width: 64, textAlign: 'right' }]} numberOfLines={1}>{d}</Text>)}
+        <Text style={[styles.mono, { width: 56, textAlign: 'right' }]}>Total</Text>
+        <Text style={[styles.mono, { width: 56, textAlign: 'right' }]}>Diff</Text>
+      </View>
+      {(recon.items || []).map((item) => (
+        <View key={item.product_id}>
+          <View style={[styles.rowBetween, { paddingVertical: 5, backgroundColor: item.variance ? COLORS.warningSoft : 'transparent' }]}>
+            <View style={{ flex: 2 }}>
+              <Text style={{ fontSize: 13, color: COLORS.text, fontWeight: item.variance ? '700' : '500' }}>{item.product_name}</Text>
+              {item.overridden && <Text style={styles.mono}>corrected by {item.override_by}: {item.override_remarks}</Text>}
+            </View>
+            <Text style={[styles.value, { width: 60, textAlign: 'right' }]}>{item.expected_remaining}</Text>
+            {devices.map((d) => <Text key={d} style={[styles.value, { width: 64, textAlign: 'right' }]}>{item.by_device?.[d] ?? '\u2014'}</Text>)}
+            <Text style={[styles.value, { width: 56, textAlign: 'right', fontWeight: '600' }]}>{item.declared_remaining}</Text>
+            <Text style={[styles.value, { width: 56, textAlign: 'right', color: item.variance ? COLORS.warning : COLORS.muted, fontWeight: '700' }]}>
+              {item.variance > 0 ? '+' : ''}{item.variance}
+            </Text>
+          </View>
+          {canAdjust && editing !== item.product_id && !!item.variance && (
+            <Button title="Correct this line" tone="ghost" small style={{ alignSelf: 'flex-start' }}
+              onPress={() => { setEditing(item.product_id); setValue(String(item.declared_remaining)); setRemarks(''); }} />
+          )}
+          {editing === item.product_id && (
+            <View style={{ padding: 10, backgroundColor: COLORS.surface, borderRadius: 8, marginBottom: 6 }}>
+              <View style={[styles.row, styles.gap8]}>
+                <View style={styles.flex1}><Field label="Returned (total for the trip)" value={value} onChangeText={(v) => setValue(v.replace(/[^0-9]/g, ''))} keyboardType="number-pad" /></View>
+              </View>
+              <Field label="Remarks (mandatory)" value={remarks} onChangeText={setRemarks} multiline placeholder="e.g. one more found in the trolley on unloading" />
+              <View style={[styles.row, styles.gap8]}>
+                <Button title="Save correction" small style={styles.flex1} onPress={() => save(item)} disabled={!remarks.trim()} />
+                <Button title="Cancel" tone="ghost" small style={styles.flex1} onPress={() => setEditing(null)} />
+              </View>
+            </View>
+          )}
+        </View>
+      ))}
+      {canAdjust && <Text style={[styles.mono, { marginTop: 6 }]}>Lines that differ are highlighted. A correction needs remarks; after approval it also moves the difference in main inventory.</Text>}
+    </View>
   );
 }

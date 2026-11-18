@@ -626,3 +626,44 @@ class SalesOverviewAndFormsTests(TripFlowTests.__bases__[0]):
         hist = call("GET", f"/sales/{sale['id']}/history", "MGT001")[1]
         self.assertTrue(hist[0]["on_device"])
         self.assertTrue(any(c.startswith("items:") for c in hist[0]["changes"]), hist)
+
+    def test_differences_between_ipads_are_highlighted(self):
+        (leg,), product = self.make_trip("ONE_WAY")
+        self.assertEqual(call("POST", f"/trips/{leg['id']}/assign", "INV001",
+                              {"crew_account": "CREW001", "crew_account_2": "CSUP001"})[0], 200)
+        self.open_leg(leg)   # CREW001 sets PAX 150
+        # The other iPad, offline, had typed 160: the first value is kept and the difference noted.
+        status, out = call("PUT", f"/flights/{leg['id']}/pax-load", "CSUP001", {"passengers": 160})
+        self.assertEqual((status, out.get("conflict"), out["passengers"]), (200, True, 150), out)
+        row = [r for r in call("GET", f"/sales/flights?flight_number={leg['flight_number']}", "MGT001")[1] if r["id"] == leg["id"]][0]
+        self.assertEqual(row["differences"], 1)
+        diff = call("GET", f"/sales/flights/{leg['id']}/differences", "MGT001")[1]
+        self.assertEqual((diff["total"], diff["conflicts"][0]["field"], diff["conflicts"][0]["device_value"]), (1, "passengers", "160"))
+        # Management settles it by applying the other iPad's value, with remarks.
+        cid = diff["conflicts"][0]["id"]
+        self.assertEqual(call("PUT", f"/flight-conflicts/{cid}/resolve", "MGT001", {"apply_device_value": True, "remarks": ""})[0], 422)
+        self.assertEqual(call("PUT", f"/flight-conflicts/{cid}/resolve", "MGT001", {"apply_device_value": True, "remarks": "Load sheet says 160"})[0], 200)
+        flight = [f for f in call("GET", "/flights", "MGT001")[1] if f["id"] == leg["id"]][0]
+        self.assertEqual(flight["passengers"], 160)
+        self.assertEqual(call("GET", f"/sales/flights/{leg['id']}/differences", "MGT001")[1]["total"], 0)
+        # A stock return with a variance shows as a difference and opens from the ledger.
+        self.sell(leg, product, None)
+        for who in ("CREW001", "CSUP001"):
+            self.assertEqual(call("PUT", f"/flights/{leg['id']}/finish", who)[0], 200)
+        self.assertEqual(call("POST", "/reconciliations", "CREW001", {"flight_id": leg["id"], "lines": [{"product_id": product, "declared_remaining": 3}]})[0], 200)
+        status, r2 = call("POST", "/reconciliations", "CSUP001", {"flight_id": leg["id"], "lines": [{"product_id": product, "declared_remaining": 0}]})
+        self.assertEqual((status, r2["status"], r2["total_variance"]), (200, "PENDING", -1), r2)   # 5 loaded, 1 sold, 3 returned
+        diff = call("GET", f"/sales/flights/{leg['id']}/differences", "MGT001")[1]
+        self.assertEqual(diff["stock_return"]["items"][0]["by_device"], {"CREW001": 3, "CSUP001": 0})
+        self.assertEqual(call("PUT", f"/reconciliations/{r2['id']}/review", "ISUP001", {"approve": True, "review_remarks": "ok"})[0], 200)
+        moves = call("GET", "/main-inventory/movements?reason=OBS_RETURN&page=1&page_size=5", "ISUP001")[1]["items"]
+        mine = [m for m in moves if m["reconciliation_id"] == r2["id"]][0]
+        self.assertEqual((mine["change_qty"], mine["line_variance"]), (3, -1))
+        detail = call("GET", f"/reconciliations/{r2['id']}", "ISUP001")[1]
+        self.assertEqual(detail["device_sectors"]["CSUP001"], [f"{leg['flight_number']} KTM-DXB"])
+        # The Inventory Supervisor corrects the approved return with remarks; the ledger moves the difference.
+        status, fixed = call("PUT", f"/reconciliations/{r2['id']}/adjust", "ISUP001",
+                             {"product_id": product, "declared_remaining": 4, "remarks": "One more found in the trolley"})
+        self.assertEqual((status, fixed["items"][0]["declared_remaining"], fixed["items"][0]["overridden"]), (200, 4, True), fixed)
+        adj = call("GET", "/main-inventory/movements?reason=OBS_RETURN_ADJ&page=1&page_size=5", "ISUP001")[1]["items"]
+        self.assertEqual(adj[0]["change_qty"], 1)
