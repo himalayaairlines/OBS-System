@@ -667,3 +667,69 @@ class SalesOverviewAndFormsTests(TripFlowTests.__bases__[0]):
         self.assertEqual((status, fixed["items"][0]["declared_remaining"], fixed["items"][0]["overridden"]), (200, 4, True), fixed)
         adj = call("GET", "/main-inventory/movements?reason=OBS_RETURN_ADJ&page=1&page_size=5", "ISUP001")[1]["items"]
         self.assertEqual(adj[0]["change_qty"], 1)
+
+
+class SalesHistoryTests(TripFlowTests.__bases__[0]):
+    """7.16: the administrator uploads the consumption-report workbook; the dashboard reads it."""
+
+    def _workbook(self):
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "JAN 2025"
+        ws.append([" Sales Report \nJan 01-31, 2025"])
+        ws.append(["SL.No", "Items Name", "Cost Price\nInclusive Vat", "Total Sold Qty (in pcs.)", "Total Cost", "Sales Price", "Total Sold Amount"])
+        ws.append([1, "Gorkha", 251.14, 100, 25114, 900, 90000])
+        ws.append([2, "Coke", 41.34, 50, 2067, 150, 7500])
+        ws.append(["Total", None, None, None, 27181, None, 97500])
+        ws2 = wb.create_sheet("FEB")
+        ws2.append([" Sales Report \nFeb 01-14, 2025", None, None, None, None, None, None, " Sales Report \nFeb 15-28, 2025"])
+        ws2.append(["SL.No", "Product Name", "Cost Price\nInclusive Vat", "Total Sold Qty (in pcs.)", "Total Cost", "Sales Price", None,
+                    "SL.No", "Product Name", "Cost Price\nInclusive Vat", "Total Sold Qty (in pcs.)", "Total Cost", "Sales Price"])
+        ws2.append([1, "Gorkha", 251.14, 10, 2511.4, 900, None, 1, "Gorkha", 251.14, 20, 5022.8, 900])
+        ws2.append([None] * 13)
+        ws2.append([" Sales Report \nFeb 01-28, 2025"])
+        ws2.append(["SL.No", "Product Name", "Cost Price\nInclusive Vat", "Total Sold Qty (in pcs.)", "Total Cost", "Sales Price", "Total Sold Amount"])
+        ws2.append([1, "Gorkha", 251.14, 30, 7534.2, 900, 27000])
+        ws2.append(["Total", None, None, None, 7534.2, None, 27000])
+        from io import BytesIO
+        buf = BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    def _upload(self, who):
+        import urllib.request
+        boundary = "----obsboundary"
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"report.xlsx\"\r\n"
+                "Content-Type: application/octet-stream\r\n\r\n").encode() + self._workbook() + f"\r\n--{boundary}--\r\n".encode()
+        if who not in TOKENS:
+            call("GET", "/health", who)
+        request = urllib.request.Request(f"{BASE}/sales-history/upload", data=body, method="POST", headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}", "Authorization": f"Bearer {TOKENS[who]}"})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"null")
+
+    def test_upload_and_dashboard_history(self):
+        self.assertEqual(self._upload("MGT001")[0], 403)      # administrator only
+        status, out = self._upload("ADMIN001")
+        self.assertEqual(status, 200, out)
+        # The whole-month February block wins over the two half-month blocks.
+        self.assertEqual((out["periods"], out["rows"], out["months"]), (2, 3, ["2025-01", "2025-02"]))
+        self.assertAlmostEqual(out["revenue"], 97500 + 27000)
+        summary = call("GET", "/sales-history/summary?year=2025", "MGT001")[1]
+        self.assertEqual((summary["available"], summary["units"], summary["years"]), (True, 180, [2025]))
+        self.assertEqual([m["month"] for m in summary["months"]], [1, 2])
+        self.assertEqual(summary["products"][0]["product_name"], "Gorkha")
+        self.assertAlmostEqual(summary["products"][0]["revenue"], 117000)
+        feb = call("GET", "/sales-history/summary?year=2025&month=2", "FIN001")[1]
+        self.assertAlmostEqual(feb["revenue"], 27000)
+        # Uploading again replaces, not duplicates.
+        self.assertEqual(self._upload("ADMIN001")[0], 200)
+        self.assertAlmostEqual(call("GET", "/sales-history/summary?year=2025", "MGT001")[1]["revenue"], 124500)
+        uploads = call("GET", "/sales-history/uploads", "MGT001")[1]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(call("DELETE", f"/sales-history/uploads/{uploads[0]['id']}", "ADMIN001")[0], 200)
+        self.assertFalse(call("GET", "/sales-history/summary?year=2025", "MGT001")[1]["available"])

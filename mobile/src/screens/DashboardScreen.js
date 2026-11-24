@@ -4,7 +4,7 @@ import { Text } from '../text';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 
-import { api, downloadReport } from '../api';
+import { api, downloadReport, uploadFile } from '../api';
 import { BarChart, DonutChart, LineChartView, ProgressBar } from '../charts';
 import { COLORS, MONTHS, compact, npr, styles } from '../theme';
 import {
@@ -12,7 +12,7 @@ import {
   SectionTitle, Select,
 } from '../ui';
 
-const YEARS = Array.from({ length: 6 }, (_, i) => new Date().getFullYear() - i);
+const BASE_YEARS = Array.from({ length: 6 }, (_, i) => new Date().getFullYear() - i);
 
 export default function DashboardScreen({ user }) {
   const [filter, setFilter] = useState({
@@ -24,6 +24,46 @@ export default function DashboardScreen({ user }) {
   const [message, setMessage] = useState(null);
   const [exporting, setExporting] = useState(false);
   const [productView, setProductView] = useState('chart');
+  // Uploaded sales history for years before OBS (7.16).
+  const [history, setHistory] = useState(null);
+  const [uploads, setUploads] = useState([]);
+  const [uploading, setUploading] = useState(false);
+  const [historyView, setHistoryView] = useState('months');
+  const fileInput = React.useRef(null);
+  const isAdmin = user.permissions?.includes('users');
+
+  const loadHistory = useCallback(async () => {
+    try {
+      const parts = [`year=${filter.year}`];
+      if (filter.month) parts.push(`month=${filter.month}`);
+      setHistory(await api(`/sales-history/summary?${parts.join('&')}`));
+      if (isAdmin) setUploads(await api('/sales-history/uploads'));
+    } catch { setHistory(null); }
+  }, [filter.year, filter.month, isAdmin]);
+  useEffect(() => { loadHistory(); }, [loadHistory]);
+
+  async function uploadHistory(file) {
+    if (!file) return;
+    setUploading(true);
+    try {
+      const result = await uploadFile('/sales-history/upload', file);
+      setMessage({ tone: 'success', text: `Uploaded ${file.name}: ${result.months.length} month(s) (${result.months[0]} to ${result.months[result.months.length - 1]}), ${result.rows} product line(s), ${npr(result.revenue)}. Choose the year to see it.` });
+      loadHistory();
+    } catch (error) {
+      setMessage({ tone: 'danger', text: `Upload failed: ${error.message}` });
+    }
+    setUploading(false);
+  }
+
+  async function removeUpload(u) {
+    try {
+      await api(`/sales-history/uploads/${u.id}`, { method: 'DELETE' });
+      setMessage({ tone: 'info', text: `${u.filename} removed from the dashboard.` });
+      loadHistory();
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+  }
 
   const query = useCallback(() => {
     const parts = [`year=${filter.year}`];
@@ -81,6 +121,7 @@ export default function DashboardScreen({ user }) {
     );
   }
 
+  const YEARS = [...new Set([...BASE_YEARS, ...((history && history.years) || [])])].sort((a, b) => b - a);
   const achievement = Number(data.achievement || 0);
   const flown = data.flights.filter((f) => f.passengers > 0);
   const atTarget = flown.filter((f) => f.rpp >= data.target_rpp).length;
@@ -312,6 +353,96 @@ export default function DashboardScreen({ user }) {
         {!data.flights.length && <Text style={styles.empty}>No flights in this period.</Text>}
       </Card>
 
+
+      {(history?.available || isAdmin) && (
+        <Card style={history?.available ? { borderColor: COLORS.info, borderWidth: 1 } : null}>
+          <SectionTitle
+            title={`Uploaded sales history \u00b7 ${periodLabel}`}
+            description={history?.available
+              ? `From the monthly consumption report uploaded by the administrator (${history.periods.length} period(s)). Live OBS figures above; this is the record from before OBS, or the paper report for the same period.`
+              : 'No uploaded report covers this period. The administrator can upload the monthly OBS consumption report workbook (one sheet per month) below.'}
+            right={history?.available ? <Pill label="UPLOADED REPORT" tone="info" /> : null}
+          />
+          {history?.available && (
+            <>
+              <View style={[styles.wrap, { marginBottom: 10 }]}>
+                <Metric label="Sales (report)" value={npr(history.revenue)} tone="primary" />
+                <Metric label="Cost of goods" value={npr(history.cost)} />
+                <Metric label="Margin" value={npr(history.margin)} tone="success" sub={`${history.margin_pct}% of sales`} />
+                <Metric label="Units sold" value={compact(history.units)} />
+              </View>
+              <View style={[styles.row, styles.gap8, { marginBottom: 8 }]}>
+                <Chip label="By month" active={historyView === 'months'} onPress={() => setHistoryView('months')} />
+                <Chip label="By product" active={historyView === 'products'} onPress={() => setHistoryView('products')} />
+                <Chip label="Periods" active={historyView === 'periods'} onPress={() => setHistoryView('periods')} />
+              </View>
+              {historyView === 'months' && (
+                <>
+                  <BarChart data={history.months.map((m) => ({ label: MONTHS[m.month - 1].slice(0, 3), value: m.revenue }))} format={compact} />
+                  {history.months.map((m) => (
+                    <View key={m.month} style={[styles.rowBetween, { paddingVertical: 5 }]}>
+                      <Text style={{ fontSize: 13, flex: 1 }}>{MONTHS[m.month - 1]}{m.last_day && m.last_day.slice(8) < '28' && m.periods === 1 ? ` (to ${m.last_day.slice(8)})` : ''}</Text>
+                      <Text style={[styles.mono, { width: 70, textAlign: 'right' }]}>{compact(m.units)} u</Text>
+                      <Text style={[styles.mono, { width: 90, textAlign: 'right' }]}>cost {compact(m.cost)}</Text>
+                      <Text style={{ fontSize: 13, fontWeight: '600', color: COLORS.primary, width: 110, textAlign: 'right' }}>{npr(m.revenue)}</Text>
+                    </View>
+                  ))}
+                </>
+              )}
+              {historyView === 'products' && history.products.map((p, index) => (
+                <View key={p.product_name} style={styles.listRow}>
+                  <View style={styles.rowBetween}>
+                    <Text style={{ fontSize: 14, fontWeight: '600', flex: 1 }} numberOfLines={1}>{index + 1}. {p.product_name}</Text>
+                    <Text style={{ fontSize: 13, fontWeight: '600', color: COLORS.primary }}>{npr(p.revenue)}</Text>
+                  </View>
+                  <Text style={styles.mono}>{p.units} units \u00b7 cost {npr(p.cost)} \u00b7 margin {npr(p.margin)} \u00b7 sells at {npr(p.sales_price)}</Text>
+                </View>
+              ))}
+              {historyView === 'periods' && history.periods.map((pd) => (
+                <View key={`${pd.period_start}-${pd.period_end}`} style={[styles.rowBetween, { paddingVertical: 5 }]}>
+                  <Text style={{ fontSize: 13, flex: 1 }}>{pd.period_start} to {pd.period_end} <Text style={styles.mono}>(sheet {pd.sheet})</Text></Text>
+                  <Text style={styles.mono}>{pd.lines} products \u00b7 {compact(pd.units)} u</Text>
+                  <Text style={{ fontSize: 13, fontWeight: '600', color: COLORS.primary, width: 110, textAlign: 'right' }}>{npr(pd.revenue)}</Text>
+                </View>
+              ))}
+            </>
+          )}
+          {isAdmin && (
+            <View style={{ marginTop: 10 }}>
+              <Button
+                title={uploading ? 'Uploading\u2026' : 'Upload consumption report (Excel)'}
+                tone="secondary"
+                onPress={() => {
+                  if (Platform.OS === 'web') fileInput.current?.click();
+                  else setMessage({ tone: 'info', text: 'Open OBS in a browser to upload a workbook.' });
+                }}
+                disabled={uploading}
+              />
+              {Platform.OS === 'web' && (
+                <input
+                  ref={fileInput}
+                  type="file"
+                  accept=".xlsx,.xlsm"
+                  style={{ display: 'none' }}
+                  onChange={(event) => { const f = event.target.files?.[0]; event.target.value = ''; uploadHistory(f); }}
+                />
+              )}
+              <Text style={[styles.mono, { marginTop: 6 }]}>
+                Layout: one sheet per month, blocks headed \u201cSales Report \u2013 Mon dd-dd, yyyy\u201d with SL.No, product, cost price, quantity, total cost, sales price. A month uploaded again replaces the earlier figures.
+              </Text>
+              {uploads.map((u) => (
+                <View key={u.id} style={[styles.rowBetween, { paddingVertical: 6 }]}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 13, fontWeight: '600' }}>{u.filename}</Text>
+                    <Text style={styles.mono}>{u.first_period} to {u.last_period} \u00b7 {u.rows} lines \u00b7 {npr(u.revenue)} \u00b7 by {u.uploaded_by} {String(u.uploaded_at).replace('T', ' ').slice(0, 16)}</Text>
+                  </View>
+                  <Button title="Remove" tone="ghost" small onPress={() => removeUpload(u)} />
+                </View>
+              ))}
+            </View>
+          )}
+        </Card>
+      )}
 
       <OptionModal
         visible={picker === 'year'}

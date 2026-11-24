@@ -968,6 +968,8 @@ def initialize_database():
         # Passenger QR menu (7.8).
         from routers.qr_menu import initialize_qr_menu
         initialize_qr_menu(connection)
+        from routers.history import initialize_sales_history
+        initialize_sales_history(connection)
 
         connection.commit()
     finally:

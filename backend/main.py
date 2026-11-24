@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from database import DB_PATH, ROLE_PERMISSIONS, initialize_database
 from routers import (
-    admin, analytics, auth, catalog, communication, flight_reports, flights, notifications,
+    admin, analytics, auth, catalog, communication, flight_reports, flights, history, notifications,
     obs, qr_menu, rates, register, reports, sales, security_admin, settings_smtp, stock_alert_settings, warehouse,
 )
 import security
@@ -104,7 +104,7 @@ initialize_database()
 
 for module in (auth, admin, flights, catalog, warehouse, obs, register, sales, rates,
                analytics, reports, flight_reports, settings_smtp, communication, stock_alert_settings,
-               notifications, security_admin, qr_menu):
+               notifications, security_admin, qr_menu, history):
     app.include_router(module.router)
 
 
