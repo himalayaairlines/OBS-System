@@ -25,7 +25,7 @@ const TABS = [
 ];
 
 export default function InventoryScreen({ user }) {
-  const canBundle = user.role === 'inventory_supervisor' || user.role === 'management';
+  const canBundle = user.permissions?.includes('bundles');
   const [tab, setTab] = useState('flights');
   const [message, setMessage] = useState(null);
 
@@ -518,7 +518,7 @@ function GroupsTab({ notify, user }) {
 
 /* ------------------------------- bundles ------------------------------- */
 function BundlesTab({ notify, user }) {
-  const canDelete = user.role === 'inventory_supervisor' || user.role === 'management';
+  const canDelete = user.permissions?.includes('bundles');
   const [products, setProducts] = useState([]);
   const [bundles, setBundles] = useState([]);
   const [form, setForm] = useState({ bundle_code: '', bundle_name: '', bundle_price: '' });
@@ -685,7 +685,7 @@ function BundlesTab({ notify, user }) {
           title="Existing bundles"
           description={canDelete
             ? 'Edit or delete any bundle. A deleted bundle stops being offered but past sales keep it.'
-            : 'Only the Inventory Supervisor can change these.'}
+            : 'Only the Inventory can change these.'}
         />
         {bundles.map((bundle) => (
           <View key={bundle.id} style={styles.listRow}>
@@ -827,7 +827,7 @@ function ProductsTab({ notify, user }) {
     <>
       <Banner
         tone="info"
-        message="Products come from the warehouse. To add one, raise an order request in Warehouse and choose “New product” — it is created once the Inventory Supervisor approves it."
+        message="Products come from the warehouse. To add one, raise an order request in Warehouse and choose “New product” — it is created once the Inventory approves it."
       />
       <Card>
         <SectionTitle
@@ -903,7 +903,7 @@ function ProductsTab({ notify, user }) {
 
 /* --------------------------- daily register ---------------------------- */
 function RegisterTab({ notify, user }) {
-  const canEdit = user.role === 'inventory_supervisor' || user.role === 'management';
+  const canEdit = user.permissions?.includes('reconcile_approve');
   const [month, setMonth] = useState(todayString().slice(0, 7));
   const [data, setData] = useState(null);
   const [calendar, setCalendar] = useState(false);

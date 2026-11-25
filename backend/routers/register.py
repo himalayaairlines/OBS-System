@@ -9,7 +9,7 @@ and each day's closing becomes the next day's opening.
 
 Received and Sales are derived from what actually happened — trolley loads out
 of main inventory and sales recorded on board — so the register cannot silently
-disagree with the rest of the system. An Inventory Supervisor can override a
+disagree with the rest of the system. An Inventory user can override a
 day's figures, but only with mandatory remarks, and the override is kept
 separately so the computed value is never lost.
 """
@@ -180,7 +180,7 @@ def obs_register_day(stock_date: str, user: dict = Depends(requires("inventory")
 
 @router.post("/obs-register/opening")
 def set_opening(data: OpeningIn, user: dict = Depends(requires("reconcile_approve"))):
-    """Seed the opening balance for a month. Inventory Supervisor / management only."""
+    """Seed the opening balance for a month. Inventory user / management only."""
     connection = get_connection()
     try:
         connection.execute(

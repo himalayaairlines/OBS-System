@@ -72,11 +72,12 @@ export const MONTHS = [
   'July', 'August', 'September', 'October', 'November', 'December',
 ];
 
+// Retired roles keep a label so old audit rows still read properly.
+export const LEGACY_ROLE_LABELS = { inventory_supervisor: 'Inventory User (old role)' };
 export const ROLE_LABELS = {
   crew: 'Crew',
   crew_supervisor: 'Crew Supervisor',
-  inventory: 'Inventory',
-  inventory_supervisor: 'Inventory Supervisor',
+  inventory: 'Inventory User',
   management: 'Management',
   finance: 'Finance',
   admin: 'Administrator',

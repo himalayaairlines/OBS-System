@@ -16,7 +16,7 @@ import {
 } from '../ui';
 
 export default function WarehouseScreen({ user }) {
-  const canApprove = ['inventory_supervisor', 'management'].includes(user.role);
+  const canApprove = user.permissions?.includes('warehouse_approve');
   const [tab, setTab] = useState('stock');
   const [dashboard, setDashboard] = useState(null);
   const [orders, setOrders] = useState([]);
@@ -188,7 +188,7 @@ export default function WarehouseScreen({ user }) {
         tone: 'success',
         text: `Order ${order.order_no} raised and sent for approval.`
           + (order.has_new_products
-            ? ' The new product(s) will be created once the Inventory Supervisor approves it.'
+            ? ' The new product(s) will be created once the Inventory approves it.'
             : ''),
       });
       setRequest({}); setRemarks(''); setNewLines([]);
@@ -424,7 +424,7 @@ export default function WarehouseScreen({ user }) {
         <Card>
           <SectionTitle
             title="Request a purchase order"
-            description="Goes to the Inventory Supervisor. Quantities are in pieces and post to stock when received."
+            description="Goes to the Inventory. Quantities are in pieces and post to stock when received."
           />
           <View style={[styles.row, styles.gap8]}>
             <Field
@@ -469,7 +469,7 @@ export default function WarehouseScreen({ user }) {
           ) : (
             <View style={{ backgroundColor: COLORS.surfaceAlt, padding: 12, borderRadius: 10 }}>
               <Text style={[styles.mono, { marginBottom: 10 }]}>
-                The product is created only once the Inventory Supervisor approves this order.
+                The product is created only once the Inventory approves this order.
               </Text>
               <View style={[styles.row, styles.gap8]}>
                 <Field

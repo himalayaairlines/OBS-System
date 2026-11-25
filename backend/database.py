@@ -14,7 +14,6 @@ DB_PATH = Path(os.getenv("OBS_DB_PATH") or BASE_DIR / "obs.db")
 ROLES = (
     "crew_supervisor",
     "inventory",
-    "inventory_supervisor",
     "management",
     "finance",
     "admin",
@@ -45,13 +44,11 @@ ROLE_PERMISSIONS = {
     "crew_supervisor": {"crew", "sync", "reconcile_submit", "flight_reports"},
     # `groups` is read-only visibility of the duty groups the crew formed.
     # Nobody on the ground builds them any more.
-    # 7.10: inventory staff read and correct the sales ledger (with remarks)
-    # and edit product prices (with remarks); every change is recorded.
-    "inventory": {"inventory", "warehouse", "groups", "sync", "alerts_handle",
-                  "sales_view", "sales_edit", "price_edit"},
-    # The inventory supervisor reconciles what the crew sold against what came
-    # back, so they read the sales ledger and may correct a mis-keyed line.
-    "inventory_supervisor": {
+    # 7.17: one inventory role. Every inventory user loads trolleys, assigns
+    # iPads, approves stock returns and warehouse orders, keeps the catalogue
+    # and combos, and corrects the sales ledger — with remarks, and every
+    # action in the audit log under their own login.
+    "inventory": {
         "inventory", "warehouse", "warehouse_approve", "bundles",
         "groups", "stock_add", "reconcile_approve", "sync",
         "sales_view", "sales_edit", "alerts_handle", "price_edit",
@@ -80,6 +77,9 @@ ROLE_PERMISSIONS = {
 # selling on any flight (no iPad assignment needed) and every approval (7.5).
 # "qr_menu": only administrators edit the passenger QR menu.
 ROLE_PERMISSIONS["admin"] = set().union(*ROLE_PERMISSIONS.values()) | {"sell_any_flight", "qr_menu"}
+# Accounts created before 7.17 are moved to "inventory" at start-up; the alias
+# keeps a token issued under the old role working until it expires.
+ROLE_PERMISSIONS["inventory_supervisor"] = ROLE_PERMISSIONS["inventory"]
 
 # --------------------------------------------------------------------------- #
 # Commission
@@ -744,7 +744,7 @@ DEMO_USERS = [
     ("CREW001", "OBS iPad 01", "1234", "crew_supervisor"),
     ("CSUP001", "OBS iPad 02", "1234", "crew_supervisor"),
     ("INV001", "Inventory Officer", "1234", "inventory"),
-    ("ISUP001", "Inventory Supervisor", "1234", "inventory_supervisor"),
+    ("ISUP001", "Inventory User 2", "1234", "inventory"),
     ("MGT001", "Management User", "1234", "management"),
     ("FIN001", "Finance Officer", "1234", "finance"),
     ("ADMIN001", "Administrator", "1234", "admin"),
@@ -970,6 +970,9 @@ def initialize_database():
         initialize_qr_menu(connection)
         from routers.history import initialize_sales_history
         initialize_sales_history(connection)
+        # 7.17: the inventory supervisor role is folded into "inventory".
+        connection.execute("UPDATE users SET role='inventory' WHERE role='inventory_supervisor'")
+        connection.commit()
 
         connection.commit()
     finally:

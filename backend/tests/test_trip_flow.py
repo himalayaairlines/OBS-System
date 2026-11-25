@@ -733,3 +733,38 @@ class SalesHistoryTests(TripFlowTests.__bases__[0]):
         self.assertEqual(len(uploads), 1)
         self.assertEqual(call("DELETE", f"/sales-history/uploads/{uploads[0]['id']}", "ADMIN001")[0], 200)
         self.assertFalse(call("GET", "/sales-history/summary?year=2025", "MGT001")[1]["available"])
+
+
+class SalesReportTests(TripFlowTests.__bases__[0]):
+    """7.17: the standard onboard sales report, on screen and as a workbook."""
+
+    tearDown = TripFlowTests.tearDown
+    make_trip = TripFlowTests.make_trip
+    open_leg = TripFlowTests.open_leg
+    sell = TripFlowTests.sell
+
+    def test_sales_report_and_workbook(self):
+        (leg,), product = self.make_trip("ONE_WAY")
+        seller = self.open_leg(leg)
+        self.sell(leg, product, seller)
+        year = int(leg["flight_date"][:4])
+        status, rep = call("GET", f"/reports/sales-report?year={year}", "MGT001")
+        self.assertEqual(status, 200, rep)
+        self.assertIn("Onboard Sales Report", rep["title"])
+        sector = [x for x in rep["sectors"] if x["id"] == leg["id"]][0]
+        self.assertEqual((sector["transactions"], sector["units"], sector["devices"]), (1, 1, "CREW001"))
+        self.assertTrue(rep["summary"]["revenue"] > 0)
+        self.assertEqual(call("GET", f"/reports/sales-report?year={year}", "CREW001")[0], 403)
+        # The workbook: six sheets, summary first.
+        import urllib.request
+        request = urllib.request.Request(f"{BASE}/reports/sales-report.xlsx?year={year}",
+                                         headers={"Authorization": f"Bearer {TOKENS['MGT001']}"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            self.assertEqual(response.status, 200)
+            body = response.read()
+            self.assertIn("H9-Onboard-Sales-Report", response.headers.get("Content-Disposition", ""))
+        from io import BytesIO
+        from openpyxl import load_workbook
+        wb = load_workbook(BytesIO(body))
+        self.assertEqual(wb.sheetnames, ["Summary", "By sector", "By route", "By product", "By iPad", "Currency & daily"])
+        self.assertIn("Onboard Sales Report", str(wb["Summary"]["A1"].value))

@@ -511,7 +511,7 @@ function DifferencesCard({ diff, canEdit, onChanged, onMessage }) {
             </View>
           ))}
           {Object.entries(diff.stock_return.device_remarks || {}).filter(([, r]) => r).map(([d, r]) => <RemarkLine key={d} label={`iPad ${d} remarks`} text={r} />)}
-          <Text style={[styles.mono, { marginTop: 4 }]}>The Inventory Supervisor corrects a return line, with remarks, from Warehouse \u2192 Stock movements.</Text>
+          <Text style={[styles.mono, { marginTop: 4 }]}>The Inventory corrects a return line, with remarks, from Warehouse \u2192 Stock movements.</Text>
         </View>
       )}
       {settled.map((c) => (

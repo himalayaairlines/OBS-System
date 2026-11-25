@@ -63,8 +63,17 @@ SHIPPED = {role: set(perms) for role, perms in database.ROLE_PERMISSIONS.items()
 
 def setUpModule():
     global _server
+    # 7.17 folded the inventory supervisor into "inventory"; these tests still
+    # need two inventory users with different rights, so ISUP001 is given the
+    # legacy role (its permission set is an alias kept for old tokens) and a
+    # distinct copy of that set to delegate to.
+    database.ROLE_PERMISSIONS["inventory_supervisor"] = set(database.ROLE_PERMISSIONS["inventory"])
     for role, extra in DELEGATED.items():
         database.ROLE_PERMISSIONS[role] |= extra
+    connection = database.get_connection()
+    connection.execute("UPDATE users SET role='inventory_supervisor', name='Inventory Supervisor' WHERE employee_id='ISUP001'")
+    connection.commit()
+    connection.close()
     config = uvicorn.Config(main.app, host="127.0.0.1", port=PORT, log_level="warning")
     _server = uvicorn.Server(config)
     threading.Thread(target=_server.run, daemon=True).start()

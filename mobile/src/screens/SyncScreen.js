@@ -23,7 +23,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
   // Inventory roles have no stake in commission; what they need from this page
   // is what the crew declared as left over.
   const isInventory = user.role === 'inventory' || user.role === 'inventory_supervisor';
-  const canApproveReturns = user.role === 'inventory_supervisor' || user.role === 'management';
+  const canApproveReturns = user.permissions?.includes('reconcile_approve');
 
   const [queue, setQueue] = useState([]);
   const [rejected, setRejected] = useState([]);
@@ -344,7 +344,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
   async function confirmReturn(trip) {
     const sure = await confirm({
       title: 'Submit the stock return?',
-      message: `The counted stock for ${trip.flight_number} goes to the Inventory Supervisor. `
+      message: `The counted stock for ${trip.flight_number} goes to the Inventory. `
         + 'Once submitted it cannot be changed here unless it is sent back for a recount.',
       confirmText: 'Confirm submit',
     });
@@ -380,9 +380,9 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
             ? `Your count is in. ${result.waiting_for.join(', ')} declares its own part when it uploads; the two counts are added together.`
             : result.has_variance
               ? `Submitted with a difference of ${result.total_variance} unit(s) against the system `
-                + 'figure. The Inventory Supervisor will review it.'
+                + 'figure. The Inventory will review it.'
               : `Submitted. ${result.total_declared} unit(s) go back to main inventory once the `
-                + 'Inventory Supervisor approves.',
+                + 'Inventory approves.',
       });
       loadPending();
 
@@ -860,7 +860,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
                   ? 'Confirmed on this iPad; it uploads with the sales on Wi-Fi. '
                   : (trip.waiting_for || []).length
                     ? 'Your count is in; the other iPad adds its part when it uploads. '
-                    : 'Submitted. The count is with the Inventory Supervisor. ')
+                    : 'Submitted. The count is with the Inventory. ')
                   + (isCrew ? 'Next: the commission and the forms on the Reports page, then \u201cFinish whole flight\u201d on the Sales page.' : '')}
               />
             ) : (
@@ -874,7 +874,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
             <Text style={[styles.mono, { marginTop: 6 }]}>
               The Expected column is what the system works out from the load and every sale on the
               trip. Type what is actually in the trolley. Anything that differs is flagged for the
-              Inventory Supervisor.
+              Inventory.
             </Text>
           </Card>
           );

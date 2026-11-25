@@ -49,7 +49,7 @@ class ReconSubmit(BaseModel):
 
     The system knows what *should* be left. What the crew type here is what is
     actually in the trolley, and the difference between the two is the variance
-    the inventory supervisor reviews.
+    the inventory user reviews.
     """
 
     flight_id: int
@@ -456,7 +456,7 @@ def submit_reconciliation(
     7.11: two iPads work the trip and each holds part of the trolley, so each
     device declares what IT can see; the trip's remaining stock is the sum of
     the devices. The return waits (status WAITING) until every assigned iPad
-    has declared, then goes to the Inventory Supervisor (PENDING). A device
+    has declared, then goes to the Inventory user (PENDING). A device
     that sends no lines at all confirms the system figure less what the other
     device declared. A supervisor or manager submitting is taken as the final
     total (device "*").
@@ -494,7 +494,7 @@ def submit_reconciliation(
             )
         is_device = user["employee_id"] in devices
         device = user["employee_id"] if is_device else "*"
-        # Once every iPad has declared it waits for the Inventory Supervisor;
+        # Once every iPad has declared it waits for the Inventory user;
         # the crew count again only if it is sent back.
         if header and header["status"] == "PENDING" \
                 and "reconcile_approve" not in permissions_for(user["role"]):

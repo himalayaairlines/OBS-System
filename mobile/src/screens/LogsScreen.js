@@ -18,7 +18,7 @@ import {
 const YEARS = Array.from({ length: 6 }, (_, i) => new Date().getFullYear() - i);
 
 export default function LogsScreen({ user }) {
-  // Management oversee everything here. The inventory supervisor reaches this
+  // Management oversee everything here. The inventory user reaches this
   // screen for the sales ledger alone, which they reconcile against what the
   // crew returned, and may correct a mis-keyed line with remarks.
   const perms = user.permissions || [];
@@ -78,7 +78,15 @@ export default function LogsScreen({ user }) {
     products: { path: '/reports/top-products.xlsx', label: 'top products' },
     logs: { path: '/reports/audit-log.xlsx', label: 'audit log' },
     sales: { path: '/reports/sales-detail.xlsx', label: 'sales' },
+    report: { path: '/reports/sales-report.xlsx', label: 'sales report' },
   };
+  // The standard onboard sales report (7.17).
+  const [report, setReport] = useState(null);
+  const [reportError, setReportError] = useState(null);
+  useEffect(() => {
+    if (tab !== 'report' || !canOversee) return;
+    api(`/reports/sales-report?${query()}`).then((r) => { setReport(r); setReportError(null); }).catch((e) => setReportError(e.message));
+  }, [tab, canOversee, query]);
 
   async function exportTab() {
     const target = EXPORTS[tab];
@@ -162,6 +170,7 @@ export default function LogsScreen({ user }) {
 
   const tabs = [
     ...(canOversee ? [
+      { key: 'report', label: 'Sales report' },
       { key: 'ranking', label: 'Crew ranking' },
       { key: 'products', label: 'Top products' },
       { key: 'logs', label: 'Audit log' },
@@ -213,6 +222,10 @@ export default function LogsScreen({ user }) {
           <Select label="Destination" valueLabel={filter.destination || 'All'} onPress={() => setPicker('destination')} style={{ flex: 1, minWidth: 110, marginBottom: 0 }} />
         </View>
       </Card>
+      )}
+
+      {tab === 'report' && (
+        <SalesReportView report={report} error={reportError} />
       )}
 
       {tab === 'ranking' && ranking && (
@@ -704,5 +717,122 @@ function CrewHistory({ member, filter, query, onBack }) {
         </>
       )}
     </ScrollView>
+  );
+}
+
+
+/* ------------------------------------------------------------------ */
+/* The standard onboard sales report, as the workbook lays it out (7.17) */
+/* ------------------------------------------------------------------ */
+function SalesReportView({ report, error }) {
+  const [section, setSection] = useState('sectors');
+  if (error) return <Card><Banner tone="danger" message={error} /></Card>;
+  if (!report) return <Card><Text style={styles.empty}>Preparing the report\u2026</Text></Card>;
+  const s = report.summary;
+  const tot = s.revenue || 1;
+  const Row = ({ cells, bold, widths }) => (
+    <View style={[styles.rowBetween, { paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: COLORS.surfaceAlt, backgroundColor: bold ? COLORS.surfaceAlt : 'transparent' }]}>
+      {cells.map((c, i) => (
+        <Text key={i} style={[i === 0 ? { flex: 2, fontSize: 13 } : [styles.mono, { flex: 1, textAlign: 'right' }], bold ? { fontWeight: '700', color: COLORS.text } : null, widths?.[i] ? { flex: widths[i] } : null]} numberOfLines={2}>{c}</Text>
+      ))}
+    </View>
+  );
+  const Head = ({ cells, widths }) => (
+    <View style={[styles.rowBetween, { paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: COLORS.border }]}>
+      {cells.map((c, i) => <Text key={i} style={[styles.mono, i === 0 ? { flex: 2 } : { flex: 1, textAlign: 'right' }, widths?.[i] ? { flex: widths[i] } : null]}>{c}</Text>)}
+    </View>
+  );
+  return (
+    <>
+      <Card>
+        <SectionTitle
+          title={report.title}
+          description={`Period: ${report.period} \u00b7 ${report.destination} \u00b7 Currency NPR \u00b7 Generated ${report.generated_at}. The Excel download has the same sections, one per sheet.`}
+        />
+        <View style={styles.wrap}>
+          <Metric label="Total onboard revenue" value={npr(s.revenue)} tone="primary" />
+          <Metric label="Passengers" value={compact(s.passengers)} />
+          <Metric label="Sectors" value={String(s.flights)} />
+          <Metric label="Transactions" value={compact(s.transactions)} />
+          <Metric label="Units" value={compact(s.units)} />
+          <Metric label="Average basket" value={npr(s.basket)} />
+          <Metric label="Revenue per passenger" value={npr(s.rpp)} tone={s.achievement >= 100 ? 'success' : 'warning'} sub={`target ${npr(s.target_rpp)} \u00b7 ${Number(s.achievement).toFixed(1)}%`} />
+          <Metric label="Shortfall / surplus vs target" value={`${s.revenue - s.revenue_at_target >= 0 ? '+' : ''}${npr(s.revenue - s.revenue_at_target)}`} tone={s.revenue - s.revenue_at_target >= 0 ? 'success' : 'danger'} />
+          <Metric label={`Commission pool (${Math.round(s.commission_rate * 100)}%)`} value={npr(s.commission_npr)} tone="success" />
+          <Metric label="Sectors at / below target" value={`${s.sectors_at_target} / ${s.sectors_below_target}`} sub={`${s.sectors_no_sales} with no sales`} />
+        </View>
+        {!!report.by_type.length && (
+          <Text style={[styles.mono, { marginTop: 8 }]}>
+            {report.by_type.map((t) => `${t.sale_type.toLowerCase()}: ${t.transactions} txn, ${t.units} units`).join(' \u00b7 ')}
+          </Text>
+        )}
+      </Card>
+
+      <View style={[styles.wrap, { marginBottom: 12 }]}>
+        {[['sectors', 'By sector'], ['routes', 'By route'], ['products', 'By product'], ['categories', 'By category'], ['devices', 'By iPad'], ['currency', 'Currency & daily']].map(([k, l]) => (
+          <Chip key={k} label={l} active={section === k} onPress={() => setSection(k)} />
+        ))}
+      </View>
+
+      {section === 'sectors' && (
+        <Card>
+          <SectionTitle title="Sector-wise sales" description="Every leg in the period with PAX, revenue and revenue per passenger against the target." />
+          <Head cells={['Date \u00b7 Flight \u00b7 Route', 'PAX', 'Txns', 'Units', 'Revenue', 'RPP', 'vs target']} widths={[2.4]} />
+          {report.sectors.map((x) => (
+            <View key={x.id}>
+              <Row widths={[2.4]} cells={[`${x.flight_date} ${x.flight_number} ${x.route}${x.trip_type === 'ROUND_TRIP' ? ` (${x.direction.toLowerCase()})` : ''}`, String(x.passengers || 0), String(x.transactions), String(x.units), compact(x.revenue), compact(x.rpp), `${x.vs_target >= 0 ? '+' : ''}${compact(x.vs_target)}`]} />
+              <Text style={[styles.mono, { marginTop: -2, marginBottom: 4 }]}>
+                {x.aircraft_type || 'aircraft n/a'} \u00b7 {x.duty_group_label || 'crew not entered'}{x.crew_count ? ` (${x.crew_count})` : ''} \u00b7 iPads {x.devices || '\u2014'}
+                {x.complementary ? ` \u00b7 ${x.complementary} complementary` : ''}{x.cancellations ? ` \u00b7 ${x.cancellations} cancelled` : ''} \u00b7 stock return {x.stock_return || 'not submitted'}
+              </Text>
+            </View>
+          ))}
+          <Row bold widths={[2.4]} cells={['Total', compact(s.passengers), String(s.transactions), String(s.units), compact(s.revenue), compact(s.rpp), `${s.gap >= 0 ? '+' : ''}${compact(s.gap)}`]} />
+          {!report.sectors.length && <Text style={styles.empty}>No sectors in this period.</Text>}
+        </Card>
+      )}
+      {section === 'routes' && (
+        <Card>
+          <SectionTitle title="Route performance" />
+          <Head cells={['Route', 'Sectors', 'PAX', 'Revenue', 'RPP', 'Share']} />
+          {report.routes.map((x) => <Row key={x.route} cells={[x.route, String(x.flights), compact(x.passengers), compact(x.revenue), compact(x.rpp), `${(x.revenue / tot * 100).toFixed(1)}%`]} />)}
+          <Row bold cells={['Total', String(s.flights), compact(s.passengers), compact(s.revenue), compact(s.rpp), '100%']} />
+        </Card>
+      )}
+      {section === 'products' && (
+        <Card>
+          <SectionTitle title="Product performance" description="Best seller first, with gross margin." />
+          <Head cells={['Product', 'Units', 'Revenue', 'Margin', 'Share']} widths={[2.4]} />
+          {report.products.filter((p) => p.revenue > 0 || p.units > 0).map((p, i) => (
+            <Row key={p.product_id} widths={[2.4]} cells={[`${i + 1}. ${p.product_name}`, String(p.units), compact(p.revenue), compact(p.margin), `${(p.revenue / tot * 100).toFixed(1)}%`]} />
+          ))}
+        </Card>
+      )}
+      {section === 'categories' && (
+        <Card>
+          <SectionTitle title="Revenue by category" />
+          <Head cells={['Category', 'Units', 'Revenue', 'Margin']} />
+          {report.categories.map((c) => <Row key={c.category} cells={[c.category, String(c.units), compact(c.revenue), compact(c.margin)]} />)}
+          <Row bold cells={['Total', String(report.categories.reduce((a, c) => a + c.units, 0)), compact(report.categories.reduce((a, c) => a + c.revenue, 0)), compact(report.categories.reduce((a, c) => a + c.margin, 0))]} />
+        </Card>
+      )}
+      {section === 'devices' && (
+        <Card>
+          <SectionTitle title="Sales recorded per OBS iPad login" />
+          <Head cells={['iPad login', 'Sectors', 'Txns', 'Units', 'Revenue', 'Share']} />
+          {report.devices.map((d) => <Row key={d.device} cells={[d.device, String(d.sectors), String(d.transactions), String(d.units), compact(d.revenue), `${(d.revenue / tot * 100).toFixed(1)}%`]} />)}
+          {!report.devices.length && <Text style={styles.empty}>No sales in this period.</Text>}
+        </Card>
+      )}
+      {section === 'currency' && (
+        <Card>
+          <SectionTitle title="Payment currency mix" description="Converted to NPR at the rate in force when each sale was made." />
+          <Head cells={['Currency', 'Lines', 'Revenue in NPR']} />
+          {report.currencies.map((c) => <Row key={c.currency} cells={[c.currency, String(c.lines), compact(c.revenue)]} />)}
+          <SectionTitle title="Daily revenue" />
+          <BarChart data={report.daily.map((d) => ({ label: d.day, value: d.revenue }))} format={compact} />
+        </Card>
+      )}
+    </>
   );
 }
