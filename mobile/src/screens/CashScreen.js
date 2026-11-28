@@ -31,8 +31,8 @@ import {
 
 const DENOMINATIONS = [1000, 500, 100, 50, 20, 10, 5];
 const SECTION_TITLES = {
-  float_open: 'Opening floating cash',
-  float_close: 'Closing floating cash',
+  float_open: 'Opening balance',
+  float_close: 'Closing balance',
   collection: 'Cash sales collection',
 };
 const STATUS_TONE = { NONE: 'muted', OPEN: 'warning', APPROVED: 'success' };
@@ -256,8 +256,7 @@ function CashSheet({ flightId, user, online, onBack, onAlertsChanged }) {
         win.document.open();
         win.document.write(html);
         win.document.close();
-        win.focus();
-        setTimeout(() => win.print(), 300);
+        win.focus();   // the sheet opens its own print dialog when it has loaded
       } else {
         const html = await apiText(`/cash/flights/${flightId}/print`);
         const uri = `${FileSystem.cacheDirectory}cash-sheet-${flightId}-${Date.now()}.html`;
@@ -332,22 +331,56 @@ function CashSheet({ flightId, user, online, onBack, onAlertsChanged }) {
         </Card>
       ))}
 
-      {blocks.map((block, index) => (
-        <CrewBlock key={block.id} index={index + 1} block={block} busy={busy} isAdmin={data.is_admin}
-          allUploaded={data.all_uploaded} onSave={saveBlock} />
-      ))}
-      {!blocks.length && (
-        <Card><Text style={styles.empty}>No crew is assigned to this sector yet. Inventory assigns the crew first.</Text></Card>
-      )}
+      {/* Same order as the paper form: floating cash of every crew side by
+          side, then each crew's cash sales collection, then the grand total. */}
+      <Card>
+        <Text style={paper.heading}>FLOATING CASH BALANCE (NPR)</Text>
+        <Text style={[styles.mono, { marginBottom: 8 }]}>
+          The opening balance is saved before the flight and the closing balance after it, each on its own.
+          Once saved it cannot be changed (only the administrator can correct it, with remarks).
+        </Text>
+        <View style={paper.wrapRow}>
+          {blocks.map((block, index) => (
+            <View key={block.id} style={paper.crewFloat}>
+              <Text style={paper.crewTitle}>Crew {index + 1}</Text>
+              <View style={paper.wrapRow}>
+                <DenoSection block={block} section="float_open" values={block.float_open} busy={busy} isAdmin={data.is_admin} onSave={saveBlock} />
+                <DenoSection block={block} section="float_close" values={block.float_close} busy={busy} isAdmin={data.is_admin} onSave={saveBlock} />
+              </View>
+              <Text style={paper.name}>Name/Staff No. {block.crew_name} ({block.staff_no || block.crew_account})</Text>
+            </View>
+          ))}
+        </View>
+        {!blocks.length && <Text style={styles.empty}>No crew is assigned to this sector yet. Inventory assigns the crew first.</Text>}
+      </Card>
 
       <Card>
-        <SectionTitle title="Grand total" />
-        <TotalRow label="Opening floating cash" value={data.totals.float_open} />
-        <TotalRow label="Closing floating cash" value={data.totals.float_close} />
-        <TotalRow label="Total cash collected (NPR)" value={data.totals.collected} strong />
-        <TotalRow label="Crew commission" value={data.totals.commission} />
-        <TotalRow label="Net cash" value={data.totals.net_cash} strong />
-        <TotalRow label="Sales recorded by the phones (NPR value)" value={data.totals.system_npr_value} />
+        <Text style={paper.heading}>CASH SALES COLLECTION</Text>
+        {blocks.map((block, index) => (
+          <View key={block.id} style={[paper.crewCollect, index ? paper.divider : null]}>
+            <Text style={paper.crewTitle}>Crew {index + 1}</Text>
+            <CollectionSection block={block} busy={busy} isAdmin={data.is_admin} allUploaded={data.all_uploaded} onSave={saveBlock} />
+            <Text style={paper.name}>Name/Staff No. {block.crew_name} ({block.staff_no || block.crew_account})</Text>
+            {!!block.system?.transactions && (
+              <Text style={styles.mono}>Phones recorded {block.system.transactions} sale(s) worth {npr(block.system.npr_value)} under this login.</Text>
+            )}
+            {(block.differences || []).map((d) => (
+              <Banner key={d.currency} tone="danger"
+                message={`${d.currency}: entered ${money(d.entered)}, phones recorded ${money(d.system)} (difference ${d.difference > 0 ? '+' : ''}${money(d.difference)}).`} />
+            ))}
+            {!!block.remarks && <RemarkLine label="Remarks" text={block.remarks} style={{ marginTop: 6 }} />}
+          </View>
+        ))}
+      </Card>
+
+      <Card>
+        <Text style={paper.heading}>Grand Total ({blocks.map((_, i) => `Crew ${i + 1}`).join(' + ') || 'all crew'})</Text>
+        <TotalRow label="Total Cash Collected (NPR)" value={data.totals.collected} strong />
+        <TotalRow label={`Crew Commission (${(data.commission_rate * 100).toFixed(0)}%)`} value={data.totals.commission} />
+        <TotalRow label="Net Cash" value={data.totals.net_cash} strong />
+        <Text style={[styles.mono, { marginTop: 6 }]}>
+          Floating cash: opening {money(data.totals.float_open)} · closing {money(data.totals.float_close)} · sales recorded by the phones {money(data.totals.system_npr_value)}
+        </Text>
       </Card>
 
       {data.may_approve && (
@@ -392,79 +425,72 @@ function TotalRow({ label, value, strong }) {
   );
 }
 
-/* ------------------------------------------------------------------ */
-/* One crew member's block                                             */
-/* ------------------------------------------------------------------ */
-function CrewBlock({ index, block, busy, isAdmin, allUploaded, onSave }) {
-  return (
-    <Card>
-      <SectionTitle
-        title={`Crew ${index}: ${block.crew_name}`}
-        description={`Staff No. ${block.staff_no || block.crew_account}${block.isNew ? ' · nothing entered yet' : ''}`}
-      />
-      <DenoSection block={block} section="float_open" values={block.float_open} busy={busy} isAdmin={isAdmin} onSave={onSave} />
-      <DenoSection block={block} section="float_close" values={block.float_close} busy={busy} isAdmin={isAdmin} onSave={onSave} />
-      <CollectionSection block={block} busy={busy} isAdmin={isAdmin} allUploaded={allUploaded} onSave={onSave} />
-
-      <View style={{ marginTop: 8, borderTopWidth: 1, borderTopColor: COLORS.border, paddingTop: 8 }}>
-        <TotalRow label="Total cash collected (NPR)" value={block.total_collected} strong />
-        <TotalRow label="Crew commission" value={block.commission} />
-        <TotalRow label="Net cash" value={block.net_cash} strong />
-        {!!block.system?.transactions && (
-          <Text style={styles.mono}>Phones recorded {block.system.transactions} sale(s) worth {npr(block.system.npr_value)} under this login.</Text>
-        )}
-      </View>
-      {!!block.differences?.length && (
-        <View style={{ marginTop: 6 }}>
-          {block.differences.map((d) => (
-            <Banner key={d.currency} tone="danger"
-              message={`${d.currency}: entered ${money(d.entered)}, phones recorded ${money(d.system)} (difference ${d.difference > 0 ? '+' : ''}${money(d.difference)}).`} />
-          ))}
-        </View>
-      )}
-      {!!block.remarks && <RemarkLine label="Remarks" text={block.remarks} style={{ marginTop: 6 }} />}
-    </Card>
-  );
-}
-
 function SavedLine({ by, at }) {
   if (!at) return null;
   return <Text style={styles.mono}>Saved by {by} · {when(at)}</Text>;
 }
 
-function DenoGrid({ values, onChange, editable }) {
+/* Paper-form tables: bordered cells, the same columns as the printed sheet. */
+const paper = {
+  heading: { fontSize: 16, fontWeight: '800', color: COLORS.text, marginBottom: 4, letterSpacing: 0.3 },
+  crewTitle: { fontSize: 14, fontWeight: '700', color: COLORS.text, marginBottom: 4 },
+  name: { fontSize: 13, color: COLORS.text, marginTop: 4 },
+  wrapRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 12, alignItems: 'flex-start' },
+  crewFloat: { flexGrow: 1, flexBasis: 420, minWidth: 280, marginBottom: 10 },
+  crewCollect: { marginBottom: 10, paddingTop: 6 },
+  divider: { borderTopWidth: 1, borderTopColor: COLORS.border, marginTop: 6 },
+  table: { borderWidth: 1, borderColor: '#555', alignSelf: 'stretch' },
+  tr: { flexDirection: 'row', borderBottomWidth: 1, borderBottomColor: '#999', minHeight: 30, alignItems: 'stretch' },
+  th: { fontSize: 12, fontWeight: '700', color: COLORS.text, paddingHorizontal: 4, paddingVertical: 5 },
+  td: { fontSize: 13, color: COLORS.text, paddingHorizontal: 4, paddingVertical: 5 },
+  cell: { borderRightWidth: 1, borderRightColor: '#999', justifyContent: 'center' },
+  head: { backgroundColor: '#EEF1F5' },
+  input: { borderWidth: 1, borderColor: COLORS.border, borderRadius: 4, paddingVertical: 3, paddingHorizontal: 4, fontSize: 13, margin: 2, color: COLORS.text, backgroundColor: '#FFFFFF' },
+};
+
+function Cell({ flex = 1, last, children, align = 'left' }) {
   return (
-    <View>
-      <View style={[styles.row, { paddingVertical: 2 }]}>
-        <Text style={[styles.mono, { flex: 1 }]}>Note</Text>
-        <Text style={[styles.mono, { flex: 1, textAlign: 'center' }]}>Qty</Text>
-        <Text style={[styles.mono, { flex: 1.4, textAlign: 'right' }]}>Amount</Text>
+    <View style={[paper.cell, { flex, alignItems: align === 'right' ? 'flex-end' : align === 'center' ? 'center' : 'flex-start' }, last ? { borderRightWidth: 0 } : null]}>
+      {children}
+    </View>
+  );
+}
+
+function DenoGrid({ values, onChange, editable, label = 'Deno' }) {
+  return (
+    <View style={paper.table}>
+      <View style={[paper.tr, paper.head]}>
+        <Cell><Text style={paper.th}>{label}</Text></Cell>
+        <Cell align="center"><Text style={paper.th}>Qty</Text></Cell>
+        <Cell flex={1.4} last align="right"><Text style={paper.th}>Amount</Text></Cell>
       </View>
       {DENOMINATIONS.map((d) => {
         const qty = values[d] ?? values[String(d)] ?? '';
         return (
-          <View key={d} style={[styles.row, { alignItems: 'center', paddingVertical: 2 }]}>
-            <Text style={{ flex: 1, fontSize: 14, color: COLORS.text }}>{d}</Text>
-            {editable ? (
-              <TextInput
-                value={String(qty)}
-                onChangeText={(v) => onChange({ ...values, [d]: v.replace(/[^0-9]/g, '').slice(0, 6) })}
-                keyboardType="number-pad"
-                accessibilityLabel={`Number of ${d} notes`}
-                style={[styles.input, { flex: 1, textAlign: 'center', paddingVertical: 4, marginHorizontal: 4 }]}
-              />
-            ) : (
-              <Text style={{ flex: 1, textAlign: 'center', fontSize: 14, color: COLORS.text }}>{qty || '–'}</Text>
-            )}
-            <Text style={{ flex: 1.4, textAlign: 'right', fontSize: 14, color: COLORS.text }}>
-              {qty ? money(d * (parseInt(qty, 10) || 0)) : ''}
-            </Text>
+          <View key={d} style={paper.tr}>
+            <Cell><Text style={paper.td}>{d}</Text></Cell>
+            <Cell align="center">
+              {editable ? (
+                <TextInput
+                  value={String(qty)}
+                  onChangeText={(v) => onChange({ ...values, [d]: v.replace(/[^0-9]/g, '').slice(0, 6) })}
+                  keyboardType="number-pad"
+                  accessibilityLabel={`Number of ${d} notes`}
+                  style={[paper.input, { alignSelf: 'stretch', textAlign: 'center' }]}
+                />
+              ) : (
+                <Text style={paper.td}>{qty || ''}</Text>
+              )}
+            </Cell>
+            <Cell flex={1.4} last align="right">
+              <Text style={paper.td}>{qty ? money(d * (parseInt(qty, 10) || 0)) : ''}</Text>
+            </Cell>
           </View>
         );
       })}
-      <View style={[styles.rowBetween, { paddingTop: 4 }]}>
-        <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text }}>Total</Text>
-        <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text }}>{money(denoTotal(values))}</Text>
+      <View style={[paper.tr, { borderBottomWidth: 0 }]}>
+        <Cell flex={2}><Text style={[paper.td, { fontWeight: '700', alignSelf: 'flex-end' }]}>Total</Text></Cell>
+        <Cell flex={1.4} last align="right"><Text style={[paper.td, { fontWeight: '700' }]}>{money(denoTotal(values))}</Text></Cell>
       </View>
     </View>
   );
@@ -479,7 +505,8 @@ const asCounts = (values) => {
   return out;
 };
 
-/** Editing a saved part: administrator only, with remarks. */
+/** A part is entered once. After saving it is closed; only the
+ *  administrator can correct it, with remarks. */
 function useSectionEdit(block, section, isAdmin) {
   const saved = !!block.saved?.[section];
   const editable = !!block.editable?.[section];
@@ -489,18 +516,37 @@ function useSectionEdit(block, section, isAdmin) {
   return { saved, editable, editing, setEditing, remarks, setRemarks, correcting: saved && isAdmin };
 }
 
+function SectionFooter({ edit, busy, onSave, onCancel, saveTitle = 'Save' }) {
+  if (edit.editing) {
+    return (
+      <View style={{ marginTop: 6 }}>
+        {edit.correcting && <Field label="Remarks (mandatory)" value={edit.remarks} onChangeText={edit.setRemarks} multiline />}
+        <View style={[styles.row, styles.gap8]}>
+          {edit.saved && <Button title="Cancel" tone="ghost" small onPress={onCancel} />}
+          <Button title={busy ? 'Saving…' : saveTitle} small onPress={onSave} disabled={busy} />
+        </View>
+      </View>
+    );
+  }
+  if (edit.saved && edit.correcting && edit.editable) {
+    return <Button title="Correct (admin)" tone="ghost" small onPress={() => edit.setEditing(true)} style={{ alignSelf: 'flex-start', marginTop: 4 }} />;
+  }
+  return null;
+}
+
 function DenoSection({ block, section, values, busy, isAdmin, onSave }) {
   const edit = useSectionEdit(block, section, isAdmin);
   const [draft, setDraft] = useState(values || {});
   useEffect(() => { setDraft(values || {}); }, [values]);
+  const title = section === 'float_open' ? 'Opening Balance' : 'Closing Balance';
 
   async function save() {
     if (edit.correcting && !edit.remarks.trim()) {
       return notify({ title: 'Remarks required', message: 'Say why the saved figures are being changed.' });
     }
     const sure = await confirm({
-      title: `Save the ${SECTION_TITLES[section].toLowerCase()}?`,
-      message: `${block.crew_name}: ${npr(denoTotal(draft))}.${edit.correcting ? '' : ' After saving only the administrator can change it.'}`,
+      title: `Save the ${title.toLowerCase()}?`,
+      message: `${block.crew_name}: ${npr(denoTotal(draft))}.${edit.correcting ? '' : ' Once saved it cannot be changed.'}`,
       confirmText: 'Save',
     });
     if (!sure) return;
@@ -508,55 +554,63 @@ function DenoSection({ block, section, values, busy, isAdmin, onSave }) {
   }
 
   return (
-    <View style={{ marginBottom: 10 }}>
-      <View style={styles.rowBetween}>
-        <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text }}>{SECTION_TITLES[section]}</Text>
-        {edit.saved ? <Pill label="SAVED" tone="success" /> : <Pill label="NOT SAVED" tone="muted" />}
+    <View style={{ flexGrow: 1, flexBasis: 200, minWidth: 190 }}>
+      <View style={[styles.rowBetween, { marginBottom: 2 }]}>
+        <Text style={{ fontSize: 13, fontWeight: '700', color: COLORS.text }}>{title}</Text>
+        {edit.saved ? <Pill label="SAVED" tone="success" /> : null}
       </View>
-      <SavedLine by={block[`${section}_by`]} at={block[`${section}_at`]} />
       <DenoGrid values={draft} onChange={setDraft} editable={edit.editing} />
-      {edit.editing ? (
-        <>
-          {edit.correcting && <Field label="Remarks (mandatory)" value={edit.remarks} onChangeText={edit.setRemarks} multiline />}
-          <View style={[styles.row, styles.gap8, { marginTop: 4 }]}>
-            {edit.saved && <Button title="Cancel" tone="ghost" small onPress={() => { setDraft(values || {}); edit.setEditing(false); }} />}
-            <Button title={busy ? 'Saving…' : 'Save'} small onPress={save} disabled={busy} />
-          </View>
-        </>
-      ) : (edit.saved && isAdmin && edit.editable) ? (
-        <Button title="Correct (admin)" tone="ghost" small onPress={() => edit.setEditing(true)} style={{ alignSelf: 'flex-start' }} />
-      ) : null}
+      <SavedLine by={block[`${section}_by`]} at={block[`${section}_at`]} />
+      <SectionFooter edit={edit} busy={busy} onSave={save} saveTitle={`Save ${title.toLowerCase()}`}
+        onCancel={() => { setDraft(values || {}); edit.setEditing(false); }} />
     </View>
   );
 }
 
+const fcyNprOf = (x) => (Number(x.amount) || 0) * (Number(x.rate) || 0);
+const BLANK_LINE = { currency: '', deno: '', qty: '', amount: '', rate: '' };
+
 function CollectionSection({ block, busy, isAdmin, allUploaded, onSave }) {
   const edit = useSectionEdit(block, 'collection', isAdmin);
   const suggestion = block.system_suggestion || { fcy: [], npr_total: 0 };
-  const initialFcy = () => (block.saved?.collection ? block.fcy_collect : suggestion.fcy)
-    .map((x) => ({ currency: x.currency, amount: String(x.amount ?? ''), rate: String(x.rate ?? '') }));
+  const initialFcy = () => {
+    const lines = (block.saved?.collection ? block.fcy_collect : suggestion.fcy).map((x) => ({
+      currency: x.currency, deno: x.deno ? String(x.deno) : '', qty: x.qty ? String(x.qty) : '',
+      amount: String(x.amount ?? ''), rate: String(x.rate ?? ''),
+    }));
+    // Room to write in, as on the paper form.
+    return block.saved?.collection ? lines : [...lines, { ...BLANK_LINE }];
+  };
   const [notes, setNotes] = useState(block.npr_collect || {});
   const [fcy, setFcy] = useState(initialFcy);
   useEffect(() => { setNotes(block.npr_collect || {}); setFcy(initialFcy()); }, [block]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const fcyNpr = fcy.reduce((s, x) => s + (Number(x.amount) || 0) * (Number(x.rate) || 0), 0);
+  const used = fcy.filter((x) => x.currency || x.amount || x.qty);
+  const fcyNpr = used.reduce((s, x) => s + fcyNprOf(x), 0);
   const nprTotal = denoTotal(notes);
-  const prefilled = !block.saved?.collection && !!suggestion.fcy.length;
+  const collected = nprTotal + fcyNpr;
+  const commission = Number(block.commission || 0);
   const changedFromSystem = !block.saved?.collection && allUploaded
     && (Math.abs(nprTotal - (suggestion.npr_total || 0)) > 0.5
       || suggestion.fcy.some((s) => {
-        const line = fcy.find((x) => x.currency === s.currency);
+        const line = used.find((x) => x.currency === s.currency);
         return !line || Math.abs((Number(line.amount) || 0) - s.amount) > 0.5;
       }));
 
   function setLine(i, key, value) {
-    setFcy((lines) => lines.map((l, j) => (j === i ? {
-      ...l, [key]: key === 'currency' ? value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3) : value.replace(/[^0-9.]/g, ''),
-    } : l)));
+    setFcy((lines) => lines.map((l, j) => {
+      if (j !== i) return l;
+      const next = { ...l, [key]: key === 'currency' ? value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3) : value.replace(/[^0-9.]/g, '') };
+      // Deno × Qty fills the amount, as on the paper form.
+      if ((key === 'deno' || key === 'qty') && Number(next.deno) > 0 && Number(next.qty) > 0) {
+        next.amount = String(Math.round(Number(next.deno) * Number(next.qty) * 100) / 100);
+      }
+      return next;
+    }));
   }
 
   async function save() {
-    const bad = fcy.find((x) => (x.currency || x.amount) && (x.currency.length !== 3 || x.currency === 'NPR' || !(Number(x.rate) > 0)));
+    const bad = used.find((x) => x.currency.length !== 3 || x.currency === 'NPR' || !(Number(x.rate) > 0) || !(Number(x.amount) > 0));
     if (bad) return notify({ title: 'Check the currency lines', message: 'Each line needs a 3-letter foreign currency, an amount and an exchange rate above 0.' });
     const needRemarks = edit.correcting || changedFromSystem;
     if (needRemarks && !edit.remarks.trim()) {
@@ -566,91 +620,108 @@ function CollectionSection({ block, busy, isAdmin, allUploaded, onSave }) {
     }
     const sure = await confirm({
       title: 'Save the cash sales collection?',
-      message: `${block.crew_name}: NPR notes ${money(nprTotal)} + foreign currency ${money(fcyNpr)} = ${npr(nprTotal + fcyNpr)}.`
-        + (edit.correcting ? '' : ' After saving only the administrator can change it.'),
+      message: `${block.crew_name}: NPR ${money(nprTotal)} + FCY ${money(fcyNpr)} = ${npr(collected)}.`
+        + (edit.correcting ? '' : ' Once saved it cannot be changed.'),
       confirmText: 'Save',
     });
     if (!sure) return;
-    const lines = fcy.filter((x) => Number(x.amount) > 0).map((x) => ({ currency: x.currency, amount: Number(x.amount), rate: Number(x.rate) }));
+    const lines = used.map((x) => ({
+      currency: x.currency, amount: Number(x.amount), rate: Number(x.rate),
+      deno: Number(x.deno) > 0 ? Number(x.deno) : null, qty: Number(x.qty) > 0 ? parseInt(x.qty, 10) : null,
+    }));
     if (await onSave(block, 'collection', asCounts(notes), lines, edit.remarks.trim())) edit.setEditing(false);
   }
 
+  const shownLines = edit.editing ? fcy : used;
+  const input = (i, key, extra) => (
+    <TextInput value={fcy[i][key]} onChangeText={(v) => setLine(i, key, v)}
+      keyboardType={key === 'currency' ? 'default' : 'decimal-pad'} autoCapitalize={key === 'currency' ? 'characters' : 'none'}
+      accessibilityLabel={key} style={[paper.input, { alignSelf: 'stretch' }, extra]} />
+  );
+
   return (
-    <View style={{ marginBottom: 6 }}>
-      <View style={styles.rowBetween}>
-        <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text }}>{SECTION_TITLES.collection}</Text>
-        {edit.saved ? <Pill label="SAVED" tone="success" /> : <Pill label="NOT SAVED" tone="muted" />}
-      </View>
-      <SavedLine by={block.collection_by} at={block.collection_at} />
+    <View>
+      {edit.saved ? <Pill label="SAVED" tone="success" /> : null}
       {edit.editing && !edit.saved && (
-        <Text style={styles.mono}>
+        <Text style={[styles.mono, { marginBottom: 4 }]}>
           Phones recorded: NPR {money(suggestion.npr_total)}
-          {suggestion.fcy.map((s) => ` · ${s.currency} ${money(s.amount)}`).join('')}
-          {prefilled ? ' (foreign currency filled in from the sales; change it if the cash differs)' : ''}
+          {suggestion.fcy.map((x) => ` · ${x.currency} ${money(x.amount)}`).join('')}
+          {suggestion.fcy.length ? ' — foreign currency is filled in from the sales; change it if the cash differs.' : ''}
         </Text>
       )}
-      <Text style={[styles.mono, { marginTop: 4 }]}>NPR notes</Text>
-      <DenoGrid values={notes} onChange={setNotes} editable={edit.editing} />
-
-      <Text style={[styles.mono, { marginTop: 8 }]}>Foreign currency (FCY)</Text>
-      <View style={[styles.row, { paddingVertical: 2 }]}>
-        <Text style={[styles.mono, { flex: 1 }]}>Currency</Text>
-        <Text style={[styles.mono, { flex: 1.2, textAlign: 'right' }]}>Amount</Text>
-        <Text style={[styles.mono, { flex: 1.2, textAlign: 'right' }]}>Rate</Text>
-        <Text style={[styles.mono, { flex: 1.4, textAlign: 'right' }]}>NPR</Text>
-      </View>
-      {fcy.map((line, i) => (
-        <View key={i} style={[styles.row, { alignItems: 'center', paddingVertical: 2 }]}>
-          {edit.editing ? (
-            <>
-              <TextInput value={line.currency} onChangeText={(v) => setLine(i, 'currency', v)} autoCapitalize="characters"
-                accessibilityLabel="Currency" style={[styles.input, { flex: 1, paddingVertical: 4, marginRight: 4 }]} />
-              <TextInput value={line.amount} onChangeText={(v) => setLine(i, 'amount', v)} keyboardType="decimal-pad"
-                accessibilityLabel="Amount" style={[styles.input, { flex: 1.2, textAlign: 'right', paddingVertical: 4, marginRight: 4 }]} />
-              <TextInput value={line.rate} onChangeText={(v) => setLine(i, 'rate', v)} keyboardType="decimal-pad"
-                accessibilityLabel="Exchange rate" style={[styles.input, { flex: 1.2, textAlign: 'right', paddingVertical: 4 }]} />
-            </>
-          ) : (
-            <>
-              <Text style={{ flex: 1, fontSize: 14, color: COLORS.text }}>{line.currency}</Text>
-              <Text style={{ flex: 1.2, textAlign: 'right', fontSize: 14, color: COLORS.text }}>{money(line.amount)}</Text>
-              <Text style={{ flex: 1.2, textAlign: 'right', fontSize: 14, color: COLORS.text }}>{line.rate}</Text>
-            </>
-          )}
-          <Text style={{ flex: 1.4, textAlign: 'right', fontSize: 14, color: COLORS.text }}>
-            {money((Number(line.amount) || 0) * (Number(line.rate) || 0))}
-          </Text>
-          {edit.editing && (
-            <Pressable onPress={() => setFcy((lines) => lines.filter((_, j) => j !== i))} accessibilityLabel="Remove line" hitSlop={6}>
-              <Text style={{ color: COLORS.danger, marginLeft: 6, fontSize: 16 }}>×</Text>
-            </Pressable>
-          )}
+      <View style={paper.wrapRow}>
+        <View style={{ flexGrow: 1, flexBasis: 220, minWidth: 200, maxWidth: 360 }}>
+          <Text style={{ fontSize: 13, fontWeight: '700', color: COLORS.text, marginBottom: 2 }}>Currency: NPR</Text>
+          <DenoGrid values={notes} onChange={setNotes} editable={edit.editing} />
         </View>
-      ))}
-      {!fcy.length && <Text style={styles.mono}>No foreign currency.</Text>}
-      {edit.editing && (
-        <Button title="Add currency line" tone="ghost" small style={{ alignSelf: 'flex-start' }}
-          onPress={() => setFcy((lines) => [...lines, { currency: '', amount: '', rate: '' }])} />
-      )}
-      <View style={[styles.rowBetween, { paddingTop: 4 }]}>
-        <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text }}>FCY total (NPR)</Text>
-        <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text }}>{money(fcyNpr)}</Text>
-      </View>
 
-      {edit.editing ? (
-        <>
-          {(edit.correcting || changedFromSystem) && (
-            <Field label="Remarks (mandatory)" value={edit.remarks} onChangeText={edit.setRemarks} multiline
-              placeholder={edit.correcting ? 'Why is this being changed?' : 'Why does the cash differ from the sales?'} />
-          )}
-          <View style={[styles.row, styles.gap8, { marginTop: 4 }]}>
-            {edit.saved && <Button title="Cancel" tone="ghost" small onPress={() => { setNotes(block.npr_collect || {}); setFcy(initialFcy()); edit.setEditing(false); }} />}
-            <Button title={busy ? 'Saving…' : 'Save collection'} small onPress={save} disabled={busy} />
+        <View style={{ flexGrow: 2, flexBasis: 420, minWidth: 300 }}>
+          <Text style={{ fontSize: 13, fontWeight: '700', color: COLORS.text, marginBottom: 2 }}>Currency (FCY)</Text>
+          <View style={paper.table}>
+            <View style={[paper.tr, paper.head]}>
+              <Cell><Text style={paper.th}>Currency</Text></Cell>
+              <Cell><Text style={paper.th}>Deno</Text></Cell>
+              <Cell flex={0.8}><Text style={paper.th}>Qty</Text></Cell>
+              <Cell flex={1.1} align="right"><Text style={paper.th}>Amount</Text></Cell>
+              <Cell flex={1.1} align="right"><Text style={paper.th}>Exchange Rate</Text></Cell>
+              <Cell flex={1.3} last={!edit.editing} align="right"><Text style={paper.th}>NPR Currency</Text></Cell>
+              {edit.editing && <Cell flex={0.35} last><Text style={paper.th}> </Text></Cell>}
+            </View>
+            {shownLines.map((line, i) => (
+              <View key={i} style={paper.tr}>
+                {edit.editing ? (
+                  <>
+                    <Cell>{input(i, 'currency')}</Cell>
+                    <Cell>{input(i, 'deno')}</Cell>
+                    <Cell flex={0.8}>{input(i, 'qty')}</Cell>
+                    <Cell flex={1.1}>{input(i, 'amount', { textAlign: 'right' })}</Cell>
+                    <Cell flex={1.1}>{input(i, 'rate', { textAlign: 'right' })}</Cell>
+                  </>
+                ) : (
+                  <>
+                    <Cell><Text style={paper.td}>{line.currency}</Text></Cell>
+                    <Cell><Text style={paper.td}>{line.deno}</Text></Cell>
+                    <Cell flex={0.8}><Text style={paper.td}>{line.qty}</Text></Cell>
+                    <Cell flex={1.1} align="right"><Text style={paper.td}>{money(line.amount)}</Text></Cell>
+                    <Cell flex={1.1} align="right"><Text style={paper.td}>{line.rate}</Text></Cell>
+                  </>
+                )}
+                <Cell flex={1.3} last={!edit.editing} align="right"><Text style={paper.td}>{(line.amount || line.rate) ? money(fcyNprOf(line)) : ''}</Text></Cell>
+                {edit.editing && (
+                  <Cell flex={0.35} last align="center">
+                    <Pressable onPress={() => setFcy((lines) => lines.filter((_, j) => j !== i))} accessibilityLabel="Remove line" hitSlop={6}>
+                      <Text style={{ color: COLORS.danger, fontSize: 16 }}>×</Text>
+                    </Pressable>
+                  </Cell>
+                )}
+              </View>
+            ))}
+            {!shownLines.length && (
+              <View style={paper.tr}><Cell last><Text style={[paper.td, { color: COLORS.muted }]}>No foreign currency</Text></Cell></View>
+            )}
+            <View style={[paper.tr, { borderBottomWidth: 0 }]}>
+              <Cell flex={5}><Text style={[paper.td, { fontWeight: '700', alignSelf: 'flex-end' }]}>Total</Text></Cell>
+              <Cell flex={1.3 + (edit.editing ? 0.35 : 0)} last align="right"><Text style={[paper.td, { fontWeight: '700' }]}>{money(fcyNpr)}</Text></Cell>
+            </View>
           </View>
-        </>
-      ) : (edit.saved && isAdmin && edit.editable) ? (
-        <Button title="Correct (admin)" tone="ghost" small onPress={() => edit.setEditing(true)} style={{ alignSelf: 'flex-start' }} />
-      ) : null}
+          {edit.editing && (
+            <Button title="+ Add currency line" tone="ghost" small style={{ alignSelf: 'flex-start' }}
+              onPress={() => setFcy((lines) => [...lines, { ...BLANK_LINE }])} />
+          )}
+
+          <View style={{ marginTop: 8, alignSelf: 'flex-end', minWidth: 260 }}>
+            <TotalRow label="Total Cash Collected (NPR)" value={collected} strong />
+            <TotalRow label="Crew Commission (10%)" value={commission} />
+            <TotalRow label="Net Cash" value={collected - commission} strong />
+          </View>
+        </View>
+      </View>
+      <SavedLine by={block.collection_by} at={block.collection_at} />
+      {edit.editing && changedFromSystem && !edit.correcting && (
+        <Field label="Remarks (mandatory: the cash differs from the sales)" value={edit.remarks} onChangeText={edit.setRemarks} multiline />
+      )}
+      <SectionFooter edit={edit} busy={busy} onSave={save} saveTitle="Save cash sales collection"
+        onCancel={() => { setNotes(block.npr_collect || {}); setFcy(initialFcy()); edit.setEditing(false); }} />
     </View>
   );
 }

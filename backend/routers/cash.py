@@ -419,6 +419,8 @@ class FcyLine(BaseModel):
     currency: str = Field(min_length=3, max_length=3)
     amount: float = Field(ge=0, le=10_000_000)
     rate: float = Field(gt=0, le=100_000)
+    deno: float | None = Field(default=None, gt=0, le=100_000)
+    qty: int | None = Field(default=None, gt=0, le=100_000)
 
 
 class BlockIn(BaseModel):
@@ -504,9 +506,11 @@ def save_block(flight_id: int, data: BlockIn, user: dict = Depends(current_user)
                 code = line.currency.strip().upper()
                 if not code.isalpha() or code == "NPR":
                     raise HTTPException(status_code=400, detail="Foreign currency lines take a foreign currency code.")
-                if line.amount:
-                    fcy.append({"currency": code, "amount": round(line.amount, 2), "rate": round(line.rate, 6),
-                                "npr": round(line.amount * line.rate, 2)})
+                amount = line.amount or ((line.deno or 0) * (line.qty or 0))
+                if amount:
+                    fcy.append({"currency": code, "deno": line.deno, "qty": line.qty,
+                                "amount": round(amount, 2), "rate": round(line.rate, 6),
+                                "npr": round(amount * line.rate, 2)})
             connection.execute(
                 "UPDATE cash_sheet_crew SET npr_collect=?, fcy_collect=?, collection_by=?, collection_at=? WHERE id=?",
                 (json.dumps(values), json.dumps(fcy), user["employee_id"], now, row["id"]))
@@ -634,23 +638,34 @@ def print_sheet(flight_id: int, user: dict = Depends(current_user)):
         return (f"<table><caption>{e(title)}</caption><tr><th>Deno</th><th>Qty</th><th>Amount</th></tr>{rows}"
                 f"<tr class='t'><td colspan=2>Total</td><td>{money(total)}</td></tr></table>")
 
+    def staff(b):
+        return f"<p class=sig>Name/Staff No. <b>{e(b['crew_name'])}</b> ({e(b['staff_no'])}) &nbsp; Signature: ____________</p>"
+
+    # Laid out as the paper form: the floating cash of every crew side by
+    # side, then each crew's NPR and FCY collection side by side.
+    floats = "".join(f"""<div class=crew><h3>Crew {i}</h3><div class=row>
+        {deno_table('Opening Balance', b['float_open'], b['float_open_total'])}
+        {deno_table('Closing Balance', b['float_close'], b['float_close_total'])}</div>{staff(b)}</div>"""
+                     for i, b in enumerate(data["blocks"], start=1))
     blocks = []
     for i, b in enumerate(data["blocks"], start=1):
-        fcy = "".join(f"<tr><td>{e(x['currency'])}</td><td>{money(x['amount'])}</td><td>{e(x['rate'])}</td>"
+        fcy = "".join(f"<tr><td class=l>{e(x['currency'])}</td><td>{e(x.get('deno') or '')}</td><td>{e(x.get('qty') or '')}</td>"
+                      f"<td>{money(x['amount'])}</td><td>{e(x['rate'])}</td>"
                       f"<td>{money(x['amount'] * x['rate'])}</td></tr>" for x in b["fcy_collect"])
+        fcy += "<tr><td>&nbsp;</td><td></td><td></td><td></td><td></td><td></td></tr>" * max(0, 3 - len(b["fcy_collect"]))
         diffs = "".join(f"<li>{e(d['currency'])}: entered {d['entered']:g}, phones recorded {d['system']:g}</li>"
                         for d in b["differences"])
         blocks.append(f"""
-        <section><h2>Crew {i}: {e(b['crew_name'])} <small>Staff No. {e(b['staff_no'])}</small></h2>
-        <div class=row>{deno_table('Opening balance', b['float_open'], b['float_open_total'])}
-        {deno_table('Closing balance', b['float_close'], b['float_close_total'])}
-        {deno_table('Cash sales collection (NPR)', b['npr_collect'], b['npr_total'])}
-        <table><caption>Currency (FCY)</caption><tr><th>Currency</th><th>Amount</th><th>Exchange rate</th><th>NPR</th></tr>
-        {fcy}<tr class='t'><td colspan=3>Total</td><td>{money(b['fcy_npr_total'])}</td></tr></table></div>
-        <p class=tot>Total cash collected (NPR): <b>{money(b['total_collected'])}</b> &nbsp;
-        Crew commission: <b>{money(b['commission'])}</b> &nbsp; Net cash: <b>{money(b['net_cash'])}</b></p>
-        {f"<ul class=diff>{diffs}</ul>" if diffs else ''}
-        <p class=sig>Saved by {e(b['collection_by'] or '-')} {e(b['collection_at'] or '')}</p></section>""")
+        <div class=crew><h3>Crew {i}</h3><div class=row>
+        {deno_table('Currency: NPR', b['npr_collect'], b['npr_total'])}
+        <div><table><caption>Currency (FCY)</caption><tr><th>Currency</th><th>Deno</th><th>Qty</th><th>Amount</th>
+        <th>Exchange Rate</th><th>NPR Currency</th></tr>
+        {fcy}<tr class='t'><td colspan=5>Total</td><td>{money(b['fcy_npr_total'])}</td></tr></table>
+        <table class=sum><tr><td class=l>Total Cash Collected (NPR)</td><td><b>{money(b['total_collected'])}</b></td></tr>
+        <tr><td class=l>Crew Commission (10%)</td><td>{money(b['commission'])}</td></tr>
+        <tr><td class=l>Net Cash</td><td><b>{money(b['net_cash'])}</b></td></tr></table></div></div>
+        {staff(b)}
+        {f"<ul class=diff>{diffs}</ul>" if diffs else ''}</div>""")
     f = data["flight"]
     t = data["totals"]
     page = f"""<!doctype html><html><head><meta charset=utf-8><title>Cash sheet {e(f['flight_number'])} {e(f['flight_date'])}</title>
@@ -659,12 +674,14 @@ h2{{font-size:14px;margin:14px 0 6px}}small{{font-weight:normal;color:#555}}.row
 table{{border-collapse:collapse;margin-bottom:6px}}caption{{font-weight:bold;text-align:left;padding:2px 0}}
 td,th{{border:1px solid #333;padding:3px 7px;text-align:right;min-width:42px}}th{{background:#eee}}
 tr.t td{{font-weight:bold}}.tot{{margin:4px 0}}.diff{{color:#b00}}.sig{{color:#555}}section{{page-break-inside:avoid;border-top:1px solid #999;padding-top:6px}}
-.head{{display:flex;justify-content:space-between}}</style></head><body>
-<div class=head><div><h1>Floating Cash Balance &amp; Cash Sales Collection (NPR)</h1>
+.head{{display:flex;justify-content:space-between}}h3{{font-size:13px;margin:8px 0 4px}}
+.crew{{margin-right:18px}}td.l{{text-align:left}}table.sum td{{border:none;padding:2px 7px}}</style></head><body>
+<div class=head><div><h1>Cash Sheet</h1>
 <div>{e(f['flight_number'])} &middot; {e(f['origin'])}-{e(f['destination'])} &middot; {e(f['flight_date'])}</div></div>
 <div>S.N {e(data['sn'] or '-')}<br>Status: {e(data['status'])}{(' by ' + e(data['approved_by'])) if data['approved_by'] else ''}</div></div>
-{''.join(blocks) or '<p>No crew blocks entered yet.</p>'}
-<section><h2>Grand total (all crew)</h2><p class=tot>Total cash collected (NPR): <b>{money(t['collected'])}</b> &nbsp;
+<section><h2>FLOATING CASH BALANCE (NPR)</h2><div class=row>{floats or '<p>No crew entered yet.</p>'}</div></section>
+<section><h2>CASH SALES COLLECTION</h2>{''.join(blocks) or '<p>No crew entered yet.</p>'}</section>
+<section><h2>Grand Total ({' + '.join(f'Crew {i}' for i in range(1, len(data['blocks']) + 1)) or 'all crew'})</h2><p class=tot>Total cash collected (NPR): <b>{money(t['collected'])}</b> &nbsp;
 Crew commission: <b>{money(t['commission'])}</b> &nbsp; Net cash: <b>{money(t['net_cash'])}</b> &nbsp;
 Sales recorded on the phones (NPR value): <b>{money(t['system_npr_value'])}</b></p>
 <p>Finance staff: ______________________ &nbsp; Signature: ______________________</p></section>

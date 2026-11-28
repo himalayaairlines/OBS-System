@@ -419,6 +419,17 @@ class CrewSystemTests(unittest.TestCase):
         # Bad notes are refused.
         self.assertEqual(call("PUT", f"/cash/flights/{leg['id']}/blocks", "ADMIN001", {
             "crew_account": a, "section": "float_close", "denominations": {"300": 1}, "remarks": "x"})[0], 400)
+        # Paper-form FCY line: Deno x Qty gives the amount when no amount is written.
+        status, sheet = call("PUT", f"/cash/flights/{leg['id']}/blocks", "ADMIN001", {
+            "crew_account": "GUEST1", "section": "collection", "denominations": {},
+            "fcy": [{"currency": "AED", "amount": 0, "deno": 50, "qty": 3, "rate": 40.8}], "remarks": "paper form"})
+        self.assertEqual(status, 200, sheet)
+        guest = [x for x in sheet["blocks"] if x["crew_account"] == "GUEST1"][0]
+        self.assertEqual((guest["fcy_collect"][0]["amount"], guest["fcy_npr_total"]), (150, 6120))
+        page = call("GET", f"/cash/flights/{leg['id']}/print", "MGT001")[1]
+        for heading in ("FLOATING CASH BALANCE (NPR)", "Opening Balance", "Closing Balance", "CASH SALES COLLECTION",
+                        "Currency: NPR", "Exchange Rate", "NPR Currency", "Net Cash", "Grand Total"):
+            self.assertIn(heading, page)
 
     def test_09_finance_sees_the_sales_report_only(self):
         year = date.today().year
