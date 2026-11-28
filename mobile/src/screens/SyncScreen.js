@@ -7,7 +7,7 @@ import {
   writeQueue, writeRejected,
 } from '../api';
 import {
-  applyJournalToFlights, clearFailed, journalTrip, legFinished, legStarted, readFailed, readJournal, readOutbox, rootOf, tripAction,
+  applyJournalToFlights, clearFailed, journalLeg, journalTrip, legFinished, legSellable, legStarted, readFailed, readJournal, readOutbox, rootOf, tripAction,
 } from '../tripLocal';
 import { CommissionCard, SectorStockCard } from './StockCards';
 import { confirm, notify } from '../dialog';
@@ -352,6 +352,40 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
   }
 
   /** 7.18: a colleague submitted the trip's return; this phone moves on. */
+  // 7.18: "Finish this flight" lives here, right above the stock step it
+  // opens. "Start second flight" and "Finish whole flight" stay on Sales.
+  const [finishing, setFinishing] = useState(null);
+  async function finishSector(flight) {
+    const roundFirst = flight.trip_type === 'ROUND_TRIP' && flight.direction !== 'RETURN';
+    const sure = await confirm({
+      title: 'Finish this flight?',
+      message: `${flight.flight_number} ${flight.origin}\u2192${flight.destination} will be finished on this phone.\n\n`
+        + 'You can no longer record a sale on this sector. The sales already recorded are kept.',
+      confirmText: 'Finish this flight',
+      tone: 'danger',
+    });
+    if (!sure) return;
+    setFinishing(flight.id);
+    try {
+      const { result } = await tripAction({ method: 'PUT', endpoint: `/flights/${flight.id}/finish`,
+        label: `Finish ${flight.flight_number} ${flight.origin}-${flight.destination}`, flightId: flight.id });
+      await journalLeg(rootOf(flight), flight.id, { finished_at: new Date().toISOString() });
+      await refreshLocal();
+      onQueueChange?.();
+      await notify({
+        title: 'Flight finished',
+        message: (result ? `${flight.flight_number}: ${result.transactions} transaction(s), ${npr(result.revenue_npr)} on your login.`
+          : `${flight.flight_number} is finished on this phone. (No signal: it uploads with your sales on Wi-Fi.)`)
+          + (roundFirst
+            ? '\n\nNext, on this page: the remaining stock (or say another crew member did it). Then press \u201cStart second flight\u201d on the Sales page.'
+            : '\n\nNext, on this page: the final stock return (or say another crew member did it). Then press \u201cFinish whole flight\u201d on the Sales page.'),
+      });
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+    setFinishing(null);
+  }
+
   async function returnByOther(trip) {
     const sure = await confirm({
       title: 'Another crew member submitted it?',
@@ -798,6 +832,20 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
         )}
       </Card>
       )}
+
+      {isCrew && flights.filter((f) => legSellable(f) && !f.my_completed_at && String(f.flight_date || '') <= todayString())
+        .sort((a, b) => String(a.flight_date).localeCompare(String(b.flight_date)) || (a.direction === 'RETURN') - (b.direction === 'RETURN'))
+        .map((f) => (
+          <Card key={`finish-${f.id}`} style={{ borderColor: COLORS.warning, borderWidth: 1 }}>
+            <SectionTitle
+              title={`Finish this flight · ${f.flight_number} ${f.origin}\u2192${f.destination}`}
+              description={`${f.flight_date}${f.trip_type === 'ROUND_TRIP' ? (f.direction === 'RETURN' ? ' · second flight' : ' · first flight') : ''}. Press this when the sector is over: selling stops on it and the stock step below opens.`}
+            />
+            <Button title={finishing === f.id ? 'Finishing\u2026' : 'Finish this flight'} tone="warning"
+              onPress={() => finishSector(f)} disabled={!!finishing} />
+            {!online && <Text style={[styles.mono, { marginTop: 6 }]}>No signal: it is saved on this phone and uploads with your sales on Wi-Fi.</Text>}
+          </Card>
+        ))}
 
       {isCrew && (() => {
         // 7.18: the count after the first sector of a round trip, on this page.

@@ -504,44 +504,6 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
     }
   }
 
-  // 7.18: "Finish this flight" is on the Sales page again; the stock count
-  // and the final return follow on the Sync & Return Stock page.
-  async function finishSector() {
-    if (!flight) return;
-    const roundFirst = flight.trip_type === 'ROUND_TRIP' && flight.direction !== 'RETURN';
-    const sure = await confirm({
-      title: 'Finish this flight?',
-      message: `${flight.flight_number} ${route(flight)} will be finished on this phone.\n\n`
-        + 'You can no longer record a sale on this sector. The sales already recorded are kept.',
-      confirmText: 'Finish this flight',
-      tone: 'danger',
-    });
-    if (!sure) return;
-    setBusy(true);
-    try {
-      const { result, queued } = await tripAction({ method: 'PUT', endpoint: `/flights/${flight.id}/finish`,
-        label: `Finish ${flight.flight_number} ${route(flight)}`, flightId: flight.id });
-      await journalLeg(rootOf(flight), flight.id, { finished_at: new Date().toISOString() });
-      await loadReference();
-      onQueueChange?.();
-      const next = await confirm({
-        title: 'Sector finished',
-        message: (result ? `${flight.flight_number}: ${result.transactions} transaction(s), ${npr(result.revenue_npr)} on your login.`
-          : `${flight.flight_number} is finished on this phone. (No signal: it uploads with your sales on Wi-Fi.)`)
-          + (roundFirst
-            ? '\n\nNext: the remaining stock on the Sync & Return Stock page (or say another crew member did it), then \u201cStart second flight\u201d here.'
-            : '\n\nNext: the final stock return on the Sync & Return Stock page, then \u201cFinish whole flight\u201d here.'),
-        confirmText: 'Go to Sync & Return Stock',
-        cancelText: 'Later',
-      });
-      if (next) goTo?.('sync');
-      if (queued) setMessage({ tone: 'info', text: 'Saved on this phone; it uploads by itself on Wi-Fi.' });
-    } catch (error) {
-      setMessage({ tone: 'danger', text: error.message });
-    }
-    setBusy(false);
-  }
-
   // 7.18: the aircraft landed somewhere else. The sector's destination changes;
   // remarks are mandatory and Management sees where it was meant to go.
   const [diversionOpen, setDiversionOpen] = useState(false);
@@ -941,9 +903,9 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
             {selling && infoOpen && (
               <>
                 <View style={styles.divider} />
-                <Button title="Sector over? Finish this flight" tone="warning" small onPress={finishSector} disabled={busy} />
+                <Button title="Sector over? Finish it on Sync & Return Stock" tone="warning" small onPress={() => goTo?.('sync')} />
                 <Text style={[styles.mono, { marginTop: 6 }]}>
-                  The remaining stock and the final return follow on the Sync & Return Stock page. The cabin forms are on the Reports page and can be filled in at any time.
+                  Finishing the flight, the remaining stock and the final return are on the Sync & Return Stock page. The cabin forms are on the Reports page and can be filled in at any time.
                 </Text>
               </>
             )}
@@ -1183,12 +1145,11 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
           </Card>
           {!infoOpen && (
             <Button
-              title="Sector over? Finish this flight"
+              title="Sector over? Finish it on Sync & Return Stock"
               tone="warning"
               small
               style={{ marginBottom: 12 }}
-              onPress={finishSector}
-              disabled={busy}
+              onPress={() => goTo?.('sync')}
             />
           )}
         </>
@@ -1365,7 +1326,7 @@ function TripSteps({ trip }) {
   const steps = [];
   trip.legs.forEach((leg, index) => {
     if (index === 1) steps.push({ label: `Start second flight ${route(leg)}`, done: leg.started });
-    steps.push({ label: `Sell and finish ${route(leg)}`, done: leg.finished });
+    steps.push({ label: `Sell ${route(leg)}, then finish it (Sync & Return Stock)`, done: leg.finished });
     if (leg.stock_count_needed) {
       steps.push({ label: `Remaining stock after ${route(leg)} (Sync & Return Stock)`, done: !!leg.stock_count_done });
     } else {
