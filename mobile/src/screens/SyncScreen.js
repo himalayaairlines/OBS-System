@@ -7,8 +7,9 @@ import {
   writeQueue, writeRejected,
 } from '../api';
 import {
-  applyJournalToFlights, clearFailed, journalTrip, legFinished, readFailed, readJournal, readOutbox, rootOf, tripAction,
+  applyJournalToFlights, clearFailed, journalTrip, legFinished, legStarted, readFailed, readJournal, readOutbox, rootOf, tripAction,
 } from '../tripLocal';
+import { CommissionCard, SectorStockCard } from './StockCards';
 import { confirm, notify } from '../dialog';
 import { usePaged } from '../paging';
 import { COLORS, npr, styles, todayString } from '../theme';
@@ -19,7 +20,9 @@ import {
 } from '../ui';
 
 export default function SyncScreen({ user, online, onQueueChange, goToReports, goTo }) {
-  const isCrew = user.role === 'crew_supervisor';
+  const isCrew = user.role === 'crew' || user.role === 'crew_supervisor';
+  // 7.18: a crew member's own login counts the whole trolley once for the crew.
+  const ownLogin = user.role === 'crew';
   // Inventory roles have no stake in commission; what they need from this page
   // is what the crew declared as left over.
   const isInventory = user.role === 'inventory' || user.role === 'inventory_supervisor';
@@ -65,7 +68,8 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
     setFailedSteps(await readFailed());
     if (isCrew) {
       const [p, b, f] = await Promise.all([readCache('products', []), readCache('bundles', []), readCache('flights', [])]);
-      setProducts(p || []); setBundles(b || []); setFlights(f || []);
+      setProducts(p || []); setBundles(b || []);
+      setFlights(applyJournalToFlights(f || [], await readJournal()));
       const g = {};
       for (const flight of f || []) {
         const group = await readCache(`dutyGroup.${flight.id}`, null);
@@ -158,7 +162,8 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
         status: trip.stock_return_at ? 'WAITING' : 'NOT_SUBMITTED', offline_built: true,
         devices: String(legs[0].crew_account || '').split(',').filter(Boolean),
         submitted_devices: trip.stock_return_at ? [user.employee_id] : [], waiting_for: [],
-        my_submitted: !!trip.stock_return_at, submitted: false,
+        my_submitted: !!(trip.stock_return_at || trip.return_by_other_at), submitted: false,
+        by_other: !!trip.return_by_other_at && !trip.stock_return_at,
         items: inventory.map((row) => ({
           product_id: row.product_id, product_name: row.product_name, loaded_quantity: row.loaded_quantity,
           sold_quantity: Math.max(0, (row.loaded_quantity || 0) - (row.remaining_quantity || 0)),
@@ -185,9 +190,13 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
           delete journal[t.flight_id].stock_return_at;
         }
       }
-      setPending(list.map((t) => (journal[t.flight_id]?.stock_return_at && !t.my_submitted
-        ? { ...t, my_submitted: true, local: true, submitted_devices: [...(t.submitted_devices || []), user.employee_id] }
-        : t)));
+      setPending(list.map((t) => {
+        const local = journal[t.flight_id] || {};
+        if (local.return_by_other_at && !t.my_submitted && !t.submitted) return { ...t, my_submitted: true, by_other: true };
+        return local.stock_return_at && !t.my_submitted
+          ? { ...t, my_submitted: true, local: true, submitted_devices: [...(t.submitted_devices || []), user.employee_id] }
+          : t;
+      }));
       setPendingError(null);
     } catch (error) {
       try {
@@ -256,6 +265,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
       .reduce((sum, [, qty]) => sum + Number(qty || 0), 0);
   }
   function myDefault(trip, item) {
+    if (ownLogin) return item.expected_remaining;
     const others = othersDeclared(trip, item);
     return (trip.submitted_devices || []).some((d) => d !== user.employee_id)
       ? Math.max(0, item.expected_remaining - others)
@@ -341,6 +351,26 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
     setMessage({ tone: 'success', text: 'Sale changed on this iPad. The change and your remarks upload with it and stay in its history.' });
   }
 
+  /** 7.18: a colleague submitted the trip's return; this phone moves on. */
+  async function returnByOther(trip) {
+    const sure = await confirm({
+      title: 'Another crew member submitted it?',
+      message: 'Your phone moves on to \u201cFinish whole flight\u201d. The return itself comes from the colleague who counted it.',
+      confirmText: 'Yes, a colleague did it',
+    });
+    if (!sure) return;
+    try {
+      await tripAction({ endpoint: `/flights/${trip.flight_id}/stock-return-by-other`,
+        label: `Stock return ${trip.flight_number}: by a colleague`, flightId: trip.flight_id });
+      await journalTrip(trip.flight_id, { return_by_other_at: new Date().toISOString() });
+      await refreshLocal();
+      onQueueChange?.();
+      loadPending();
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+  }
+
   async function confirmReturn(trip) {
     const sure = await confirm({
       title: 'Submit the stock return?',
@@ -386,16 +416,16 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
       });
       loadPending();
 
-      // Next: the commission and the forms on the Reports page, then Finish whole flight.
+      // Next: Finish whole flight on the Sales page. The forms are separate (Reports, any time).
       if (goTo && isCrew) {
         const now = await confirm({
           title: 'Stock return submitted',
-          message: 'Next: see this sector\u2019s commission and fill in the forms on the Reports page, '
-            + 'then press \u201cFinish whole flight\u201d on the Sales page.',
-          confirmText: 'Go to Reports',
+          message: 'Next: press \u201cFinish whole flight\u201d on the Sales page. '
+            + 'The cabin forms are on the Reports page and can be filled in at any time.',
+          confirmText: 'Go to Sales',
           cancelText: 'Later',
         });
-        if (now) goTo('reports');
+        if (now) goTo('crew');
       }
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
@@ -407,11 +437,11 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
       <PageHeader
-        title="Sync & Commission"
+        title={isCrew || isInventory ? 'Sync & Return Stock' : 'Sync & Commission'}
         description={isInventory
           ? 'Stock returned by crew after each flight.'
           : isCrew
-            ? 'Your group\'s sales for the selected day, plus the upload queue.'
+            ? 'Your upload queue, your sales and commission, and the stock return for your trip.'
             : 'All groups, sales and commission for the selected day.'}
         right={<Pill label={online ? 'ONLINE' : 'OFFLINE'} tone={online ? 'success' : 'warning'} />}
       />
@@ -769,6 +799,20 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
       </Card>
       )}
 
+      {isCrew && (() => {
+        // 7.18: the count after the first sector of a round trip, on this page.
+        const counts = flights.filter((f) => f.trip_type === 'ROUND_TRIP' && f.direction !== 'RETURN' && legFinished(f)
+          && !f.my_completed_at && !flights.some((r) => r.linked_flight_id === f.id && r.direction === 'RETURN' && legStarted(r)));
+        return counts.map((f) => (
+          <SectorStockCard key={`count-${f.id}`} flightId={f.id} rootId={rootOf(f)} flight={f} online={online} user={user}
+            onChanged={() => { refreshLocal(); onQueueChange?.(); }} />
+        ));
+      })()}
+
+      {isCrew && flights.filter((f) => legFinished(f) && !f.my_completed_at).map((f) => (
+        <CommissionCard key={`comm-${f.id}`} flightId={f.id} online={online} user={user} />
+      ))}
+
       {isCrew && (
         pending.length ? pending.map((trip) => {
           // This iPad has declared its part: read-only until sent back.
@@ -794,7 +838,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
             {trip.status === 'REJECTED' && (
               <Banner tone="danger" message={`Sent back: ${trip.review_remarks || 'recount required'}`} />
             )}
-            {otherDevices.length > 0 && (
+            {otherDevices.length > 0 && !ownLogin && (
               <Banner
                 tone="info"
                 message={`Two iPads share this trolley. Type what is left on THIS iPad; ${otherDevices.join(', ')} declares its own part and the two are added together. `
@@ -846,7 +890,7 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
             <View style={styles.divider} />
 
             <Field
-              label="Remarks (only if something does not match)"
+              label="Remarks (optional)"
               value={countRemarks[trip.flight_id] || ''}
               onChangeText={(text) => setCountRemarks((c) => ({ ...c, [trip.flight_id]: text }))}
               multiline
@@ -856,20 +900,30 @@ export default function SyncScreen({ user, online, onQueueChange, goToReports, g
             {locked ? (
               <Banner
                 tone="success"
-                message={(trip.local || trip.offline_built
-                  ? 'Confirmed on this iPad; it uploads with the sales on Wi-Fi. '
-                  : (trip.waiting_for || []).length
-                    ? 'Your count is in; the other iPad adds its part when it uploads. '
-                    : 'Submitted. The count is with the Inventory. ')
-                  + (isCrew ? 'Next: the commission and the forms on the Reports page, then \u201cFinish whole flight\u201d on the Sales page.' : '')}
+                message={(trip.by_other
+                  ? 'You said another crew member submitted the return; their count arrives when their phone uploads. '
+                  : trip.local || trip.offline_built
+                    ? 'Confirmed on this phone; it uploads with the sales on Wi-Fi. '
+                    : ownLogin && trip.submitted_by && trip.submitted_by !== user.employee_id
+                      ? `Submitted by ${trip.submitted_by}. The count is with Inventory. `
+                      : (trip.waiting_for || []).length && !ownLogin
+                        ? 'Your count is in; the other iPad adds its part when it uploads. '
+                        : 'Submitted. The count is with Inventory. ')
+                  + (isCrew ? 'Next: \u201cFinish whole flight\u201d on the Sales page.' : '')}
               />
             ) : (
-              <Button
-                title={online ? 'Submit stock return' : 'SUBMIT (will upload on Wi-Fi)'}
-                tone={online ? 'primary' : 'warning'}
-                style={{ marginTop: 10 }}
-                onPress={() => confirmReturn(trip)}
-              />
+              <>
+                <Button
+                  title={online ? 'Submit stock return' : 'SUBMIT (will upload on Wi-Fi)'}
+                  tone={online ? 'primary' : 'warning'}
+                  style={{ marginTop: 10 }}
+                  onPress={() => confirmReturn(trip)}
+                />
+                {ownLogin && (
+                  <Button title="Another crew member submitted it" tone="ghost" small style={{ marginTop: 8 }}
+                    onPress={() => returnByOther(trip)} />
+                )}
+              </>
             )}
             <Text style={[styles.mono, { marginTop: 6 }]}>
               The Expected column is what the system works out from the load and every sale on the

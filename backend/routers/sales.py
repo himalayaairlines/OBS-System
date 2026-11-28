@@ -17,7 +17,9 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from database import AIRCRAFT_TYPES, COMMISSION_RATE, get_connection
+import math
+
+from database import AIRCRAFT_TYPES, COMMISSION_RATE, CREW_ROLES, get_connection
 import trip_flow
 from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from security import (
@@ -74,6 +76,10 @@ class SaleTransaction(BaseModel):
     remarks: str | None = None
     transaction_time: str
     device_edits: list[DeviceEdit] = []
+    # 7.18: what the passenger paid in the chosen currency, as the phone showed
+    # it (the NPR price converted and rounded UP to a whole unit). Kept as the
+    # cash actually collected; worked out here when the phone does not send it.
+    payment_amount: float | None = Field(default=None, ge=0, le=10_000_000)
 
 
 class SyncRequest(BaseModel):
@@ -87,6 +93,65 @@ class SaleEdit(BaseModel):
     # Management may reattribute a sale recorded against the wrong crew member.
     sold_by_crew_member_id: int | None = None
     edit_remarks: str
+
+
+def currency_amount(npr: float, rate: float, currency: str) -> float:
+    """7.18: what the passenger pays in `currency` for an NPR price: converted
+    at the day's rate and rounded UP to the next whole unit (3.0 -> 3,
+    3.1 -> 4, 2.5 -> 3). NPR itself is charged as priced."""
+    if not npr or npr <= 0:
+        return 0.0
+    if currency == "NPR" or not rate:
+        return round(npr, 2)
+    # The epsilon keeps an exact conversion (e.g. 3.0000000001 from float
+    # division) from being pushed to the next unit.
+    return float(math.ceil(npr / rate - 1e-9))
+
+
+def _currency_split(line_nprs: list[float], rate: float, currency: str, paid: float | None) -> list[float]:
+    """Spread the transaction's currency amount over its lines so the lines add
+    up to exactly what was collected."""
+    total_npr = sum(line_nprs)
+    total = currency_amount(total_npr, rate, currency)
+    if paid is not None and total_npr > 0:
+        total = round(float(paid), 2)
+    if not line_nprs:
+        return []
+    if total_npr <= 0:
+        return [0.0] * len(line_nprs)
+    out, allocated = [], 0.0
+    for index, npr in enumerate(line_nprs):
+        if index == len(line_nprs) - 1:
+            out.append(round(total - allocated, 2))
+        else:
+            share = round(total * npr / total_npr, 2)
+            out.append(share)
+            allocated += share
+    return out
+
+
+def _group_from_roster(connection, flight, user):
+    """A duty group made from the crew Inventory rostered on the sector, for a
+    sale that arrives before any phone entered the names (7.18)."""
+    members = [r["id"] for r in connection.execute(
+        """SELECT DISTINCT m.id FROM flight_assignments a
+           JOIN users u ON u.employee_id = a.crew_account
+           JOIN crew_members m ON m.id = u.crew_member_id
+           WHERE a.flight_id=? AND m.active=1""", (flight["id"],))]
+    if not members:
+        return None
+    label = (f"{flight['flight_number']} / {flight['flight_date']} / "
+             f"{'OUT' if flight['direction'] == 'OUTBOUND' else 'RET'}")
+    try:
+        group_id = connection.execute(
+            "INSERT INTO duty_groups(flight_id,client_ref,label,created_by,created_at) VALUES (?,?,?,?,?)",
+            (flight["id"], f"ROSTER-{flight['id']}", label, f"ROSTER ({user['employee_id']})", now_iso())).lastrowid
+    except sqlite3.IntegrityError:
+        return connection.execute("SELECT * FROM duty_groups WHERE flight_id=?", (flight["id"],)).fetchone()
+    for member_id in members:
+        connection.execute("INSERT INTO duty_group_members(duty_group_id,crew_member_id) VALUES (?,?)",
+                           (group_id, member_id))
+    return connection.execute("SELECT * FROM duty_groups WHERE id=?", (group_id,)).fetchone()
 
 
 class PermanentError(Exception):
@@ -217,9 +282,9 @@ def _record(connection, transaction: SaleTransaction, user: dict, replay: bool =
 
     if "sell_any_flight" not in permissions_for(user["role"]):
         if not accounts:
-            raise PermanentError("No OBS device is assigned to this flight.")
+            raise PermanentError("No crew is rostered on this sector.")
         if user["employee_id"] not in accounts:
-            raise PermanentError("This device is not assigned to that flight.")
+            raise PermanentError("You are not rostered on that sector.")
 
     # The sale belongs to the sector's duty group: the pooled commission is
     # split across its members. Without a group there is nobody to pay, so
@@ -227,13 +292,26 @@ def _record(connection, transaction: SaleTransaction, user: dict, replay: bool =
     duty_group = connection.execute(
         "SELECT * FROM duty_groups WHERE flight_id=?", (transaction.flight_id,)
     ).fetchone()
+    if not duty_group and (replay or user["role"] in CREW_ROLES):
+        # 7.18: the names are entered on one phone; a phone that sold before it
+        # ever saw them still uploads. The group starts from Inventory's roster.
+        duty_group = _group_from_roster(connection, flight, user)
     if not duty_group:
         raise PermanentError(
             "No duty group has been formed for this sector. Enter the crew names before selling."
         )
     has_combo = any(line.bundle_id for line in transaction.lines)
     seller = None
-    if transaction.sold_by_crew_member_id:
+    own = None
+    if user["role"] in CREW_ROLES:
+        # 7.18: every crew member sells on their own login, so the seller is
+        # whoever is signed in — for products (sales ranking) and combos
+        # (combo commission) alike. Nothing to pick at the till.
+        from crew_accounts import crew_member_for_user
+        own = crew_member_for_user(connection, user)
+    if own is not None:
+        seller = {"id": own["id"], "name": own["name"]}
+    elif transaction.sold_by_crew_member_id:
         seller = connection.execute(
             """SELECT m.id, m.name FROM duty_group_members dm
                JOIN crew_members m ON m.id = dm.crew_member_id
@@ -258,6 +336,21 @@ def _record(connection, transaction: SaleTransaction, user: dict, replay: bool =
     stock_flight_id = trip_root(connection, transaction.flight_id)
     consumes_stock = sale_type in {"NORMAL", "COMPLEMENTARY"}
     records_revenue = sale_type == "NORMAL"
+    currency = transaction.payment_currency.strip().upper()
+    line_amounts = _currency_split([line["npr_amount"] if records_revenue else 0.0 for line in expanded],
+                                   rate, currency, transaction.payment_amount)
+    paid_total = round(sum(line_amounts), 2)
+    computed_total = currency_amount(sum(line["npr_amount"] for line in expanded) if records_revenue else 0.0,
+                                     rate, currency)
+    if transaction.payment_amount is not None and abs(paid_total - computed_total) > max(1.0, 0.1 * computed_total):
+        # The phone's rate and the server's rate for that day disagree by more
+        # than rounding can explain: keep what was collected, show the gap.
+        connection.execute(
+            "INSERT INTO flight_conflicts(flight_id,device,field,kept_value,kept_by,device_value,created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (transaction.flight_id, user["employee_id"], "payment_amount",
+             f"{currency} {computed_total:g} at the server rate", None,
+             f"{currency} {paid_total:g} collected ({transaction.order_ref})", now_iso()))
 
     total_npr = 0.0
     inserted = []
@@ -277,7 +370,31 @@ def _record(connection, transaction: SaleTransaction, user: dict, replay: bool =
                     "SELECT product_name FROM products WHERE id=?", (line["product_id"],)
                 ).fetchone()
                 name = product["product_name"] if product else "product"
-                raise PermanentError(f"Insufficient stock on board for {name}.")
+                if not replay:
+                    raise PermanentError(f"Insufficient stock on board for {name}.")
+                # 7.18: every phone sells offline from the same trolley figure,
+                # so the uploads together can claim more than was loaded. The
+                # sale happened (the cash is in the bag), so it is kept, and
+                # the sector is flagged for Inventory to check the load count.
+                connection.execute(
+                    "UPDATE inventory SET sold_quantity = sold_quantity + ? WHERE flight_id=? AND product_id=?",
+                    (line["quantity"], stock_flight_id, line["product_id"]))
+                stock = connection.execute(
+                    "SELECT loaded_quantity, sold_quantity, returned_quantity, wasted_quantity FROM inventory "
+                    "WHERE flight_id=? AND product_id=?", (stock_flight_id, line["product_id"])).fetchone()
+                kept = f"{name}: {stock['loaded_quantity'] if stock else '?'} loaded"
+                sold_text = f"{name}: {stock['sold_quantity'] if stock else '?'} sold in total"
+                open_row = connection.execute(
+                    "SELECT id FROM flight_conflicts WHERE flight_id=? AND field='oversell' AND kept_value=? "
+                    "AND resolved_at IS NULL", (transaction.flight_id, kept)).fetchone()
+                if open_row:
+                    connection.execute("UPDATE flight_conflicts SET device_value=?, device=? WHERE id=?",
+                                       (sold_text, user["employee_id"], open_row["id"]))
+                else:
+                    connection.execute(
+                        "INSERT INTO flight_conflicts(flight_id,device,field,kept_value,kept_by,device_value,created_at) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (transaction.flight_id, user["employee_id"], "oversell", kept, None, sold_text, now_iso()))
 
         npr_amount = line["npr_amount"] if records_revenue else 0.0
         total_npr += npr_amount
@@ -294,8 +411,7 @@ def _record(connection, transaction: SaleTransaction, user: dict, replay: bool =
                 transaction.flight_id, duty_group["id"], seller["id"] if seller else None, line["product_id"],
                 line["bundle_id"], user["employee_id"], seat, line["quantity"],
                 line["unit_price"], transaction.payment_method, transaction.transaction_time,
-                transaction.payment_currency.strip().upper(), rate,
-                round(npr_amount / rate, 2) if rate else 0, npr_amount, sale_type, remarks,
+                currency, rate, line_amounts[index], npr_amount, sale_type, remarks,
             ),
         ).lastrowid)
 
@@ -320,7 +436,7 @@ def _record(connection, transaction: SaleTransaction, user: dict, replay: bool =
         "sold_by": seller["name"] if seller else None,
         "sale_type": sale_type,
         "total_npr": round(total_npr, 2),
-        "total_currency": round(total_npr / rate, 2) if rate else 0,
+        "total_currency": paid_total,
         "currency": transaction.payment_currency.strip().upper(),
         "exchange_rate": rate,
         "lines": len(expanded),
@@ -495,7 +611,8 @@ def sales_by_flight(year: int | None = None, month: int | None = None, day: int 
             params.append(f"%{flight_number.strip().upper()}%")
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         sql = f"""
-            SELECT f.id, f.flight_number, f.flight_date, f.origin, f.destination, f.direction, f.trip_type,
+            SELECT f.id, f.flight_number, f.flight_date, f.origin, f.destination, f.original_destination,
+                   f.direction, f.trip_type,
                    f.status, f.aircraft_type, f.passengers, f.trip_completed_at,
                    CASE WHEN f.direction='RETURN' THEN 2 ELSE 1 END AS segment,
                    (SELECT GROUP_CONCAT(a.crew_account, ',') FROM flight_assignments a WHERE a.flight_id=f.id) AS devices,
@@ -658,6 +775,12 @@ def flight_sales_summary(flight_id: int, user: dict = Depends(requires("sales_vi
                    ROUND(SUM(s.npr_amount), 2) AS revenue_npr,
                    MIN(s.transaction_time) AS first_sale, MAX(s.transaction_time) AS last_sale
             FROM sales s WHERE {normal} GROUP BY s.crew_id ORDER BY revenue_npr DESC""", (flight_id,))]
+        # 7.18: which login sold which product (Inventory and Management).
+        by_device_product = [dict(r) for r in connection.execute(f"""
+            SELECT s.crew_id AS device, COALESCE(p.product_name, b.bundle_name) AS product_name,
+                   SUM(s.quantity) AS units, ROUND(SUM(s.npr_amount), 2) AS revenue_npr
+            FROM sales s LEFT JOIN products p ON p.id=s.product_id LEFT JOIN bundles b ON b.id=s.bundle_id
+            WHERE {normal} GROUP BY 1, 2 ORDER BY 1, revenue_npr DESC""", (flight_id,))]
         by_seller = [dict(r) for r in connection.execute(f"""
             SELECT COALESCE(cm.name, 'Not attributed') AS seller_name, cm.id AS crew_member_id,
                    COUNT(DISTINCT s.order_ref) AS transactions, SUM(s.quantity) AS units,
@@ -684,6 +807,12 @@ def flight_sales_summary(flight_id: int, user: dict = Depends(requires("sales_vi
         devices = [r["crew_account"] for r in connection.execute(
             "SELECT crew_account FROM flight_assignments WHERE flight_id=? ORDER BY id", (flight_id,))]
         group = connection.execute("SELECT id, label FROM duty_groups WHERE flight_id=?", (flight_id,)).fetchone()
+        diversions = [dict(r) for r in connection.execute(
+            "SELECT * FROM flight_diversions WHERE flight_id=? ORDER BY id", (flight_id,))]
+        crew = [dict(r) for r in connection.execute(
+            """SELECT m.crew_code, m.name, m.position FROM duty_group_members dm
+               JOIN duty_groups d ON d.id = dm.duty_group_id JOIN crew_members m ON m.id = dm.crew_member_id
+               WHERE d.flight_id=? ORDER BY m.name""", (flight_id,))]
     finally:
         connection.close()
     return {
@@ -691,6 +820,7 @@ def flight_sales_summary(flight_id: int, user: dict = Depends(requires("sales_vi
                    "segment": 2 if flight["direction"] == "RETURN" else 1},
         "totals": {**dict(totals), "edits": edits},
         "by_product": by_product, "by_device": by_device, "by_seller": by_seller,
+        "by_device_product": by_device_product, "diversions": diversions, "crew": crew,
         "by_currency": by_currency, "by_type": by_type,
     }
 
@@ -878,7 +1008,7 @@ def edit_sale(sale_id: int, data: SaleEdit, user: dict = Depends(requires("sales
                    sold_by_crew_member_id=?, npr_amount=?, transaction_currency_amount=?,
                    edited_by=?, edited_at=?, edit_remarks=? WHERE id=?""",
             (new_product_id, new_quantity, seat, unit_price, new_seller_id, npr_amount,
-             round(npr_amount / rate, 2) if rate else 0,
+             currency_amount(npr_amount, rate, (sale["transaction_currency"] or "NPR").upper()),
              user["employee_id"], edited_at, data.edit_remarks.strip(), sale_id),
         )
         # Every correction is kept line by line (7.10), not only the last one.

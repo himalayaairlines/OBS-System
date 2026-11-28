@@ -159,7 +159,8 @@ class TripFlowTests(unittest.TestCase):
         self.assertEqual(status, 200, comm)
         self.assertEqual(len(comm["members"]), 4)
         self.assertEqual(call("GET", f"/flights/{out['id']}/commission", "MGT001")[0], 200)
-        self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", "CREW001")[1]["step"], "FORMS_FIRST")
+        # 7.18: the forms are outside the flight flow; the next step is the second flight.
+        self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", "CREW001")[1]["step"], "START_SECOND")
 
         self.file_all(out)
         report = call("GET", f"/flights/{out['id']}/reports", "CREW001")[1]["reports"][0]["report"]
@@ -169,12 +170,9 @@ class TripFlowTests(unittest.TestCase):
         with urllib.request.urlopen(request, timeout=30) as response:
             self.assertEqual(response.headers["Content-Type"], "application/pdf")
             self.assertTrue(response.read().startswith(b"%PDF"))
-        # Saved forms can still be changed by the crew, with remarks.
-        self.assertEqual(call("PUT", f"/flight-reports/{report['id']}", "CREW001", {"payload": {}})[0], 400)
-        status, changed = call("PUT", f"/flight-reports/{report['id']}", "CREW001",
-                               {"payload": {}, "remarks": "Typo in seat number"})
-        self.assertEqual(status, 200, changed)
-        self.assertEqual(changed["rev_no"], 1)
+        # 7.18: after the final submission the crew cannot change a form.
+        self.assertEqual(call("PUT", f"/flight-reports/{report['id']}", "CREW001",
+                              {"payload": {}, "remarks": "Typo in seat number"})[0], 403)
 
         status, state = call("POST", f"/flights/{out['id']}/start-second", "CREW001")
         self.assertEqual(status, 200, state)
@@ -184,9 +182,9 @@ class TripFlowTests(unittest.TestCase):
         # The second sector shows what was sold before it.
         back_position = call("GET", f"/flights/{back['id']}/sector-stock", "CREW001")[1]
         self.assertEqual([i for i in back_position["items"] if i["product_id"] == product][0]["sold_before"], 1)
-        # First-segment forms are now locked to the iPad, not to Management.
+        # Management may still correct, with remarks.
         self.assertEqual(call("PUT", f"/flight-reports/{report['id']}", "CREW001",
-                              {"payload": {}, "remarks": "again"})[0], 400)
+                              {"payload": {}, "remarks": "again"})[0], 403)
         self.assertEqual(call("PUT", f"/flight-reports/{report['id']}", "MGT001",
                               {"payload": {}, "remarks": "Management check"})[0], 200)
 
@@ -241,7 +239,8 @@ class TripFlowTests(unittest.TestCase):
         self.assertEqual(status, 200, out)
         visible = {f["id"] for f in call("GET", "/flights", "CREW001")[1]}
         self.assertIn(leg["id"], visible)
-        self.assertNotIn(second["id"], visible)
+        # 7.18: every trip a crew login is rostered on is listed; they choose.
+        self.assertIn(second["id"], visible)
         seller = self.open_leg(leg)
         self.sell(leg, product, seller)
         self.assertEqual(call("PUT", f"/flights/{leg['id']}/finish", "CREW001")[0], 200)
@@ -325,7 +324,7 @@ class TripFlowTests(unittest.TestCase):
         line = [i for i in r2["items"] if i["product_id"] == product][0]
         self.assertEqual((line["expected_remaining"], line["declared_remaining"], line["by_device"]),
                          (2, 3, {"CREW001": 2, "CSUP001": 1}))
-        self.assertEqual(call("GET", f"/flights/{leg['id']}/trip-progress", "CREW001")[1]["step"], "FORMS_LAST")
+        self.assertEqual(call("GET", f"/flights/{leg['id']}/trip-progress", "CREW001")[1]["step"], "COMPLETE")
         # Forms: iPad 1 files three, marks the fourth as the other iPad's.
         for report_type in REPORT_TYPES[:-1]:
             self.assertEqual(call("POST", "/flight-reports", "CREW001",
@@ -481,19 +480,18 @@ class IndependentDevicesTests(TripFlowTests.__bases__[0]):
         # leaves the fourth to B, then starts the second flight.
         status, count = call("POST", f"/flights/{out['id']}/sector-stock", a, {"lines": [{"product_id": product, "declared_remaining": 1}]})
         self.assertEqual((status, count["my_submitted"]), (200, True), count)
-        self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", a)[1]["step"], "FORMS_FIRST")
+        self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", a)[1]["step"], "START_SECOND")
         for report_type in REPORT_TYPES[:-1]:
             self.assertEqual(call("POST", "/flight-reports", a, {"flight_id": out["id"], "report_type": report_type,
                                                                 "payload": {}, "submit": True, "client_ref": f"A-{report_type}-{out['id']}"})[0], 200)
         self.assertEqual(call("POST", "/flight-reports/defer", a, {"flight_id": out["id"], "report_type": REPORT_TYPES[-1]})[0], 200)
         self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", a)[1]["step"], "START_SECOND")
-        # B has not deferred anything, so for B the forms are not done yet.
-        self.assertEqual(call("GET", f"/flights/{out['id']}/trip-progress", b)[1]["legs"][0]["reports_done"], False)
+
         status, state = call("POST", f"/flights/{back['id']}/start-second", a)
         self.assertEqual((status, state["step"]), (200, "SELL_SECOND"), state)
         self.assertEqual(call("POST", f"/flights/{back['id']}/start-second", a)[1]["step"], "SELL_SECOND")  # replay
-        # A's first-sector forms are locked on A, but B can still file its own.
-        self.assertEqual(call("POST", "/flight-reports", a, {"flight_id": out["id"], "report_type": REPORT_TYPES[-1], "payload": {}, "submit": True})[0], 400)
+        # 7.18: forms are outside the flow, so A may still file one after starting the second flight.
+        self.assertEqual(call("POST", "/flight-reports", a, {"flight_id": out["id"], "report_type": REPORT_TYPES[-1], "payload": {}, "submit": True})[0], 200)
         self.assertEqual(call("POST", "/flight-reports", b, {"flight_id": out["id"], "report_type": REPORT_TYPES[-1],
                                                             "payload": {}, "submit": True, "client_ref": f"B-last-{out['id']}"})[0], 200)
         # B also filled in a form A already saved while offline: kept as a merged revision, not refused.
@@ -512,7 +510,7 @@ class IndependentDevicesTests(TripFlowTests.__bases__[0]):
         # A's own final return goes in although B is still on the first sector.
         status, r1 = self._return(a, out, product, 0)
         self.assertEqual((status, r1["status"]), (200, "WAITING"), r1)
-        self.assertEqual(call("GET", f"/flights/{back['id']}/trip-progress", a)[1]["step"], "FORMS_LAST")
+        self.assertEqual(call("GET", f"/flights/{back['id']}/trip-progress", a)[1]["step"], "COMPLETE")
         for report_type in REPORT_TYPES:
             self.assertEqual(call("POST", "/flight-reports", a, {"flight_id": back["id"], "report_type": report_type, "payload": {}, "submit": True})[0], 200)
         status, done = call("POST", f"/flights/{out['id']}/complete-trip", a)

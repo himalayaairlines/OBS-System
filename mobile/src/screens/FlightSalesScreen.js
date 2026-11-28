@@ -19,7 +19,7 @@ import {
  * Every correction is kept in the sale's history and the audit log.
  */
 const YEARS = Array.from({ length: 4 }, (_, i) => new Date().getFullYear() - i);
-const route = (f) => `${f.origin}→${f.destination}`;
+const route = (f) => `${f.origin}→${f.destination}${f.original_destination ? ` (diverted, planned ${f.original_destination})` : ''}`;
 const when = (s) => String(s || '').replace('T', ' ').slice(0, 16);
 
 export default function FlightSalesScreen({ user, online }) {
@@ -87,7 +87,7 @@ export default function FlightSalesScreen({ user, online }) {
       </Card>
 
       <Card>
-        <SectionTitle title="Sectors" description={flights.loading ? 'Loading…' : `${flights.total} sector(s). A highlighted sector has something the two iPads disagreed on, or a figure that does not add up — open it to see what.`} />
+        <SectionTitle title="Sectors" description={flights.loading ? 'Loading…' : `${flights.total} sector(s). A highlighted sector has something the crew phones disagreed on, or a figure that does not add up — open it to see what.`} />
         {!!flights.error && <Banner tone="danger" message={flights.error} />}
         {!online && <Banner tone="warning" message="Connect to load the sales." />}
         {flights.items.map((f) => (
@@ -270,15 +270,39 @@ function FlightDetail({ flightId, user, canEdit, online, onBack }) {
         </Card>
       )}
 
+      {!!summary?.diversions?.length && (
+        <Card style={{ borderColor: COLORS.warning, borderWidth: 1 }}>
+          <SectionTitle title="Diversion" />
+          {summary.diversions.map((d) => (
+            <View key={d.id} style={{ marginBottom: 6 }}>
+              <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.warning }}>
+                Planned {d.planned_destination} \u2192 diverted to {d.diverted_to}
+              </Text>
+              <Text style={styles.mono}>{d.reason} \u00b7 entered by {d.entered_by} \u00b7 {when(d.diverted_at || d.entered_at)}</Text>
+              {!!d.remarks && <RemarkLine text={d.remarks} />}
+            </View>
+          ))}
+        </Card>
+      )}
+
+      {!!summary?.crew?.length && (
+        <Card>
+          <SectionTitle title="Crew on this flight" description="As entered on board (duty group)." />
+          <View style={styles.wrap}>
+            {summary.crew.map((m) => <Pill key={m.crew_code} label={`${m.name} \u00b7 ${m.position} \u00b7 ${m.crew_code}`} tone="muted" />)}
+          </View>
+        </Card>
+      )}
+
       {!!diff && (diff.total > 0 || diff.conflicts.length > 0) && (
         <DifferencesCard diff={diff} canEdit={canEdit} onChanged={load} onMessage={setMessage} />
       )}
 
       {!!summary && (
         <Card>
-          <SectionTitle title="By iPad login" description="Each iPad on the sector and what it recorded. Tap one to see only its sales below." />
+          <SectionTitle title="By crew login" description="Each login on the sector, what it recorded and which products it sold. Tap one to see only its sales below." />
           <View style={[styles.wrap, styles.gap8]}>
-            <Chip label="All iPads" active={!device} onPress={() => setDevice('')} />
+            <Chip label="All logins" active={!device} onPress={() => setDevice('')} />
             {(summary.by_device || []).map((d) => (
               <Chip key={d.device} label={`${d.device} · ${npr(d.revenue_npr)}`} active={device === d.device} onPress={() => setDevice(device === d.device ? '' : d.device)} />
             ))}
@@ -288,6 +312,19 @@ function FlightDetail({ flightId, user, canEdit, online, onBack }) {
               {d.device}: {d.transactions} transaction(s), {d.units} unit(s), {npr(d.revenue_npr)} · first sale {when(d.first_sale)} · last sale {when(d.last_sale)}
             </Text>
           ))}
+          {!!(summary.by_device_product || []).length && (
+            <View style={{ marginTop: 8 }}>
+              {(summary.by_device || []).filter((d) => !device || d.device === device).map((d) => {
+                const lines = summary.by_device_product.filter((x) => x.device === d.device);
+                if (!lines.length) return null;
+                return (
+                  <Text key={`dp-${d.device}`} style={[styles.mono, { marginTop: 4 }]}>
+                    {d.device} sold: {lines.map((x) => `${x.product_name} \u00d7${x.units}`).join(', ')}
+                  </Text>
+                );
+              })}
+            </View>
+          )}
           {!!f?.devices?.length && (summary.by_device || []).length < f.devices.length && (
             <Text style={[styles.mono, { marginTop: 6 }]}>
               Assigned but no sales recorded: {f.devices.filter((d) => !(summary.by_device || []).some((x) => x.device === d)).join(', ')}
@@ -439,7 +476,11 @@ function FlightDetail({ flightId, user, canEdit, online, onBack }) {
 function DifferencesCard({ diff, canEdit, onChanged, onMessage }) {
   const [resolving, setResolving] = useState(null);   // conflict id
   const [remarks, setRemarks] = useState('');
-  const fieldLabel = { passengers: 'PAX load', aircraft: 'Aircraft' };
+  const fieldLabel = {
+    passengers: 'PAX load', aircraft: 'Aircraft', duty_group: 'Crew list (duty group)', stock_count: 'Remaining stock count',
+    stock_return: 'Returned stock count', oversell: 'Sold more than was loaded', payment_amount: 'Amount paid',
+  };
+  const applicable = (c) => c.field === 'passengers' || c.field === 'aircraft';
   const open = diff.conflicts.filter((c) => !c.resolved_at);
   const settled = diff.conflicts.filter((c) => c.resolved_at);
 
@@ -459,13 +500,13 @@ function DifferencesCard({ diff, canEdit, onChanged, onMessage }) {
     <Card style={{ borderColor: COLORS.warning, borderWidth: 1 }}>
       <SectionTitle
         title={`Differences (${diff.total})`}
-        description="Found when the iPads uploaded: values the two iPads disagreed on, forms both filled in, and stock figures that do not add up."
+        description="Found when the phones synced: values the crew entered differently, more sold than loaded, amounts paid that do not match, and stock figures that do not add up."
         right={<Pill label={diff.total ? 'CHECK' : 'SETTLED'} tone={diff.total ? 'warning' : 'success'} />}
       />
       {open.map((c) => (
         <View key={c.id} style={[styles.listRow, { backgroundColor: COLORS.warningSoft, borderRadius: 8, paddingHorizontal: 8 }]}>
           <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.warning }}>{fieldLabel[c.field] || c.field}</Text>
-          <Text style={styles.mono}>Kept: {c.kept_value} (entered by iPad {c.kept_by}) \u00b7 iPad {c.device} sent: {c.device_value} \u00b7 {when(c.created_at)}</Text>
+          <Text style={styles.mono}>Kept: {c.kept_value} (entered by {c.kept_by}) \u00b7 {c.device} sent: {c.device_value} \u00b7 {when(c.created_at)}</Text>
           {canEdit && resolving !== c.id && (
             <Button title="Settle this difference" tone="secondary" small style={{ marginTop: 6, alignSelf: 'flex-start' }} onPress={() => { setResolving(c.id); setRemarks(''); }} />
           )}
@@ -473,8 +514,14 @@ function DifferencesCard({ diff, canEdit, onChanged, onMessage }) {
             <View style={{ marginTop: 8 }}>
               <Field label="Remarks (mandatory)" value={remarks} onChangeText={setRemarks} multiline placeholder="e.g. load sheet confirms 160" />
               <View style={[styles.row, styles.gap8]}>
-                <Button title={`Keep ${c.kept_value}`} small style={styles.flex1} onPress={() => resolve(c, false)} disabled={!remarks.trim()} />
-                <Button title={`Use ${c.device_value} (iPad ${c.device})`} tone="warning" small style={styles.flex1} onPress={() => resolve(c, true)} disabled={!remarks.trim()} />
+                {applicable(c) ? (
+                  <>
+                    <Button title={`Keep ${c.kept_value}`} small style={styles.flex1} onPress={() => resolve(c, false)} disabled={!remarks.trim()} />
+                    <Button title={`Use ${c.device_value} (${c.device})`} tone="warning" small style={styles.flex1} onPress={() => resolve(c, true)} disabled={!remarks.trim()} />
+                  </>
+                ) : (
+                  <Button title="Checked — record it" small style={styles.flex1} onPress={() => resolve(c, false)} disabled={!remarks.trim()} />
+                )}
                 <Button title="Cancel" tone="ghost" small onPress={() => setResolving(null)} />
               </View>
             </View>

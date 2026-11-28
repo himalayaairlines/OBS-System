@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { Pressable, ScrollView, View } from 'react-native';
 import { Text, TextInput } from '../text';
 
@@ -7,19 +7,19 @@ import * as Sharing from 'expo-sharing';
 
 import { api, cached, downloadReport, readCache, writeCache } from '../api';
 import {
-  applyJournalToFlights, applyJournalToPosition, applyJournalToSector, buildLocalPosition, buildLocalSector,
-  amendQueuedReport, findLeg, journalLeg, legFinished, legStarted, loadProgress, readJournal, rootOf, tripAction,
+  applyJournalToFlights, applyJournalToSector, buildLocalSector, journalLeg, readJournal, tripAction,
 } from '../tripLocal';
 import { usePaged } from '../paging';
 import { confirm, notify } from '../dialog';
-import { COLORS, npr, styles, todayString } from '../theme';
+import { COLORS, styles, todayString } from '../theme';
 import {
-  Banner, Button, CalendarModal, Card, Field, Notice, OptionModal, PageHeader, Pagination, Pill,
+  Banner, Button, CalendarModal, Card, Chip, Field, Notice, OptionModal, PageHeader, Pagination, Pill,
   RemarkLine, SectionTitle, Select,
 } from '../ui';
+import { SectorStockList } from './StockCards';
 
 /*
- * The cabin reports filed after a sector.
+ * The cabin reports.
  *
  * The forms are not written into this screen. The server serves the schema of
  * each controlled form — its sections, headings and fields — and everything
@@ -31,14 +31,16 @@ const STATUS_TONE = {
   SUBMITTED: 'success',
   DRAFT: 'warning',
   NOT_STARTED: 'danger',
+  PENDING: 'danger',
   AWAITING_OTHER: 'info',
 };
 
 const STATUS_LABEL = {
-  SUBMITTED: 'SAVED',
-  DRAFT: 'DRAFT',
+  SUBMITTED: 'SUBMITTED',
+  DRAFT: 'SAVED · NOT SUBMITTED',
   NOT_STARTED: 'NOT FILLED',
-  AWAITING_OTHER: 'OTHER iPAD',
+  PENDING: 'PENDING',
+  AWAITING_OTHER: 'COLLEAGUE WILL FILL',
 };
 
 /* ------------------------------------------------------------------ */
@@ -232,19 +234,32 @@ function FormField({ field, value, onChange, readOnly, onPickDate }) {
   );
 }
 
+
 /* ------------------------------------------------------------------ */
 /* The screen                                                          */
 /* ------------------------------------------------------------------ */
-// A sector the iPad is working: selling now, or finished but not yet locked.
-// 7.12: judged by what THIS iPad has done (my_* flags), never by the other iPad.
-const crewSector = (f) => !f.trip_completed_at && !f.my_completed_at && !f.reports_locked_at && !f.my_forms_locked_at
-  && (legFinished(f) || (f.status === 'OPEN' && legStarted(f)));
+/*
+ * 7.18: the forms are outside the flight flow. A crew member picks any date
+ * and sector they flew, at any time (also after logging out and in again).
+ * Only one crew member needs to fill the forms: they save each form (a draft
+ * they can still change) and press "Final submit" once; the others press
+ * "Another crew member will fill these forms". After the final submission
+ * the forms are read-only for the crew; who submitted is in the audit log.
+ *
+ * Management / Admin / Inventory see the forms trip by trip
+ * ("KTM-DXB-KTM (date)") with every leg and form, and "Pending" where a form
+ * is still missing. Inventory reads only; Admin alone switches forms off.
+ */
+const sectorLabel = (s) => `${s.flight_number} · ${s.origin}-${s.destination} · ${s.flight_date}`;
 
-export default function ReportsScreen({ user, online, initialFlightId, onHandled, goTo }) {
-  const canReview = user.permissions?.includes('reports_review');
+export default function ReportsScreen({ user, online, initialFlightId, onHandled }) {
+  const perms = user.permissions || [];
+  const canReview = perms.includes('reports_review');
+  const isReader = !canReview && !perms.includes('flight_reports') && perms.includes('reports_view');
+  const isCrew = !canReview && !isReader;
 
   const [forms, setForms] = useState([]);
-  const [flights, setFlights] = useState([]);
+  const [sectors, setSectors] = useState([]);        // crew: every sector they flew
   const [flightId, setFlightId] = useState(initialFlightId || null);
   const [sector, setSector] = useState(null);       // reports_for_flight payload
   const [message, setMessage] = useState(null);
@@ -255,297 +270,133 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
   const [draft, setDraft] = useState({});
   const [editRemarks, setEditRemarks] = useState('');
   const [datePicker, setDatePicker] = useState(null);
-  // A report opened from Management's "Filed reports" list.
-  const [filedReport, setFiledReport] = useState(null);
+  const [filedReport, setFiledReport] = useState(null);   // opened from the trips list
 
-  // Management filters
+  // Filters
   const [filterDate, setFilterDate] = useState('');
   const [filterFlight, setFilterFlight] = useState('');
+  const [filterStatus, setFilterStatus] = useState('');
   const [filterCalendar, setFilterCalendar] = useState(false);
-  const [flightPicker, setFlightPicker] = useState(false);
+  const [sectorPicker, setSectorPicker] = useState(false);
+  const [expanded, setExpanded] = useState({});
 
   const form = forms.find((f) => f.type === openType) || null;
   const sectorReports = sector?.reports || [];
-  const outstanding = sector?.outstanding || [];
   const entry = sectorReports.find((r) => r.report_type === openType) || null;
-  const report = (filedReport && filedReport.report_type === openType ? filedReport : null)
-    || entry?.report || null;
-  // Something was changed on screen compared with the saved version.
-  const dirty = !!report && JSON.stringify(draft || {}) !== JSON.stringify(report.payload || {});
+  const report = (filedReport && filedReport.report_type === openType ? filedReport : null) || entry?.report || null;
+  const dirty = JSON.stringify(draft || {}) !== JSON.stringify(report?.payload || {});
+  const rootId = sector ? (sector.direction === 'RETURN' && sector.linked_flight_id ? sector.linked_flight_id : sector.flight_id) : null;
 
   /* ------------------------------ data ------------------------------ */
   const loadForms = useCallback(async () => {
-    const result = await cached('reportForms', '/report-forms');
-    setForms(result.data || []);
+    try {
+      const result = await cached('reportForms', '/report-forms');
+      setForms(result.data || []);
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
   }, []);
 
-  const loadFlights = useCallback(async () => {
-    const result = await cached('flights', '/flights');
-    const list = canReview ? (result.data || []) : applyJournalToFlights(result.data || [], await readJournal());
-    setFlights(list);
-    setFlightId((current) => {
-      if (current && list.some((f) => f.id === current)) return current;
-      // The crew care about the sector they are selling on or have just finished.
-      const open = list.filter((f) => crewSector(f));
-      if (!canReview) return (open.find((f) => legFinished(f)) || open[0])?.id ?? null;
-      const finished = list.filter((f) => f.status === 'FLOWN');
-      return finished[0]?.id ?? list[0]?.id ?? null;
-    });
-  }, []);
+  // Crew: the sectors they were rostered on, cached so the list also shows offline.
+  const loadSectors = useCallback(async () => {
+    if (!isCrew) return;
+    try {
+      const result = await cached('reportSectors', '/flight-reports/my-sectors', []);
+      let list = result.data || [];
+      // Sectors assigned since the last time online are in the flights cache.
+      const flights = applyJournalToFlights((await readCache('flights', [])) || [], await readJournal());
+      const known = new Set(list.map((s) => s.id));
+      flights.filter((f) => !known.has(f.id)).forEach((f) => list.push({
+        id: f.id, flight_number: f.flight_number, flight_date: f.flight_date, origin: f.origin,
+        destination: f.destination, direction: f.direction, trip_type: f.trip_type, linked_flight_id: f.linked_flight_id,
+        status: f.status, sector: `${f.origin}-${f.destination}`, offline: true,
+      }));
+      list = list.sort((a, b) => String(b.flight_date).localeCompare(String(a.flight_date)) || a.id - b.id);
+      setSectors(list);
+      setFlightId((current) => (current && list.some((s) => s.id === current) ? current
+        : (list.find((s) => s.flight_date === todayString()) || list[0])?.id ?? null));
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+  }, [isCrew]);
 
   // The server copy when there is one, otherwise the cached copy, otherwise a
-  // list built on the iPad; this iPad's own saves and hand-overs on top (7.12).
+  // list built on the phone; this phone's own saves on top.
   const loadSector = useCallback(async (id) => {
-    if (!id) return setSector(null);
+    if (!id || !isCrew) return setSector(null);
     try {
       const result = await cached(`sectorReports.${id}`, `/flights/${id}/reports`, null);
       let data = result.data || null;
-      if (!canReview) {
-        const journal = await readJournal();
-        if (!data) {
-          const flight = ((await readCache('flights', [])) || []).find((f) => f.id === id);
-          const defs = forms.length ? forms : ((await readCache('reportForms', [])) || []);
-          data = buildLocalSector(applyJournalToFlights(flight ? [flight] : [], journal)[0] || flight, defs, user.employee_id);
-        }
-        data = applyJournalToSector(data, journal, user.employee_id);
+      const journal = await readJournal();
+      if (!data) {
+        const flight = ((await readCache('flights', [])) || []).find((f) => f.id === id)
+          || sectors.find((s) => s.id === id);
+        const defs = forms.length ? forms : ((await readCache('reportForms', [])) || []);
+        data = flight ? buildLocalSector(flight, defs, user.employee_id) : null;
+      }
+      data = applyJournalToSector(data, journal, user.employee_id);
+      if (data) {
+        const known = sectors.find((s) => s.id === id);
+        if (known?.linked_flight_id) data = { ...data, linked_flight_id: known.linked_flight_id };
       }
       setSector(data);
       return data;
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
-  }, [canReview, forms, user.employee_id]);
+  }, [isCrew, forms, sectors, user.employee_id]);
 
-  // Where the trip stands for this iPad (needed for the final return card).
-  const [trip, setTrip] = useState(null);
-  useEffect(() => {
-    if (canReview || !flightId) return setTrip(null);
-    loadProgress(flightId, flights, online).then(setTrip).catch(() => setTrip(null));
-  }, [canReview, flightId, flights, online, sector]);
-  const rootId = rootOf(flights.find((f) => f.id === flightId));
+  // Management / Inventory / Admin: trip by trip, paged on the server.
+  const tripParts = [];
+  if (filterDate) tripParts.push(`date=${filterDate}`);
+  if (filterFlight.trim()) tripParts.push(`flight_number=${encodeURIComponent(filterFlight.trim())}`);
+  if (filterStatus) tripParts.push(`status=${filterStatus}`);
+  const tripPager = usePaged(`/flight-reports/trips${tripParts.length ? `?${tripParts.join('&')}` : ''}`, { enabled: !isCrew });
 
-  // Every report ever filed, so the management list is paged on the server.
-  const filedParts = [];
-  if (filterDate) filedParts.push(`date=${filterDate}`);
-  if (filterFlight) filedParts.push(`flight_number=${encodeURIComponent(filterFlight)}`);
-  const filedPager = usePaged(`/flight-reports${filedParts.length ? `?${filedParts.join('&')}` : ''}`, { enabled: canReview });
-  const filed = filedPager.items;
-  const loadFiled = filedPager.reload;
-
-  useEffect(() => { loadForms(); loadFlights(); }, [loadForms, loadFlights]);
-  useEffect(() => { loadSector(flightId); }, [flightId, loadSector]);
+  useEffect(() => { loadForms(); loadSectors(); }, [loadForms, loadSectors]);
+  useEffect(() => { if (isCrew) loadSector(flightId); }, [isCrew, flightId, loadSector]);
 
   /* --------------------------- open a form -------------------------- */
+  function seedFor(definition, info) {
+    const known = {
+      flight_number: info?.flight_number, flight_date: info?.flight_date, sector: info?.sector
+        || (info?.origin ? `${info.origin}-${info.destination}` : undefined),
+      origin: info?.origin, destination: info?.destination, aircraft: info?.aircraft, aircraft_type: info?.aircraft_type,
+    };
+    const seeded = {};
+    definition.sections.forEach((section) => section.fields.forEach((field) => {
+      if (field.prefill && known[field.prefill]) seeded[field.key] = known[field.prefill];
+    }));
+    return seeded;
+  }
+
   function openForm(reportType) {
     const definition = forms.find((f) => f.type === reportType);
     if (!definition) return;
-    const existing = sector?.reports?.find((r) => r.report_type === reportType)?.report;
-
-    if (existing) {
-      setDraft(existing.payload || {});
-    } else {
-      // Fill in what the system already knows so the crew do not key it twice.
-      const known = {
-        flight_number: sector?.flight_number,
-        flight_date: sector?.flight_date,
-        sector: sector?.sector,
-        origin: sector?.origin,
-        destination: sector?.destination,
-        aircraft: sector?.aircraft,
-        aircraft_type: sector?.aircraft_type,
-      };
-      const seeded = {};
-      definition.sections.forEach((section) => section.fields.forEach((field) => {
-        if (field.prefill && known[field.prefill]) seeded[field.key] = known[field.prefill];
-      }));
-      setDraft(seeded);
-    }
+    const existing = sectorReports.find((r) => r.report_type === reportType)?.report;
+    setDraft(existing ? (existing.payload || {}) : seedFor(definition, sector));
     setEditRemarks('');
+    setFiledReport(null);
     setOpenType(reportType);
   }
 
-  // The crew may fill in and change their sector's forms until they lock
-  // (second flight started, or whole flight finished). Changing a saved form
-  // needs remarks. Management may always correct, with remarks.
-  const locked = !!sector?.locked;
-  const crewEditingSaved = !canReview && report?.status === 'SUBMITTED';
-  const readOnly = useMemo(() => {
-    if (canReview) return false;
-    return locked;
-  }, [canReview, locked]);
-
-  function setValue(key, value) {
-    setDraft((current) => ({ ...current, [key]: value }));
-  }
-
-  /* --------------------------- submitting --------------------------- */
-  async function submitForm() {
-    const sure = await confirm({
-      title: 'Save this form?',
-      message: `${form.title} for ${sector.flight_number} ${sector.sector} is saved and sent to `
-        + 'Management.\n\nYou can still change it until the next flight is started or the whole '
-        + 'flight is finished; each change needs remarks.',
-      confirmText: 'Save',
-    });
-    if (!sure) return;
-
-    setBusy(true);
-    try {
-      const body = {
-        flight_id: sector.flight_id,
-        report_type: openType,
-        payload: draft,
-        submit: true,
-        client_ref: `RPT-${sector.flight_id}-${openType}-${Date.now().toString(36)}`,
-      };
-      let saved = null;
-      if (canReview) {
-        saved = await api('/flight-reports', { method: 'POST', body });
-      } else {
-        // The crew's form is saved on the iPad first and uploads on Wi-Fi if there is no signal (7.12).
-        const { result } = await tripAction({ endpoint: '/flight-reports', body, label: `${form.title}`, flightId: sector.flight_id });
-        saved = result;
-        await journalLeg(rootId, sector.flight_id, (leg) => ({
-          ...leg,
-          forms: { ...(leg.forms || {}), [openType]: 'mine' },
-          payloads: { ...(leg.payloads || {}), [openType]: draft },
-        }));
-      }
-      setOpenType(null);
-      await loadSector(sector.flight_id);
-      if (online) await loadFiled();
-      onHandled?.();
-      // No pop-up per form (7.11): the list shows what is saved, and the
-      // "Submit all forms" button at the bottom closes the set.
-      if (canReview && saved) {
-        setMessage({ tone: 'success', text: `${form.title} saved — ${saved.issue_label}, ${saved.rev_label}.` });
-      }
-    } catch (error) {
-      setMessage({ tone: 'danger', text: error.message });
+  async function openFiled(leg, item) {
+    if (!item.report_id) {
+      return notify({ title: `${item.title}: pending`, message: item.status === 'AWAITING_OTHER'
+        ? `Left to another crew member by ${item.deferred_by.join(', ')}. It has not been filled yet.`
+        : 'Nobody has filled this form for the sector yet.' });
     }
-    setBusy(false);
-  }
-
-  async function unsubmitForm() {
-    const sure = await confirm({
-      title: 'Pull this report back?',
-      message: 'You can do this once. After you submit it again the report is closed to '
-        + 'the iPad and only Management can change it.',
-      confirmText: 'Pull back',
-      tone: 'danger',
-    });
-    if (!sure) return;
-    setBusy(true);
     try {
-      await api(`/flight-reports/${report.id}/unsubmit`, { method: 'POST' });
-      await loadSector(sector.flight_id);
-      setMessage({ tone: 'info', text: `${form.title} is editable again. This was the only pull-back.` });
-    } catch (error) {
-      setMessage({ tone: 'danger', text: error.message });
-    }
-    setBusy(false);
-  }
-
-  async function saveCorrection(target) {
-    if (!editRemarks.trim()) {
-      return notify({
-        title: 'Remarks required',
-        message: 'Say why the report is being corrected. The remarks are kept with it.',
-      });
-    }
-    setBusy(true);
-    try {
-      if (target.local) {
-        // Saved on this iPad and not uploaded yet: the queued copy is simply replaced.
-        const stillQueued = await amendQueuedReport(sector.flight_id, openType, draft);
-        await journalLeg(rootId, sector.flight_id, (leg) => ({ ...leg, payloads: { ...(leg.payloads || {}), [openType]: draft } }));
-        if (!stillQueued) {
-          // It has uploaded in the meantime: a fresh copy has the server id to correct.
-          const fresh = await loadSector(sector.flight_id);
-          const uploaded = fresh?.reports?.find((r) => r.report_type === openType)?.report;
-          if (uploaded && !uploaded.local) return saveCorrection(uploaded);
-        }
-        setMessage({ tone: 'success', text: `Changes saved on this iPad. ${form.title} uploads on Wi-Fi.` });
-        setOpenType(null);
-        setEditRemarks('');
-        await loadSector(flightId);
-        setBusy(false);
-        return;
-      }
-      const saved = await api(`/flight-reports/${target.id}`, {
-        method: 'PUT',
-        body: { payload: draft, remarks: editRemarks.trim() },
-      });
-      setMessage({ tone: 'success', text: canReview
-        ? `Correction saved — now ${saved.rev_label}.`
-        : `Changes saved — now ${saved.rev_label}. Management can see them.` });
-      setOpenType(null);
-      setFiledReport(null);
+      const r = await api(`/flight-reports/${item.report_id}`);
+      setSector({ flight_id: leg.id, flight_number: leg.flight_number, flight_date: leg.flight_date, origin: leg.origin,
+        destination: leg.destination, sector: leg.sector, duty_group_label: r.duty_group_label });
+      setFiledReport(r);
+      setDraft(r.payload || {});
       setEditRemarks('');
-      await loadSector(flightId);
-      await loadFiled();
+      setOpenType(r.report_type);
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
-    setBusy(false);
-  }
-
-  /** All forms handled: one confirmation at the end, then on to the Sales page. */
-  async function submitAllForms() {
-    const roundFirst = sector.trip_type === 'ROUND_TRIP' && sector.segment === 1;
-    const go = await confirm({
-      title: 'All forms handled',
-      message: `All forms for ${sector.sector} are saved and sent to Management.\n\n`
-        + (roundFirst
-          ? 'Next: go to the Sales page and press \u201cStart second flight\u201d.'
-          : 'Next: press \u201cFinish whole flight\u201d on the Sales page.'),
-      confirmText: 'Go to Sales',
-      cancelText: 'Later',
-    });
-    if (go) goTo?.('crew');
-  }
-
-  /** "Submitted by the other iPad" (7.11): this device leaves the form to the other one. */
-  async function deferForm(item) {
-    const sure = await confirm({
-      title: 'Submitted by the other iPad?',
-      message: `${item.title} will be left to ${item.other_device || 'the other iPad'}. It counts as handled for this trip; `
-        + 'it shows as SAVED once that iPad uploads it, and Management sees it as awaiting the other iPad until then.',
-      confirmText: 'Yes, the other iPad has it',
-    });
-    if (!sure) return;
-    try {
-      await tripAction({ endpoint: '/flight-reports/defer', body: { flight_id: sector.flight_id, report_type: item.report_type },
-        label: `${item.title}: other iPad`, flightId: sector.flight_id });
-      await journalLeg(rootId, sector.flight_id, (leg) => ({ ...leg, forms: { ...(leg.forms || {}), [item.report_type]: 'other' } }));
-      await loadSector(sector.flight_id);
-    } catch (error) {
-      setMessage({ tone: 'danger', text: error.message });
-    }
-  }
-
-  async function undeferForm(reportType) {
-    try {
-      await tripAction({ method: 'DELETE', endpoint: `/flight-reports/defer?flight_id=${sector.flight_id}&report_type=${encodeURIComponent(reportType)}`,
-        label: 'Take a form back', flightId: sector.flight_id });
-      await journalLeg(rootId, sector.flight_id, (leg) => {
-        const forms = { ...(leg.forms || {}) };
-        if (forms[reportType] === 'other') delete forms[reportType];
-        return { ...leg, forms };
-      });
-      await writeCache(`sectorReports.${sector.flight_id}`, null);
-      await loadSector(sector.flight_id);
-    } catch (error) {
-      setMessage({ tone: 'danger', text: error.message });
-    }
-  }
-
-  function openFiled(r) {
-    setFiledReport(r);
-    setFlightId(r.flight_id);
-    setDraft(r.payload || {});
-    setEditRemarks('');
-    setOpenType(r.report_type);
   }
 
   function closeForm() {
@@ -554,37 +405,127 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     setEditRemarks('');
   }
 
-  /** Moved here from the Sales page (7.9): the sector is finished right above its forms. */
-  async function finishFlight() {
-    if (!sector) return;
-    const roundFirst = sector.trip_type === 'ROUND_TRIP' && sector.segment === 1;
+  // Crew: editable until the final submission. Management: corrections with
+  // remarks. Inventory: read only.
+  const readOnly = isReader || (isCrew && (report?.status === 'SUBMITTED' || sector?.read_only));
+
+  function setValue(key, value) {
+    setDraft((current) => ({ ...current, [key]: value }));
+  }
+
+  /* ----------------------------- crew ------------------------------- */
+  async function refreshAfter(result) {
+    if (result && result.flight_id) await writeCache(`sectorReports.${result.flight_id}`, result);
+    await loadSector(sector.flight_id);
+    if (online) await loadSectors();
+    onHandled?.();
+  }
+
+  /** Save one form as a draft. It can still be changed until the final submit. */
+  async function saveDraft() {
+    setBusy(true);
+    try {
+      const body = {
+        flight_id: sector.flight_id, report_type: openType, payload: draft, submit: false,
+        client_ref: `RPT-${sector.flight_id}-${openType}-${Date.now().toString(36)}`,
+      };
+      // Saved on the phone first; it uploads on Wi-Fi if there is no signal.
+      const { queued } = await tripAction({ endpoint: '/flight-reports', body, label: `${form.title} (saved)`, flightId: sector.flight_id });
+      await journalLeg(rootId, sector.flight_id, (leg) => ({
+        ...leg,
+        forms: { ...(leg.forms || {}), [openType]: 'draft' },
+        payloads: { ...(leg.payloads || {}), [openType]: draft },
+      }));
+      setOpenType(null);
+      await loadSector(sector.flight_id);
+      setMessage({ tone: 'success', text: `${form.title} saved${queued ? ' on this phone (uploads on Wi-Fi)' : ''}. `
+        + 'You can still change it. Press “Final submit” when all forms are done.' });
+      onHandled?.();
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+    setBusy(false);
+  }
+
+  async function finalSubmit() {
+    const drafts = sectorReports.filter((r) => r.status === 'DRAFT');
+    const missing = sectorReports.filter((r) => r.status !== 'SUBMITTED' && r.status !== 'DRAFT');
     const sure = await confirm({
-      title: 'Finish this flight?',
-      message: `${sector.flight_number} ${sector.sector} will be finished.\n\n`
-        + 'No further sale can be recorded on this sector and it cannot be reopened. '
-        + 'The sales already recorded are kept.'
-        + (roundFirst ? '\n\nThe returning crew will enter their own names before selling.' : ''),
-      confirmText: 'Finish this flight',
+      title: 'Final submit?',
+      message: `${drafts.map((d) => d.title).join(', ')} for ${sectorLabel(sector)} will be submitted to Management.\n\n`
+        + 'After this they can no longer be changed by the crew. Your name is recorded as the submitter.'
+        + (missing.length ? `\n\nNot filled yet (stay pending): ${missing.map((m) => m.title).join(', ')}.` : ''),
+      confirmText: 'Final submit',
       tone: 'danger',
     });
     if (!sure) return;
     setBusy(true);
     try {
-      const { result, queued } = await tripAction({ method: 'PUT', endpoint: `/flights/${sector.flight_id}/finish`,
-        label: `Finish ${sector.flight_number} ${sector.sector}`, flightId: sector.flight_id });
-      await journalLeg(rootId, sector.flight_id, { finished_at: new Date().toISOString() });
-      await loadFlights();
-      await loadSector(sector.flight_id);
-      const left = result ? (result.reports_outstanding ?? 0) : outstanding.length;
-      await notify({
-        title: 'Sector finished',
-        message: (result ? `${sector.flight_number}: ${result.transactions} transaction(s), ${npr(result.revenue_npr)}.` 
-          : `${sector.flight_number} is finished on this iPad. (No signal: this uploads with the sales on Wi-Fi.)`)
-          + '\n\nNext, in order: 1) confirm the remaining stock on this iPad, 2) see the commission, 3) the forms'
-          + (left ? ` (${left} still to handle on this sector)` : ' (all already saved)')
-          + ', then the final step on the Sales page.',
+      const { result, queued } = await tripAction({ endpoint: '/flight-reports/final-submit', body: { flight_id: sector.flight_id },
+        label: `Final submit ${sector.flight_number} ${sector.sector}`, flightId: sector.flight_id });
+      await journalLeg(rootId, sector.flight_id, (leg) => {
+        const marks = { ...(leg.forms || {}) };
+        drafts.forEach((d) => { marks[d.report_type] = 'mine'; });
+        return { ...leg, forms: marks };
       });
-      if (queued) onHandled?.();
+      await refreshAfter(result);
+      setMessage({ tone: 'success', text: queued
+        ? 'Final submission saved on this phone. It uploads on Wi-Fi.'
+        : 'Forms submitted to Management. They are now read-only.' });
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+    setBusy(false);
+  }
+
+  async function leaveToColleague() {
+    const sure = await confirm({
+      title: 'Another crew member will fill these forms?',
+      message: `You will not fill the forms of ${sectorLabel(sector)}. They stay pending until the colleague submits them.`,
+      confirmText: 'Yes, another crew member will',
+    });
+    if (!sure) return;
+    setBusy(true);
+    try {
+      const { result } = await tripAction({ endpoint: '/flight-reports/defer-all', body: { flight_id: sector.flight_id },
+        label: `Forms left to a colleague · ${sector.flight_number}`, flightId: sector.flight_id });
+      await journalLeg(rootId, sector.flight_id, { defer_all_at: new Date().toISOString() });
+      await refreshAfter(result);
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+    setBusy(false);
+  }
+
+  async function takeBack() {
+    setBusy(true);
+    try {
+      const { result } = await tripAction({ method: 'DELETE', endpoint: `/flight-reports/defer-all?flight_id=${sector.flight_id}`,
+        label: `Take the forms back · ${sector.flight_number}`, flightId: sector.flight_id });
+      await journalLeg(rootId, sector.flight_id, (leg) => {
+        const marks = { ...(leg.forms || {}) };
+        Object.keys(marks).forEach((k) => { if (marks[k] === 'other') delete marks[k]; });
+        return { ...leg, forms: marks, defer_all_at: null };
+      });
+      if (!result) await writeCache(`sectorReports.${sector.flight_id}`, null);
+      await refreshAfter(result);
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+    setBusy(false);
+  }
+
+  /* -------------------------- management ---------------------------- */
+  async function saveCorrection() {
+    if (!editRemarks.trim()) {
+      return notify({ title: 'Remarks required', message: 'Say why the report is being corrected. The remarks are kept with it.' });
+    }
+    setBusy(true);
+    try {
+      const saved = await api(`/flight-reports/${report.id}`, { method: 'PUT', body: { payload: draft, remarks: editRemarks.trim() } });
+      setMessage({ tone: 'success', text: `Correction saved — now ${saved.rev_label}.` });
+      closeForm();
+      await tripPager.reload();
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
@@ -599,7 +540,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     }
   }
 
-  /* ------------------------------ view ------------------------------ */
+  /* --------------------------- form view ---------------------------- */
   if (openType && form) {
     const footerDate = report?.report_date || todayString();
     return (
@@ -624,14 +565,13 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
             <Pill label={sector?.sector || ''} tone="muted" />
             <Pill label={sector?.flight_date || ''} tone="muted" />
             {!!sector?.duty_group_label && <Pill label={sector.duty_group_label} tone="muted" />}
-            {!!report && (
-              <Pill label={STATUS_LABEL[report.status] || report.status}
-                    tone={STATUS_TONE[report.status] || 'muted'} />
-            )}
+            {!!report && <Pill label={STATUS_LABEL[report.status] || report.status} tone={STATUS_TONE[report.status] || 'muted'} />}
           </View>
-          {!!form.statement && (
-            <Text style={[styles.mono, { marginTop: 8 }]}>{form.statement}</Text>
+          {!!form.statement && <Text style={[styles.mono, { marginTop: 8 }]}>{form.statement}</Text>}
+          {isCrew && report?.status === 'SUBMITTED' && (
+            <Banner tone="info" message={`Final submitted${report.submitted_by ? ` by ${report.submitted_by}` : ''}. Read only; ask Management if something needs correcting.`} />
           )}
+          {isReader && <Banner tone="info" message="Read only. Management corrects forms; Admin switches forms on or off." />}
         </Card>
 
         {form.sections.map((section) => (
@@ -651,15 +591,17 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
         ))}
 
         <Card>
-          <SectionTitle
-            title="Form control"
-            description="Issue and revision numbers are allocated by the system. The date is the day the form is filled."
-          />
+          <SectionTitle title="Form control" description="Issue and revision numbers are allocated by the system. The date is the day the form is filled." />
           <View style={styles.wrap}>
-            <Pill label={report ? report.issue_label : 'Issue: allocated on submit'} tone="muted" />
-            <Pill label={report ? report.rev_label : 'Rev. 00'} tone="muted" />
+            <Pill label={report?.issue_label || 'Issue: allocated on save'} tone="muted" />
+            <Pill label={report?.rev_label || 'Rev. 00'} tone="muted" />
             <Pill label={`Date: ${footerDate}`} tone="muted" />
           </View>
+          {!!report?.submitted_by && report.status === 'SUBMITTED' && (
+            <Text style={[styles.mono, { marginTop: 6 }]}>
+              Submitted by {report.submitted_by}{report.submitted_at ? ` · ${String(report.submitted_at).replace('T', ' ').slice(0, 16)}` : ''}
+            </Text>
+          )}
           {!!report?.edit_remarks && (
             <RemarkLine label={`Last correction by ${report.edited_by}`} text={report.edit_remarks} style={{ marginTop: 8 }} />
           )}
@@ -668,7 +610,7 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
               {report.revisions.map((rev, i) => (
                 <View key={i}>
                   <Text style={styles.mono}>
-                    Rev {String(rev.rev_no).padStart(2, '0')} · {rev.action.toLowerCase()} by{' '}
+                    Rev {String(rev.rev_no).padStart(2, '0')} · {String(rev.action || '').toLowerCase()} by{' '}
                     {rev.changed_by} · {String(rev.changed_at || '').replace('T', ' ').slice(0, 16)}
                   </Text>
                   {!!rev.remarks && <RemarkLine text={rev.remarks} style={{ marginTop: 2, marginBottom: 4 }} />}
@@ -678,83 +620,42 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
           )}
         </Card>
 
-        {report && report.status === 'SUBMITTED' && (canReview ? dirty : !locked) && (
+        {canReview && !!report && dirty && (
           <Card>
-            <SectionTitle
-              title={canReview ? 'Correct this report' : 'Change this saved form'}
-              description="The saved version is kept. Remarks are mandatory and stay with the report."
-            />
-            <Field
-              label="Remarks (mandatory)"
-              value={editRemarks}
-              onChangeText={setEditRemarks}
-              multiline
-              placeholder="Why is this being corrected?"
-            />
-            {!canReview && (
-              <Button
-                title={busy ? 'Saving…' : 'Save changes'}
-                onPress={() => saveCorrection(report)}
-                disabled={busy || (!online && !report.local) || !dirty}
-              />
-            )}
+            <SectionTitle title="Correct this report" description="The saved version is kept. Remarks are mandatory and stay with the report." />
+            <Field label="Remarks (mandatory)" value={editRemarks} onChangeText={setEditRemarks} multiline placeholder="Why is this being corrected?" />
           </Card>
         )}
 
         <Card>
           <View style={[styles.row, styles.gap8]}>
-            {canReview && report?.status === 'SUBMITTED' ? (
+            {canReview ? (
               dirty ? (
                 <>
-                  <Button
-                    title="Discard changes"
-                    tone="ghost"
-                    style={styles.flex1}
-                    onPress={() => { setDraft(report.payload || {}); setEditRemarks(''); }}
-                  />
-                  <Button
-                    title={busy ? 'Saving…' : 'Save correction'}
-                    tone="primary"
-                    style={styles.flex1}
-                    onPress={() => saveCorrection(report)}
-                    disabled={busy || !online || !editRemarks.trim()}
-                  />
+                  <Button title="Discard changes" tone="ghost" style={styles.flex1}
+                    onPress={() => { setDraft(report?.payload || {}); setEditRemarks(''); }} />
+                  <Button title={busy ? 'Saving…' : 'Save correction'} tone="primary" style={styles.flex1}
+                    onPress={saveCorrection} disabled={busy || !online || !editRemarks.trim() || !report} />
                 </>
               ) : (
                 <Button title="Close" tone="ghost" style={styles.flex1} onPress={closeForm} />
               )
             ) : (
-              <Button
-                title={dirty ? 'Discard changes' : 'Cancel'}
-                tone="ghost"
-                style={styles.flex1}
-                onPress={closeForm}
-              />
+              <>
+                <Button title={!readOnly && dirty ? 'Discard changes' : 'Close'} tone="ghost" style={styles.flex1} onPress={closeForm} />
+                {!readOnly && (
+                  <Button title={busy ? 'Saving…' : 'Save'} tone="primary" style={styles.flex1} onPress={saveDraft} disabled={busy} />
+                )}
+              </>
             )}
-            {!readOnly && !crewEditingSaved && !(canReview && report?.status === 'SUBMITTED') && (
-              <Button
-                title={busy ? 'Saving…' : 'Save'}
-                tone="primary"
-                style={styles.flex1}
-                onPress={submitForm}
-                disabled={busy || (!online && canReview)}
-              />
-            )}
-
           </View>
-          {!online && (
+          {isCrew && !readOnly && (
             <Text style={[styles.mono, { marginTop: 8 }]}>
-              {canReview
-                ? 'Corrections need a connection.'
-                : 'No signal: the form is saved on this iPad and uploads with the sales on Wi-Fi.'}
+              {online ? 'Saving keeps this form editable. Press “Final submit” on the list when every form is done.'
+                : 'No signal: the form is saved on this phone and uploads on Wi-Fi.'}
             </Text>
           )}
-          {locked && !canReview && (
-            <Text style={[styles.mono, { marginTop: 8 }]}>
-              These forms are locked because the next flight was started or the whole flight
-              was finished. Ask Management if something still needs changing.
-            </Text>
-          )}
+          {canReview && !online && <Text style={[styles.mono, { marginTop: 8 }]}>Corrections need a connection.</Text>}
         </Card>
 
         <CalendarModal
@@ -768,233 +669,188 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
     );
   }
 
-  // Management see every finished sector; the crew only the ones still open to them.
-  const sellable = canReview
-    ? flights.filter((f) => f.status !== 'OPEN')
-    : flights.filter(crewSector);
-  const segmentTitle = !sector ? 'Forms'
-    : sector.trip_type === 'ROUND_TRIP'
-      ? `${sector.flight_status === 'OPEN' ? '' : '3. '}Forms (${sector.segment === 2 ? 'second' : 'first'} segment) · ${sector.sector}`
-      : `${sector.flight_status === 'OPEN' ? '' : '3. '}Forms · ${sector.sector}`;
+  /* ---------------------------- crew view --------------------------- */
+  if (isCrew) {
+    const shown = filterDate ? sectors.filter((s) => s.flight_date === filterDate) : sectors;
+    const drafts = sectorReports.filter((r) => r.status === 'DRAFT');
+    const open = sectorReports.filter((r) => r.status !== 'SUBMITTED');
+    const allDone = !!sectorReports.length && !open.length;
+    const leftByMe = !!sector?.left_to_others || sectorReports.some((r) => r.deferred_by_me);
+    return (
+      <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
+        <PageHeader title="Reports" description="Fill the cabin forms any time: choose the date and sector. Only one crew member needs to fill them." />
+        {message && <Notice message={message} />}
 
-  return (
-    <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
-      <PageHeader
-        title="Reports"
-        description={canReview
-          ? 'Cabin reports filed by the crew after each sector.'
-          : 'Complete these after finishing a sector. Each crew files its own set.'}
-      />
-      {message && <Notice message={message} />}
-
-      {!canReview && (
-      <Card>
-        <SectionTitle
-          title="Sector"
-          description="Reports belong to the crew that worked the sector, so each sector of a round trip has its own set."
-        />
-        <Select
-          label="Flight"
-          valueLabel={sector ? `${sector.flight_number} · ${sector.sector} · ${sector.flight_date}` : ''}
-          placeholder={sellable.length ? 'Select a finished sector'
-            : canReview ? 'No finished sector yet' : 'No forms to fill in right now'}
-          onPress={() => setFlightPicker(true)}
-        />
-        {!!sector && (
-          <>
-            <View style={[styles.wrap, { marginBottom: 6 }]}>
-              <Pill label={sector.direction} tone="info" />
-              {!!sector.duty_group_label && <Pill label={sector.duty_group_label} tone="muted" />}
-              {!!sector.aircraft_type && <Pill label={sector.aircraft_type} tone="muted" />}
-              <Pill
-                label={outstanding.length
-                  ? `${outstanding.length} still to fill in`
-                  : 'All forms saved'}
-                tone={outstanding.length ? 'warning' : 'success'}
-              />
-            </View>
-            {sector.flight_status === 'OPEN' && (
-              <Banner
-                tone="info"
-                message="This sector is still selling. The forms can be filled in now or after you finish it; anything still open is reminded at finish."
-              />
-            )}
-          </>
-        )}
-      </Card>
-
-      )}
-
-      {!canReview && !!sector && sector.flight_status === 'OPEN' && (
         <Card>
-          <SectionTitle
-            title="Finish this flight"
-            description="Press this when the sector is over. Selling stops on this sector and the forms below open for filling in."
-          />
-          <Button
-            title={busy ? 'Finishing\u2026' : `Finish this flight \u00b7 ${sector.flight_number} ${sector.sector}`}
-            tone="warning"
-            onPress={finishFlight}
-            disabled={busy}
-          />
-          {!online && <Text style={[styles.mono, { marginTop: 6 }]}>No signal: the step is saved on this iPad and uploads on Wi-Fi.</Text>}
-        </Card>
-      )}
-
-      {!canReview && !!sector && sector.flight_status !== 'OPEN' && (
-        sector.trip_type === 'ROUND_TRIP' && sector.segment === 1 ? (
-          <SectorStockCard flightId={sector.flight_id} rootId={rootId} online={online} locked={locked} goTo={goTo} user={user}
-            flight={flights.find((f) => f.id === sector.flight_id)} onChanged={() => loadSector(sector.flight_id)} />
-        ) : (
-          <FinalReturnCard trip={trip} goTo={goTo} user={user} />
-        )
-      )}
-
-      {!canReview && !!sector && sector.flight_status !== 'OPEN' && (
-        <CommissionCard flightId={sector.flight_id} online={online} user={user} />
-      )}
-
-      {!canReview && !!sector && !!sectorReports.length && (
-        <Card>
-          <SectionTitle
-            title={segmentTitle}
-            description={sector.locked
-              ? 'Locked: the next flight was started or the whole flight was finished.'
-              : 'Tap a form to fill it in, before or after the sector is finished. Saved forms go to Management straight away.'}
-          />
-          {sectorReports.map((item) => {
-            const r = item.report;
-            return (
-              <Pressable
-                key={item.report_type}
-                onPress={() => openForm(item.report_type)}
-                style={[styles.listRow, { paddingVertical: 12 }]}
-              >
-                <View style={styles.rowBetween}>
-                  <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text, flex: 1 }}>
-                    {item.title}
-                  </Text>
-                  <Pill
-                    label={STATUS_LABEL[item.status] || item.status}
-                    tone={STATUS_TONE[item.status] || 'muted'}
-                  />
-                </View>
-                <Text style={styles.mono}>
-                  {item.form_code} · {item.manual}
-                  {r ? ` · ${r.issue_label} · ${r.rev_label} · ${r.report_date}` : ''}
-                  {item.status === 'AWAITING_OTHER' ? ` · marked as submitted by ${item.other_device || 'the other iPad'}` : ''}
-                </Text>
-                {!sector.locked && item.status !== 'SUBMITTED' && sector.flight_status !== 'OPEN' && (
-                  <View style={[styles.row, styles.gap8, { marginTop: 6 }]}>
-                    {item.status === 'AWAITING_OTHER' && item.deferred_by_me ? (
-                      <Button title="Take it back on this iPad" tone="ghost" small onPress={() => undeferForm(item.report_type)} />
-                    ) : item.status !== 'AWAITING_OTHER' ? (
-                      <>
-                        <Button title="Fill in on this iPad" tone="secondary" small onPress={() => openForm(item.report_type)} />
-                        <Button title={`Submitted by ${item.other_device || 'the other iPad'}`} tone="ghost" small onPress={() => deferForm(item)} />
-                      </>
-                    ) : null}
-                  </View>
-                )}
-              </Pressable>
-            );
-          })}
-          {!!(sector.awaiting_other || []).length && (
-            <Banner tone="info" message={`${sector.awaiting_other.length} form(s) are marked as submitted by the other iPad. They turn to SAVED when that iPad uploads them.`} />
-          )}
-          {sector.flight_status !== 'OPEN' && !sector.locked && (
-            <Button
-              title={outstanding.length ? `Submit all forms (${outstanding.length} still to handle)` : 'Submit all forms'}
-              tone="primary"
-              style={{ marginTop: 12 }}
-              disabled={!!outstanding.length}
-              onPress={submitAllForms}
-            />
-          )}
-        </Card>
-      )}
-
-      {canReview && user.permissions?.includes('users') && <FormsVisibilityCard />}
-
-      {canReview && <SectorStockList />}
-
-      {canReview && (
-        <Card>
-          <SectionTitle
-            title="Filed reports"
-            description="Filter by date and flight. Open a report to read it or correct it."
-          />
+          <SectionTitle title="Date and sector" description="Every sector you were rostered on is listed, also after the flight is over." />
           <View style={[styles.row, styles.gap8]}>
             <View style={styles.flex1}>
-              <Select
-                label="Date"
-                valueLabel={filterDate}
-                placeholder="Any date"
-                onPress={() => setFilterCalendar(true)}
-              />
+              <Select label="Date" valueLabel={filterDate} placeholder="Any date" onPress={() => setFilterCalendar(true)} />
             </View>
             <View style={styles.flex1}>
-              <Field
-                label="Flight number"
-                value={filterFlight}
-                onChangeText={setFilterFlight}
-                autoCapitalize="characters"
-                placeholder="Any flight"
-              />
+              <Select label="Sector" valueLabel={sector ? sectorLabel(sector) : ''}
+                placeholder={shown.length ? 'Select a sector' : 'No sector on this date'} onPress={() => setSectorPicker(true)} />
             </View>
           </View>
-          {(!!filterDate || !!filterFlight) && (
-            <Button
-              title="Clear filters"
-              tone="ghost"
-              small
-              onPress={() => { setFilterDate(''); setFilterFlight(''); }}
-            />
+          {!!filterDate && <Button title="Any date" tone="ghost" small onPress={() => setFilterDate('')} />}
+          {!!sector && (
+            <View style={[styles.wrap, { marginTop: 6 }]}>
+              <Pill label={sector.direction || ''} tone="info" />
+              {!!sector.duty_group_label && <Pill label={sector.duty_group_label} tone="muted" />}
+              <Pill label={allDone ? 'All forms submitted' : `${open.length} not submitted`} tone={allDone ? 'success' : 'warning'} />
+              {!!drafts.length && <Pill label={`${drafts.length} saved, not submitted`} tone="warning" />}
+            </View>
           )}
-
-          {filed.map((r) => (
-            <Pressable
-              key={r.id}
-              onPress={() => openFiled(r)}
-              style={[styles.listRow, { paddingVertical: 12 }]}
-            >
-              <View style={styles.rowBetween}>
-                <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text, flex: 1 }}>
-                  {r.title}
-                </Text>
-                <Pill label={`${r.issue_label} · ${r.rev_label}`} tone="muted" />
-              </View>
-              <Text style={styles.mono}>
-                {r.flight_number} · {r.origin}→{r.destination} · {r.flight_date}
-                {r.duty_group_label ? ` · ${r.duty_group_label}` : ''}
-                {' · filed by '}{r.submitted_by || r.created_by}
-                {r.edited_by ? ` · corrected by ${r.edited_by}` : ''}
-              </Text>
-              {!!r.edit_remarks && <RemarkLine label={`Corrected by ${r.edited_by}`} text={r.edit_remarks} />}
-            </Pressable>
-          ))}
-          {!!filedPager.error && <Banner tone="danger" message={filedPager.error} />}
-          {!filed.length && !filedPager.loading && (
-            <Text style={styles.empty}>
-              No reports match. Reports appear here as soon as a crew files them.
-            </Text>
-          )}
-          <Pagination pager={filedPager} label="reports" />
         </Card>
-      )}
 
-      <OptionModal
-        visible={flightPicker}
-        title="Select sector"
-        options={sellable.map((f) => ({
-          value: f.id,
-          label: `${f.flight_number} · ${f.origin}→${f.destination}`,
-          sub: `${f.flight_date} · ${f.direction} · ${f.status}`,
-        }))}
-        selectedValue={flightId}
-        onSelect={(value) => { setFlightId(value); setFlightPicker(false); }}
-        onClose={() => setFlightPicker(false)}
-      />
+        {!!sector && !!sectorReports.length && (
+          <Card>
+            <SectionTitle title={`Forms · ${sector.sector}`}
+              description="Tap a form, fill it in and save it. Saved forms can still be changed until the final submit." />
+            {leftByMe && !allDone && (
+              <Banner tone="info" message="You left these forms to another crew member. They stay pending until that colleague submits them." />
+            )}
+            {sectorReports.map((item) => {
+              const r = item.report;
+              const status = item.status === 'NOT_STARTED' ? 'NOT_STARTED' : item.status;
+              return (
+                <Pressable key={item.report_type} onPress={() => openForm(item.report_type)} style={[styles.listRow, { paddingVertical: 12 }]}>
+                  <View style={styles.rowBetween}>
+                    <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text, flex: 1 }}>{item.title}</Text>
+                    <Pill label={STATUS_LABEL[status] || status} tone={STATUS_TONE[status] || 'muted'} />
+                  </View>
+                  <Text style={styles.mono}>
+                    {item.form_code}
+                    {r && r.status === 'SUBMITTED' && r.submitted_by ? ` · submitted by ${r.submitted_by}` : ''}
+                    {r && r.status === 'DRAFT' ? ' · saved, can still be changed' : ''}
+                    {item.status === 'AWAITING_OTHER' ? ' · another crew member will fill it' : ''}
+                  </Text>
+                </Pressable>
+              );
+            })}
+            {!allDone && (
+              <View style={{ marginTop: 12 }}>
+                <Button
+                  title={busy ? 'Submitting…' : drafts.length ? `Final submit (${drafts.length} saved form${drafts.length > 1 ? 's' : ''})` : 'Final submit'}
+                  tone="primary" onPress={finalSubmit} disabled={busy || !drafts.length} />
+                {!drafts.length && <Text style={[styles.mono, { marginTop: 4 }]}>Save at least one form first.</Text>}
+                {leftByMe ? (
+                  <Button title="I will fill them after all" tone="ghost" style={{ marginTop: 8 }} onPress={takeBack} disabled={busy} />
+                ) : (
+                  <Button title="Another crew member will fill these forms" tone="secondary" style={{ marginTop: 8 }}
+                    onPress={leaveToColleague} disabled={busy} />
+                )}
+              </View>
+            )}
+            {!online && <Text style={[styles.mono, { marginTop: 8 }]}>No signal: everything is saved on this phone and uploads on Wi-Fi.</Text>}
+          </Card>
+        )}
+        {!sector && <Text style={styles.empty}>{sectors.length ? 'Select a sector.' : 'No sector has been assigned to you yet.'}</Text>}
+
+        <OptionModal
+          visible={sectorPicker}
+          title="Select sector"
+          options={shown.map((s) => ({
+            value: s.id,
+            label: `${s.flight_number} · ${s.origin}→${s.destination}`,
+            sub: `${s.flight_date} · ${s.direction}${s.total ? ` · ${s.submitted}/${s.total} submitted` : ''}${s.left_to_others ? ' · left to colleague' : ''}`,
+          }))}
+          selectedValue={flightId}
+          onSelect={(value) => { setFlightId(value); setSectorPicker(false); }}
+          onClose={() => setSectorPicker(false)}
+        />
+        <CalendarModal
+          visible={filterCalendar}
+          title="Filter by date"
+          value={filterDate || todayString()}
+          allowClear
+          onSelect={(value) => { setFilterDate(value || ''); setFilterCalendar(false); }}
+          onClose={() => setFilterCalendar(false)}
+        />
+      </ScrollView>
+    );
+  }
+
+  /* ----------------------- management / inventory ------------------- */
+  const trips = tripPager.items || [];
+  return (
+    <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
+      <PageHeader title="Reports" description={isReader
+        ? 'Cabin forms trip by trip. Read only.'
+        : 'Cabin forms trip by trip. Open a form to read or correct it.'} />
+      {message && <Notice message={message} />}
+
+      {perms.includes('users') && <FormsVisibilityCard />}
+
+      <Card>
+        <SectionTitle title="Forms by trip" description="Each trip with its legs and forms. Pending = not submitted yet." />
+        <View style={[styles.row, styles.gap8]}>
+          <View style={styles.flex1}>
+            <Select label="Date" valueLabel={filterDate} placeholder="Any date" onPress={() => setFilterCalendar(true)} />
+          </View>
+          <View style={styles.flex1}>
+            <Field label="Flight number" value={filterFlight} onChangeText={setFilterFlight} autoCapitalize="characters" placeholder="Any flight" />
+          </View>
+        </View>
+        <View style={[styles.wrap, { marginBottom: 6 }]}>
+          {[['', 'All'], ['PENDING', 'With pending forms'], ['COMPLETE', 'Complete']].map(([value, label]) => (
+            <Chip key={label} label={label} active={filterStatus === value} onPress={() => setFilterStatus(value)} />
+          ))}
+        </View>
+        {(!!filterDate || !!filterFlight || !!filterStatus) && (
+          <Button title="Clear filters" tone="ghost" small onPress={() => { setFilterDate(''); setFilterFlight(''); setFilterStatus(''); }} />
+        )}
+
+        {trips.map((trip) => {
+          const isOpen = !!expanded[trip.root_id];
+          return (
+            <View key={trip.root_id} style={[styles.listRow, { paddingVertical: 10 }]}>
+              <Pressable onPress={() => setExpanded((e) => ({ ...e, [trip.root_id]: !e[trip.root_id] }))}>
+                <View style={styles.rowBetween}>
+                  <Text style={{ fontSize: 14, fontWeight: '700', color: COLORS.text, flex: 1 }}>
+                    {isOpen ? '▾ ' : '▸ '}{trip.label}
+                  </Text>
+                  <Pill label={trip.pending ? `${trip.pending} pending` : 'Complete'} tone={trip.pending ? 'warning' : 'success'} />
+                </View>
+                <Text style={styles.mono}>{trip.flight_numbers}</Text>
+              </Pressable>
+              {isOpen && trip.legs.map((leg) => (
+                <View key={leg.id} style={{ marginTop: 8, marginLeft: 12 }}>
+                  <View style={styles.rowBetween}>
+                    <Text style={{ fontSize: 13, fontWeight: '600', color: COLORS.text, flex: 1 }}>
+                      {leg.flight_number} · {leg.sector} · {leg.flight_date}
+                    </Text>
+                    <Pill label={leg.pending ? `${leg.pending} pending` : 'All submitted'} tone={leg.pending ? 'warning' : 'success'} />
+                  </View>
+                  {!!leg.original_destination && (
+                    <Text style={[styles.mono, { color: COLORS.warning }]}>Diverted: planned to {leg.original_destination}</Text>
+                  )}
+                  {leg.forms.map((item) => (
+                    <Pressable key={item.report_type} onPress={() => openFiled(leg, item)} style={[styles.rowBetween, { paddingVertical: 6 }]}>
+                      <Text style={{ fontSize: 13, color: COLORS.text, flex: 1 }}>
+                        {item.title}{item.switched_off ? ' (switched off)' : ''}
+                      </Text>
+                      <Pill
+                        label={item.status === 'PENDING' ? 'PENDING' : (STATUS_LABEL[item.status] || item.status)}
+                        tone={item.status === 'PENDING' ? 'danger' : (STATUS_TONE[item.status] || 'muted')} />
+                    </Pressable>
+                  ))}
+                  {leg.forms.some((f) => f.submitted_by) && (
+                    <Text style={styles.mono}>
+                      Submitted by {Array.from(new Set(leg.forms.filter((f) => f.submitted_by).map((f) => f.submitted_by))).join(', ')}
+                    </Text>
+                  )}
+                </View>
+              ))}
+            </View>
+          );
+        })}
+        {!!tripPager.error && <Banner tone="danger" message={tripPager.error} />}
+        {!trips.length && !tripPager.loading && <Text style={styles.empty}>No trip matches.</Text>}
+        <Pagination pager={tripPager} label="trips" />
+      </Card>
+
+      <SectorStockList />
 
       <CalendarModal
         visible={filterCalendar}
@@ -1005,298 +861,6 @@ export default function ReportsScreen({ user, online, initialFlightId, onHandled
         onClose={() => setFilterCalendar(false)}
       />
     </ScrollView>
-  );
-}
-
-
-/* ------------------------------------------------------------------ */
-/* Remaining stock after a sector (7.9)                                */
-/* ------------------------------------------------------------------ */
-function SectorStockCard({ flightId, rootId, flight, online, locked, goTo, user, onChanged }) {
-  const me = user?.employee_id;
-  const [position, setPosition] = useState(null);
-  const [declared, setDeclared] = useState({});
-  const [remarks, setRemarks] = useState('');
-  const [editing, setEditing] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
-
-  // What THIS iPad should hold: the system figure less what the other iPad declared.
-  const mineDefault = (p, i) => {
-    const others = Object.entries(i.by_device || {}).filter(([d]) => d !== me).reduce((a, [, q]) => a + Number(q || 0), 0);
-    const otherIn = (p.submitted_devices || []).some((d) => d !== me);
-    return otherIn ? Math.max(0, i.expected_remaining - others) : i.expected_remaining;
-  };
-
-  // Server copy when there is a signal; otherwise the cached copy or the
-  // trolley stock this iPad knows. This iPad's own confirmation on top (7.12).
-  const load = useCallback(async () => {
-    let p = null;
-    if (online) {
-      try {
-        p = await api(`/flights/${flightId}/sector-stock`);
-        await writeCache(`sectorStock.${flightId}`, p);
-      } catch (e) {
-        if (e.permanent) { setError(e.message); return; }
-      }
-    }
-    if (!p) p = await readCache(`sectorStock.${flightId}`, null);
-    if (!p) {
-      const inventory = await readCache(`inventory.${flightId}`, null) || await readCache(`inventory.${rootId}`, []);
-      p = buildLocalPosition(flight, inventory, me);
-    }
-    if (!p) { setError('The trolley stock is not on this iPad yet. Open the Sales page once with a connection.'); return; }
-    const leg = findLeg(await readJournal(), flightId);
-    p = applyJournalToPosition(p, leg, me);
-    setPosition(p);
-    setDeclared(Object.fromEntries(p.items.map((i) => [i.product_id,
-      String((i.by_device || {})[me] ?? mineDefault(p, i))])));
-    setRemarks((p.device_remarks || {})[me] || '');
-    setEditing(!p.my_submitted);
-    setError(null);
-  }, [flightId, rootId, flight, me, online]);
-  useEffect(() => { load(); }, [load]);
-
-  async function submit() {
-    const lines = position.items.map((i) => ({ product_id: i.product_id, declared_remaining: Number(declared[i.product_id] || 0) }));
-    if (lines.some((l) => Number.isNaN(l.declared_remaining) || l.declared_remaining < 0)) {
-      return notify({ title: 'Check the quantities', message: 'Every remaining quantity must be a whole number, 0 or more.' });
-    }
-    const changed = position.items.filter((i) => Number(declared[i.product_id]) !== mineDefault(position, i));
-    if (changed.length && !remarks.trim()) {
-      return notify({ title: 'Remarks required', message: `${changed.length} line(s) differ from the system figure. Say why.` });
-    }
-    const others = (position.devices || []).filter((d) => d !== me);
-    const sure = await confirm({
-      title: 'Confirm the remaining stock on this iPad?',
-      message: `${position.flight_number} ${position.origin}→${position.destination}: `
-        + `${lines.reduce((a, l) => a + l.declared_remaining, 0)} unit(s) left on this iPad after this sector.`
-        + (others.length ? ` ${others.join(', ')} declares its own part; the two are added together on upload.` : '')
-        + ' Management and Inventory see it once it is uploaded.',
-      confirmText: 'Confirm',
-    });
-    if (!sure) return;
-    setBusy(true);
-    try {
-      const { queued } = await tripAction({ endpoint: `/flights/${flightId}/sector-stock`, body: { lines, remarks: remarks.trim() || null },
-        label: `Remaining stock ${position.flight_number}`, flightId });
-      await journalLeg(rootId, flightId, {
-        stock_count_at: new Date().toISOString(),
-        stock_lines: Object.fromEntries(lines.map((l) => [l.product_id, l.declared_remaining])),
-        stock_remarks: remarks.trim() || null,
-      });
-      await load();
-      onChanged?.();
-      await notify({
-        title: 'Remaining stock confirmed',
-        message: (queued ? 'Saved on this iPad; it uploads with the sales on Wi-Fi. ' : 'Your count is in. ')
-          + 'Next: see the commission below, then the forms, then “Start second flight” on the Sales page.',
-      });
-    } catch (e) {
-      setError(e.message);
-    }
-    setBusy(false);
-  }
-
-  if (error) return <Card><Banner tone="danger" message={error} /></Card>;
-  if (!position) return null;
-  const readOnly = locked || !editing;
-  const others = (position.devices || []).filter((d) => d !== me);
-  const otherIn = (position.submitted_devices || []).some((d) => d !== me);
-
-  return (
-    <Card>
-      <SectionTitle
-        title="1. Remaining stock after this sector"
-        description={position.my_submitted
-          ? (position.submitted
-            ? `Both iPads have confirmed. ${position.total_declared} unit(s) left in total.`
-            : position.local
-              ? 'Confirmed on this iPad. It uploads with the sales on Wi-Fi.'
-              : `Your part is in.${others.length ? ' The other iPad confirms its own part when it uploads.' : ''}`)
-          : 'Count what is left on THIS iPad. The system figure comes from the load and the sales this iPad knows about; change a line only if the trolley says otherwise.'}
-        right={<Pill label={position.submitted ? 'Confirmed' : position.my_submitted ? 'Confirmed on this iPad' : 'To confirm'}
-                     tone={position.submitted || position.my_submitted ? 'success' : 'warning'} />}
-      />
-      {position.offline_built && (
-        <Banner tone="info" message="No signal: the figures are what this iPad knows (its load and its own sales). The server adds the other iPad's sales on upload." />
-      )}
-      <View style={[styles.row, { paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: COLORS.border }]}>
-        <Text style={[styles.mono, { flex: 2 }]}>Product</Text>
-        <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>Loaded</Text>
-        <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>Sold</Text>
-        <Text style={[styles.mono, { flex: 1, textAlign: 'right' }]}>{otherIn ? 'Should be here' : 'Should be left'}</Text>
-        <Text style={[styles.mono, { flex: 1.2, textAlign: 'right' }]}>{others.length ? 'On this iPad' : 'Left'}</Text>
-      </View>
-      {position.items.map((i) => {
-        const expectedHere = mineDefault(position, i);
-        const diff = Number(declared[i.product_id] || 0) - expectedHere;
-        const otherQty = Object.entries(i.by_device || {}).filter(([d]) => d !== me);
-        return (
-          <View key={i.product_id} style={[styles.row, { paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: COLORS.surfaceAlt }]}>
-            <View style={{ flex: 2 }}>
-              <Text style={{ fontSize: 13, color: COLORS.text }} numberOfLines={2}>{i.product_name}</Text>
-              {diff !== 0 && <Text style={[styles.mono, { color: COLORS.warning }]}>{diff > 0 ? '+' : ''}{diff} vs system</Text>}
-              {otherQty.length > 0 && <Text style={styles.mono}>{otherQty.map(([d, q]) => `${d}: ${q}`).join(' · ')}</Text>}
-            </View>
-            <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{i.loaded_quantity}</Text>
-            <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{(i.sold_before || 0) + (i.sold_quantity || 0)}</Text>
-            <Text style={[styles.value, { flex: 1, textAlign: 'right' }]}>{expectedHere}</Text>
-            <View style={{ flex: 1.2, alignItems: 'flex-end' }}>
-              {readOnly ? (
-                <Text style={[styles.value, { fontWeight: '600' }]}>{(i.by_device || {})[me] ?? i.declared_remaining}</Text>
-              ) : (
-                <TextInput
-                  value={declared[i.product_id] ?? ''}
-                  onChangeText={(v) => setDeclared((d) => ({ ...d, [i.product_id]: v.replace(/[^0-9]/g, '') }))}
-                  keyboardType="number-pad"
-                  style={[styles.input, { width: 64, textAlign: 'center', paddingVertical: 6 }]}
-                />
-              )}
-            </View>
-          </View>
-        );
-      })}
-      <View style={[styles.rowBetween, { paddingVertical: 8 }]}>
-        <Text style={styles.label}>{others.length ? 'Total on this iPad' : 'Total left'}</Text>
-        <Text style={[styles.value, { fontWeight: '700' }]}>
-          {position.items.reduce((a, i) => a + Number(declared[i.product_id] || 0), 0)} unit(s)
-        </Text>
-      </View>
-      {!readOnly ? (
-        <>
-          <Field label="Remarks (required if a figure differs from the system)" value={remarks} onChangeText={setRemarks} multiline placeholder="e.g. one can damaged" />
-          <Button title={busy ? 'Saving…' : 'Confirm remaining stock on this iPad'} onPress={submit} disabled={busy} />
-          {position.my_submitted && (
-            <Button title="Cancel" tone="ghost" small style={{ marginTop: 8 }} onPress={() => { setEditing(false); load(); }} />
-          )}
-        </>
-      ) : (
-        <>
-          {!!(position.device_remarks || {})[me] && <Text style={[styles.mono, { marginTop: 4 }]}>Remarks: {(position.device_remarks || {})[me]}</Text>}
-          {!locked && (
-            <Button title="Correct this iPad's count" tone="ghost" small style={{ marginTop: 8 }} onPress={() => setEditing(true)} />
-          )}
-        </>
-      )}
-    </Card>
-  );
-}
-
-/** The last sector: the final stock return is on the Sync page (per iPad). */
-function FinalReturnCard({ trip, goTo }) {
-  const mine = !!trip?.my_stock_return_done;
-  return (
-    <Card>
-      <SectionTitle
-        title="1. Final stock return"
-        description={mine
-          ? 'This iPad’s final stock return is in. The other iPad submits its own part; the two are added together for Inventory.'
-          : 'Submit what is left on this iPad (Sync page). The other iPad submits its own part; the two are added together.'}
-        right={<Pill label={mine ? 'Submitted' : 'To submit'} tone={mine ? 'success' : 'warning'} />}
-      />
-      {!mine && <Button title="Open the final stock return" tone="secondary" onPress={() => goTo?.('sync')} />}
-    </Card>
-  );
-}
-
-/** What this sector earned and how it is shared (7.11). */
-function CommissionCard({ flightId, online, user }) {
-  const [data, setData] = useState(null);
-  const [error, setError] = useState(null);
-  useEffect(() => {
-    if (!online) return;
-    api(`/flights/${flightId}/commission`).then((d) => { setData(d); setError(null); }).catch((e) => setError(e.message));
-  }, [flightId, online]);
-  if (!online) return null;
-  if (error) return <Card><Banner tone="danger" message={error} /></Card>;
-  if (!data) return null;
-  const s = data.sector || {};
-  return (
-    <Card>
-      <SectionTitle
-        title="2. Commission on this sector"
-        description={`${Math.round((data.commission_rate || 0.1) * 100)}% of product sales is shared equally by the ${s.member_count || 0} crew on this sector; `
-          + 'combo commission goes to whoever sold the combo.'}
-        right={<Pill label={npr(data.total_commission_npr)} tone="success" />}
-      />
-      <View style={[styles.wrap, { marginBottom: 8 }]}>
-        <Pill label={`Product sales ${npr(s.product_revenue_npr || 0)}`} tone="muted" />
-        <Pill label={`Pool ${npr(s.commission_pool_npr || 0)} \u00f7 ${s.member_count || 0} = ${npr(s.share_npr || 0)} each`} tone="info" />
-        {!!s.combo_revenue_npr && <Pill label={`Combo sales ${npr(s.combo_revenue_npr)} \u2192 ${npr(s.combo_commission_npr)} commission`} tone="warning" />}
-      </View>
-      {data.members.map((m) => (
-        <View key={m.crew_member_id} style={[styles.rowBetween, { paddingVertical: 5, borderBottomWidth: 1, borderBottomColor: COLORS.surfaceAlt }]}>
-          <View style={{ flex: 1 }}>
-            <Text style={{ fontSize: 13, color: COLORS.text }}>{m.name}</Text>
-            <Text style={styles.mono}>
-              share {npr(m.share_npr)}{m.combo_commission_npr ? ` + combo ${npr(m.combo_commission_npr)}` : ''}
-            </Text>
-          </View>
-          <Text style={[styles.value, { fontWeight: '700' }]}>{npr(m.total_npr)}</Text>
-        </View>
-      ))}
-      {!data.members.length && <Text style={styles.empty}>No crew recorded on this sector.</Text>}
-      <Text style={[styles.mono, { marginTop: 6 }]}>Recorded for Management and the administrator. Next: the forms below.</Text>
-    </Card>
-  );
-}
-
-/** Management, Inventory and the administrator: every confirmed sector count. */
-function SectorStockList() {
-  const pager = usePaged('/sector-stock-counts');
-  const [open, setOpen] = useState(null);      // flight id expanded
-  const [detail, setDetail] = useState(null);
-
-  async function toggle(flightId) {
-    if (open === flightId) { setOpen(null); setDetail(null); return; }
-    setOpen(flightId);
-    setDetail(null);
-    try { setDetail(await api(`/flights/${flightId}/sector-stock`)); } catch (e) { setDetail({ error: e.message }); }
-  }
-
-  return (
-    <Card>
-      <SectionTitle
-        title="Remaining stock after each sector"
-        description="Confirmed by the crew after the first sector of a round trip, before the second flight starts. The final stock return is on the Sync page."
-      />
-      {pager.items.map((c) => (
-        <View key={c.id}>
-          <Pressable onPress={() => toggle(c.flight_id)} style={[styles.listRow, { paddingVertical: 12 }]}>
-            <View style={styles.rowBetween}>
-              <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text, flex: 1 }}>
-                {c.flight_number} · {c.origin}→{c.destination} · {c.flight_date}
-              </Text>
-              <Pill label={c.total_variance ? `${c.total_variance > 0 ? '+' : ''}${c.total_variance} vs system` : 'Matches system'}
-                    tone={c.total_variance ? 'warning' : 'success'} />
-            </View>
-            <Text style={styles.mono}>
-              {c.total_declared} unit(s) left · confirmed by {c.submitted_by} · {String(c.submitted_at || '').replace('T', ' ').slice(0, 16)}
-            </Text>
-            {!!c.remarks && <RemarkLine label="Crew remarks" text={c.remarks} />}
-          </Pressable>
-          {open === c.flight_id && (
-            <View style={{ paddingHorizontal: 8, paddingBottom: 10 }}>
-              {!detail && <Text style={styles.mono}>Loading…</Text>}
-              {!!detail?.error && <Banner tone="danger" message={detail.error} />}
-              {!!detail?.items && detail.items.map((i) => (
-                <View key={i.product_id} style={[styles.rowBetween, { paddingVertical: 4 }]}>
-                  <Text style={{ fontSize: 13, color: COLORS.text, flex: 2 }}>{i.product_name}</Text>
-                  <Text style={[styles.mono, { flex: 2, textAlign: 'right' }]}>
-                    loaded {i.loaded_quantity} · sold {i.sold_before + i.sold_quantity} · should be {i.expected_remaining} · left {i.declared_remaining}
-                    {i.variance ? ` (${i.variance > 0 ? '+' : ''}${i.variance})` : ''}
-                  </Text>
-                </View>
-              ))}
-            </View>
-          )}
-        </View>
-      ))}
-      {!!pager.error && <Banner tone="danger" message={pager.error} />}
-      {!pager.items.length && !pager.loading && <Text style={styles.empty}>No sector count yet.</Text>}
-      <Pagination pager={pager} label="counts" />
-    </Card>
   );
 }
 

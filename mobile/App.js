@@ -37,6 +37,7 @@ import InventoryScreen from './src/screens/InventoryScreen';
 import LogsScreen from './src/screens/LogsScreen';
 import ReportsScreen from './src/screens/ReportsScreen';
 import SyncScreen from './src/screens/SyncScreen';
+import CashScreen from './src/screens/CashScreen';
 import WarehouseScreen from './src/screens/WarehouseScreen';
 
 /** Navigation is derived from the server's permission matrix, not hardcoded. */
@@ -49,13 +50,17 @@ const NAV = [
   { key: 'inventory', label: 'Inventory', icon: 'inventory', permission: 'inventory' },
   { key: 'warehouse', label: 'Warehouse', icon: 'warehouse', permission: 'warehouse' },
   { key: 'dashboard', label: 'Dashboard', icon: 'dashboard', permission: 'dashboard' },
-  { key: 'sync', label: 'Sync', icon: 'sync', permission: 'sync' },
+  // 7.18: the crew's upload queue, live commission and the stock return; and
+  // Inventory's stock-return review. Not for Management or the administrator.
+  { key: 'sync', label: 'Sync & Return Stock', icon: 'sync', permission: 'sync', hideRoles: ['management', 'admin'] },
   // Management see the whole screen; the inventory supervisor reaches it for
   // the sales ledger alone, so the tab is labelled for what they actually get.
-  { key: 'logs', label: 'Performance & Sales Logs', icon: 'ledger', permission: 'sales_view', fullPermission: 'logs', altLabel: 'Sales Logs' },
+  { key: 'logs', label: 'Performance & Sales Logs', icon: 'ledger', anyPermission: ['sales_view', 'sales_report'], fullPermission: 'logs', altLabel: 'Sales Logs' },
   { key: 'rates', label: 'Rates', icon: 'rates', permission: 'rates' },
   // Crew file the post-flight cabin reports here; management read and correct them.
-  { key: 'reports', label: 'Reports', icon: 'reports', permission: 'flight_reports' },
+  { key: 'reports', label: 'Reports', icon: 'reports', anyPermission: ['flight_reports', 'reports_view'] },
+  // 7.18: the floating cash and cash sales collection of every sector.
+  { key: 'cash', label: 'Cash', icon: 'cash', anyPermission: ['cash', 'cash_view'] },
   { key: 'comms', label: 'Communication Manager', icon: 'comms', anyPermission: ['comms_view', 'comms_admin'] },
   { key: 'smtp', label: 'SMTP Settings', icon: 'smtp', permission: 'smtp_view' },
   { key: 'admin', label: 'Users & Access', icon: 'users', permission: 'users' },
@@ -69,16 +74,19 @@ const NAV = [
 /** Sidebar sections on laptops and larger screens. */
 const GROUPS = [
   { title: 'Overview', keys: ['overview', 'dashboard'] },
-  { title: 'Operations', keys: ['crew', 'inventory', 'warehouse', 'sync', 'logs', 'rates', 'reports'] },
+  { title: 'Operations', keys: ['crew', 'inventory', 'warehouse', 'sync', 'cash', 'logs', 'rates', 'reports'] },
   { title: 'Communication', keys: ['comms', 'smtp'] },
   { title: 'Administration', keys: ['admin', 'audit', 'qrmenu', 'account'] },
 ];
 
 const EXTRA_PAGES = { notifications: { label: 'Notifications', icon: 'bell' } };
 
-const canSee = (item, permissions = []) => (item.always || (item.anyPermission
-  ? item.anyPermission.some((p) => permissions.includes(p))
-  : permissions.includes(item.permission)));
+const canSee = (item, permissions = [], role = '') => !(item.hideRoles || []).includes(role)
+  && (item.always || (item.anyPermission
+    ? item.anyPermission.some((p) => permissions.includes(p))
+    : permissions.includes(item.permission)));
+// 7.18: a crew member's own login, or the earlier shared iPad account.
+export const CREW_ROLES = ['crew', 'crew_supervisor'];
 
 // Sidebar palette (dark navy, as in the reference design).
 const SIDEBAR = {
@@ -139,6 +147,9 @@ function AppContent() {
   const [profileOpen, setProfileOpen] = useState(false);
   const [versionWarning, setVersionWarning] = useState(null);
   const [syncNotice, setSyncNotice] = useState(null);
+  // 7.18: cash that does not match the sales, shown to everyone at the top.
+  const [cashAlerts, setCashAlerts] = useState([]);
+  const [cashFocus, setCashFocus] = useState(null);
   // Set when a sector is finished, so the crew land on that sector's reports
   // instead of having to find it again. Declared with the other state: every
   // hook must run on every render, and there are early returns further down.
@@ -156,6 +167,17 @@ function AppContent() {
 
   /* ------------------------ notifications ------------------------ */
   // The bell's unread count. Polled, because the alert engine runs on the server.
+  const refreshCashAlerts = useCallback(async () => {
+    if (!user || !online || user.must_change_password) return;
+    if (!(user.permissions || []).some((p) => p === 'cash' || p === 'cash_view')) return setCashAlerts([]);
+    try { setCashAlerts(await api('/cash/alerts')); } catch { /* next tick */ }
+  }, [user, online]);
+  useEffect(() => {
+    refreshCashAlerts();
+    const timer = setInterval(refreshCashAlerts, 60000);
+    return () => clearInterval(timer);
+  }, [refreshCashAlerts]);
+
   const refreshUnread = useCallback(async () => {
     if (!user || !online || user.must_change_password) return;
     try {
@@ -198,8 +220,8 @@ function AppContent() {
     setUser(session);
     setToken(session.token);
     checkBackendVersion().then(setVersionWarning);
-    const first = NAV.find((item) => canSee(item, session.permissions));
-    setPage(first?.key || 'sync');
+    const first = NAV.find((item) => canSee(item, session.permissions, session.role));
+    setPage(first?.key || 'account');
   }
 
   // Re-check periodically so the warning clears by itself once the server is
@@ -381,7 +403,7 @@ function AppContent() {
   }
 
   const allowed = NAV
-    .filter((item) => canSee(item, user.permissions))
+    .filter((item) => canSee(item, user.permissions, user.role))
     .map((item) => (
       item.fullPermission && !user.permissions?.includes(item.fullPermission)
         ? { ...item, label: item.altLabel }
@@ -408,13 +430,25 @@ function AppContent() {
           <Banner tone="danger" message={versionWarning} />
         </View>
       )}
+      {cashAlerts.slice(0, 3).map((alert) => (
+        <View key={alert.id} style={{ paddingHorizontal: 16, paddingTop: 12 }}>
+          <Pressable onPress={() => { setCashFocus(alert.flight_id); setPage('cash'); }} accessibilityRole="button">
+            <Banner tone="danger" message={`${alert.message} Tap to open the cash sheet.`} />
+          </Pressable>
+        </View>
+      ))}
+      {cashAlerts.length > 3 && (
+        <View style={{ paddingHorizontal: 16, paddingTop: 6 }}>
+          <Text style={styles.mono}>…and {cashAlerts.length - 3} more cash difference(s) on the Cash page.</Text>
+        </View>
+      )}
     </>
   );
 
   const content = (
     <>
       {page === 'overview' && <OverviewScreen {...screenProps} />}
-      {page === 'crew' && (user.role === 'crew_supervisor'
+      {page === 'crew' && (CREW_ROLES.includes(user.role)
         ? <CrewScreen {...screenProps} />
         : <FlightSalesScreen {...screenProps} />)}
       {page === 'inventory' && <InventoryScreen {...screenProps} />}
@@ -434,6 +468,9 @@ function AppContent() {
       {page === 'audit' && <AuditLogScreen {...screenProps} />}
       {page === 'smtp' && <SmtpScreen {...screenProps} />}
       {page === 'qrmenu' && <QrMenuScreen {...screenProps} />}
+      {page === 'cash' && (
+        <CashScreen {...screenProps} focusFlightId={cashFocus} onFocused={() => setCashFocus(null)} onAlertsChanged={refreshCashAlerts} />
+      )}
       {page === 'account' && <AccountScreen {...screenProps} onLogout={logout} />}
       {page === 'comms' && (
         <CommsScreen

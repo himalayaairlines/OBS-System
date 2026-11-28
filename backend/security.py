@@ -23,7 +23,7 @@ from database import ROLE_PERMISSIONS, get_connection
 
 PBKDF2_ROUNDS = 310_000
 # The account that works offline on board; see the module docstring.
-DEVICE_ROLES = {"crew_supervisor"}
+DEVICE_ROLES = {"crew_supervisor", "crew"}
 # While a weak or default password must be changed, only these work.
 PASSWORD_CHANGE_PATHS = {"/me", "/logout", "/change-password", "/account", "/account/sessions"}
 

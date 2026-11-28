@@ -80,6 +80,9 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
   const selling = isSellable(flight);
   const [trip, setTrip] = useState(null);
   // An iPad account works the trip Inventory assigned to it: no flight picker (7.11).
+  // 7.18: a crew member's own login: they sell as themselves, so a combo needs
+  // no seller, and they choose which of their rostered sectors to work.
+  const ownLogin = user?.role === 'crew';
   const isDevice = user?.role === 'crew_supervisor';
 
   /* ---------------------------- data ---------------------------- */
@@ -189,6 +192,9 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
   useEffect(() => { loadInventory(flightId); }, [flightId, loadInventory]);
   useEffect(() => { loadDutyGroup(flightId); }, [flightId, loadDutyGroup]);
   useEffect(() => {
+    if (flightId && online) cached(`assignedCrew.${flightId}`, `/flights/${flightId}/assigned-crew`, []).catch(() => {});
+  }, [flightId, online]);
+  useEffect(() => {
     setAircraftType(flight?.aircraft_type || '');
     setAircraft(flight?.aircraft || '');
     setPax(flight?.passengers ? String(flight.passengers) : '');
@@ -210,6 +216,8 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
 
   const seller = dutyMembers.find((m) => m.id === sellerId) || null;
   const cartHasCombo = Object.entries(cart).some(([key, qty]) => key.startsWith('b:') && qty > 0);
+  // The seller has to be picked only on a shared iPad account.
+  const needsSeller = cartHasCombo && !ownLogin;
 
   // Everything the sector needs before selling. Until it is all there the card
   // stays open; once saved it hides by itself.
@@ -218,6 +226,19 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
   useEffect(() => {
     if (!infoTouched) setInfoOpen(!infoComplete);
   }, [infoComplete, infoTouched, flightId]);
+
+  // 7.18: the list starts from the crew Inventory rostered on the sector; one
+  // phone enters it (with a signal, so every phone gets it) and adjusts it.
+  async function startDutyGroup() {
+    let ids = [];
+    if (flight) {
+      const result = await cached(`assignedCrew.${flight.id}`, `/flights/${flight.id}/assigned-crew`, []);
+      ids = (result.data || []).map((m) => m.id).filter(Boolean);
+    }
+    setDutyDraft(ids);
+    setDutyMode('create');
+    setDutyPicker(true);
+  }
 
   async function submitDutyGroup() {
     if (!groupSizeOk(dutyDraft.length)) {
@@ -356,6 +377,12 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
     return Math.round(sum * 100) / 100;
   }, [cart, products, bundles]);
 
+  // 7.18: the price is in NPR; in another currency the passenger pays the
+  // converted amount rounded UP to the next whole unit (3.0 -> 3, 3.1 -> 4).
+  // The server applies the same rule; this is what the crew collect.
+  const chargeAmount = currency === 'NPR' ? totalNpr : (totalNpr > 0 ? Math.ceil(totalNpr / rate - 1e-9) : 0);
+  const chargeLabel = currency === 'NPR' ? npr(totalNpr) : `${currency} ${chargeAmount.toLocaleString('en-US')}`;
+
   // One list of tiles covering products and bundles. Anything with no stock
   // left is dropped entirely rather than shown greyed out.
   const sellable = useMemo(() => {
@@ -473,11 +500,84 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
       setInfoOpen(false);
       notify({ title: 'Flight info saved', message: 'Aircraft, PAX load and crew are recorded. Tap \u201cFlight info\u201d at the top to see or correct them.' });
     } else if (!dutyGroup && roster.length) {
-      setDutyDraft([]); setDutyMode('create'); setDutyPicker(true);
+      startDutyGroup();
     }
   }
 
-  // "Finish this flight" lives on the Reports page (7.9), above the sector's forms.
+  // 7.18: "Finish this flight" is on the Sales page again; the stock count
+  // and the final return follow on the Sync & Return Stock page.
+  async function finishSector() {
+    if (!flight) return;
+    const roundFirst = flight.trip_type === 'ROUND_TRIP' && flight.direction !== 'RETURN';
+    const sure = await confirm({
+      title: 'Finish this flight?',
+      message: `${flight.flight_number} ${route(flight)} will be finished on this phone.\n\n`
+        + 'You can no longer record a sale on this sector. The sales already recorded are kept.',
+      confirmText: 'Finish this flight',
+      tone: 'danger',
+    });
+    if (!sure) return;
+    setBusy(true);
+    try {
+      const { result, queued } = await tripAction({ method: 'PUT', endpoint: `/flights/${flight.id}/finish`,
+        label: `Finish ${flight.flight_number} ${route(flight)}`, flightId: flight.id });
+      await journalLeg(rootOf(flight), flight.id, { finished_at: new Date().toISOString() });
+      await loadReference();
+      onQueueChange?.();
+      const next = await confirm({
+        title: 'Sector finished',
+        message: (result ? `${flight.flight_number}: ${result.transactions} transaction(s), ${npr(result.revenue_npr)} on your login.`
+          : `${flight.flight_number} is finished on this phone. (No signal: it uploads with your sales on Wi-Fi.)`)
+          + (roundFirst
+            ? '\n\nNext: the remaining stock on the Sync & Return Stock page (or say another crew member did it), then \u201cStart second flight\u201d here.'
+            : '\n\nNext: the final stock return on the Sync & Return Stock page, then \u201cFinish whole flight\u201d here.'),
+        confirmText: 'Go to Sync & Return Stock',
+        cancelText: 'Later',
+      });
+      if (next) goTo?.('sync');
+      if (queued) setMessage({ tone: 'info', text: 'Saved on this phone; it uploads by itself on Wi-Fi.' });
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+    setBusy(false);
+  }
+
+  // 7.18: the aircraft landed somewhere else. The sector's destination changes;
+  // remarks are mandatory and Management sees where it was meant to go.
+  const [diversionOpen, setDiversionOpen] = useState(false);
+  const [diversion, setDiversion] = useState({ diverted_to: '', reason: '', diverted_at: '', remarks: '' });
+  async function saveDiversion() {
+    const code = diversion.diverted_to.trim().toUpperCase();
+    if (!/^[A-Z]{3}$/.test(code)) return notify({ title: 'Airport code', message: 'Enter the three-letter airport code, e.g. BKK.' });
+    if (code === flight.origin || code === flight.destination) {
+      return notify({ title: 'Airport code', message: `The sector already runs ${route(flight)}.` });
+    }
+    if (diversion.reason.trim().length < 2 || diversion.remarks.trim().length < 2) {
+      return notify({ title: 'Reason and remarks required', message: 'Say why the flight diverted and add your remarks.' });
+    }
+    const sure = await confirm({
+      title: `Diverted to ${code}?`,
+      message: `${flight.flight_number} ${flight.origin}\u2192${flight.destination} becomes ${flight.origin}\u2192${code}. `
+        + 'Management, Inventory and the other crew see the change and your remarks.',
+      confirmText: 'Record diversion',
+      tone: 'danger',
+    });
+    if (!sure) return;
+    try {
+      const body = { diverted_to: code, reason: diversion.reason.trim(), remarks: diversion.remarks.trim(),
+        diverted_at: diversion.diverted_at.trim() || null, client_ref: `DV-${flight.id}-${Date.now().toString(36)}` };
+      const { queued } = await tripAction({ endpoint: `/flights/${flight.id}/diversion`, body,
+        label: `Diversion ${flight.flight_number} to ${code}`, flightId: flight.id });
+      await journalLeg(rootOf(flight), flight.id, { diverted_to: code, planned_destination: flight.original_destination || flight.destination });
+      setDiversionOpen(false);
+      setDiversion({ diverted_to: '', reason: '', diverted_at: '', remarks: '' });
+      await loadReference();
+      onQueueChange?.();
+      setMessage({ tone: 'success', text: `Diversion to ${code} recorded.${queued ? ' It uploads on Wi-Fi.' : ''}` });
+    } catch (error) {
+      setMessage({ tone: 'danger', text: error.message });
+    }
+  }
 
   async function recordSale() {
     if (!flight) return notify({ title: 'Flight required', message: 'Select the flight you are working.' });
@@ -491,7 +591,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
     if (!seat.trim()) return notify({ title: 'Seat required', message: 'Choose the passenger seat.' });
     // 7.11: normal sales pay into the sector's pooled commission, so no seller is
     // picked. A combo names who sold it, because that person earns its commission.
-    if (cartHasCombo && !sellerId) {
+    if (needsSeller && !sellerId) {
       return notify({
         title: 'Who sold the combo?',
         message: 'Choose the crew member who sold this combo. Combo commission is paid to that person.',
@@ -518,9 +618,11 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
       order_ref: orderRef(),
       flight_id: flight.id,
       seat_number: seat.trim().toUpperCase(),
-      sold_by_crew_member_id: cartHasCombo ? sellerId : null,
+      sold_by_crew_member_id: needsSeller ? sellerId : null,
       lines,
       payment_currency: currency,
+      // 7.18: what the passenger pays in that currency, rounded UP to a whole unit.
+      payment_amount: saleType === 'NORMAL' ? chargeAmount : 0,
       payment_method: 'Cash',
       sale_type: saleType,
       remarks: saleType === 'NORMAL' ? null : remarks.trim(),
@@ -569,7 +671,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
       message: queued
         ? 'The network is unavailable, so the sale is queued and will upload by itself once the '
           + 'iPad reaches Wi-Fi.'
-        : `${money(totalNpr / rate, currency)} recorded on seat ${payload.seat_number}.`,
+        : `${chargeLabel} recorded on seat ${payload.seat_number}.`,
     });
   }
 
@@ -642,13 +744,45 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
         />
       )}
       {message && <Notice message={message} />}
-      {!!trip && (trip.step === 'FORMS_FIRST' || trip.step === 'FORMS_LAST') && (
-        <Banner
-          tone="warning"
-          message={`Reminder: ${(trip.step === 'FORMS_FIRST' ? trip.legs[0] : trip.legs[trip.legs.length - 1]).reports_total
-            - (trip.step === 'FORMS_FIRST' ? trip.legs[0] : trip.legs[trip.legs.length - 1]).reports_filed} form(s) for `
-            + `${route(trip.step === 'FORMS_FIRST' ? trip.legs[0] : trip.legs[trip.legs.length - 1])} are still to fill in on the Reports page.`}
-        />
+
+      {!!flight && flight.status !== 'CLOSED' && !flight.my_completed_at && (
+        <Card tight>
+          <View style={[styles.rowBetween, { flexWrap: 'wrap', gap: 8 }]}>
+            <View style={{ flex: 1, minWidth: 180 }}>
+              <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }}>
+                {flight.flight_number} · {flight.origin}→{flight.destination}
+              </Text>
+              {!!flight.original_destination && (
+                <Text style={[styles.mono, { color: COLORS.warning }]}>Diverted — planned destination {flight.original_destination}</Text>
+              )}
+            </View>
+            <Button title={diversionOpen ? 'Close diversion' : 'Diversion'} tone={diversionOpen ? 'ghost' : 'warning'} small
+              onPress={() => setDiversionOpen((v) => !v)} />
+          </View>
+          {diversionOpen && (
+            <View style={{ marginTop: 10 }}>
+              <Text style={[styles.mono, { marginBottom: 8 }]}>
+                Use this when the aircraft lands somewhere other than {flight.destination}. The sector's destination changes to the
+                diversion airport; the original destination is kept and everyone sees the change with your remarks.
+              </Text>
+              <View style={[styles.row, styles.gap8, { flexWrap: 'wrap' }]}>
+                <View style={{ flex: 1, minWidth: 120 }}>
+                  <Field label="Diverted to (airport code)" value={diversion.diverted_to} autoCapitalize="characters" maxLength={3}
+                    onChangeText={(v) => setDiversion((d) => ({ ...d, diverted_to: v.replace(/[^A-Za-z]/g, '').toUpperCase() }))} placeholder="e.g. MCT" />
+                </View>
+                <View style={{ flex: 1, minWidth: 120 }}>
+                  <Field label="Time (local, optional)" value={diversion.diverted_at} maxLength={40}
+                    onChangeText={(v) => setDiversion((d) => ({ ...d, diverted_at: v }))} placeholder="e.g. 14:35" />
+                </View>
+              </View>
+              <Field label="Reason" value={diversion.reason} maxLength={200}
+                onChangeText={(v) => setDiversion((d) => ({ ...d, reason: v }))} placeholder="Weather, medical, technical…" />
+              <Field label="Remarks (mandatory)" value={diversion.remarks} multiline maxLength={500}
+                onChangeText={(v) => setDiversion((d) => ({ ...d, remarks: v }))} placeholder="What happened" />
+              <Button title="Record diversion" tone="danger" onPress={saveDiversion} />
+            </View>
+          )}
+        </Card>
       )}
 
       <Card>
@@ -687,7 +821,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
               title="Flight"
               description={isDevice
                 ? 'Set by Inventory for this iPad. The next trip appears here once this one is finished.'
-                : 'Only flights assigned to this device are listed.'}
+                : 'The sectors Inventory rostered you on. Choose the one you are working.'}
             />
             {isDevice && flight ? (
               <View style={[styles.listRow, { paddingVertical: 10, marginBottom: 8 }]}>
@@ -713,7 +847,9 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
             )}
             {!activeFlights.length && (
               <Text style={styles.empty}>
-                No trip in progress on this iPad. Inventory assigns the device to a trip; it appears here by itself.
+                {ownLogin
+                  ? 'You are not rostered on a flight right now. Inventory assigns the crew to each sector; it appears here by itself.'
+                  : 'No trip in progress on this iPad. Inventory assigns the device to a trip; it appears here by itself.'}
               </Text>
             )}
           </>
@@ -805,14 +941,9 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
             {selling && infoOpen && (
               <>
                 <View style={styles.divider} />
-                <Button
-                  title="Sector over? Go to Reports to finish it"
-                  tone="ghost"
-                  small
-                  onPress={() => goToReports?.(flight.id)}
-                />
+                <Button title="Sector over? Finish this flight" tone="warning" small onPress={finishSector} disabled={busy} />
                 <Text style={[styles.mono, { marginTop: 6 }]}>
-                  {'\u201cFinish this flight\u201d is on the Reports page, just above the forms for this sector.'}
+                  The remaining stock and the final return follow on the Sync & Return Stock page. The cabin forms are on the Reports page and can be filled in at any time.
                 </Text>
               </>
             )}
@@ -858,7 +989,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
             <Button
               title="Enter the crew working this sector"
               tone="primary"
-              onPress={() => { setDutyDraft([]); setDutyMode('create'); setDutyPicker(true); }}
+              onPress={() => { startDutyGroup(); }}
               disabled={busy || !roster.length}
             />
           )}
@@ -994,7 +1125,7 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
                 setSeatPicker(true);
               }}
             />
-            {cartHasCombo ? (
+            {needsSeller ? (
               <Select
                 label="Combo sold by (earns the combo commission)"
                 valueLabel={seller ? `${seller.name}${seller.crew_code ? ` · ${seller.crew_code}` : ''}` : ''}
@@ -1011,7 +1142,9 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
               />
             ) : (
               <Text style={[styles.mono, { marginBottom: 10 }]}>
-                Commission on this sale is shared equally by the {dutyMembers.length || ''} crew on this sector. Only a combo asks who sold it.
+                {ownLogin
+                  ? `Recorded as sold by you (${user.name}). Product commission is shared equally by the ${dutyMembers.length || ''} crew on this sector; a combo's commission is yours.`
+                  : `Commission on this sale is shared equally by the ${dutyMembers.length || ''} crew on this sector. Only a combo asks who sold it.`}
               </Text>
             )}
             <Select
@@ -1034,13 +1167,14 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
 
             <View style={[styles.wrap, { marginVertical: 10 }]}>
               <Metric label="Total (NPR)" value={npr(totalNpr)} tone="primary" />
-              <Metric label={`Charge (${currency})`} value={money(totalNpr / rate, currency)} />
+              <Metric label={`Charge (${currency})`} value={chargeLabel}
+                sub={currency !== 'NPR' && totalNpr > 0 ? `${(totalNpr / rate).toFixed(2)} rounded up` : undefined} />
             </View>
 
             <Button
               title={busy ? 'Recording…' : online ? 'Record sale' : 'Record sale (will queue)'}
               onPress={recordSale}
-              disabled={busy || (!Object.values(cart).some((q) => q > 0)) || !seat || (cartHasCombo && !sellerId)}
+              disabled={busy || (!Object.values(cart).some((q) => q > 0)) || !seat || (needsSeller && !sellerId)}
               tone={online ? 'primary' : 'warning'}
             />
             {!!Object.values(cart).some((q) => q > 0) && (
@@ -1049,11 +1183,12 @@ export default function CrewScreen({ user, online, onQueueChange, goToReports, g
           </Card>
           {!infoOpen && (
             <Button
-              title="Sector over? Go to Reports to finish this flight"
-              tone="ghost"
+              title="Sector over? Finish this flight"
+              tone="warning"
               small
               style={{ marginBottom: 12 }}
-              onPress={() => goToReports?.(flight.id)}
+              onPress={finishSector}
+              disabled={busy}
             />
           )}
         </>
@@ -1229,19 +1364,13 @@ function TripSteps({ trip }) {
   const stock = trip.my_stock_return_done ?? ({ NOT_SUBMITTED: false, WAITING: false, REJECTED: false, PENDING: true, APPROVED: true }[trip.stock_return]);
   const steps = [];
   trip.legs.forEach((leg, index) => {
-    const label = trip.round_trip ? (index === 0 ? 'first segment' : 'second segment') : 'this flight';
     if (index === 1) steps.push({ label: `Start second flight ${route(leg)}`, done: leg.started });
     steps.push({ label: `Sell and finish ${route(leg)}`, done: leg.finished });
     if (leg.stock_count_needed) {
-      steps.push({ label: `Remaining stock after ${route(leg)} confirmed on this iPad`, done: !!leg.stock_count_done });
+      steps.push({ label: `Remaining stock after ${route(leg)} (Sync & Return Stock)`, done: !!leg.stock_count_done });
     } else {
-      steps.push({ label: 'Final stock return from this iPad', done: !!stock });
+      steps.push({ label: 'Final stock return (Sync & Return Stock)', done: !!stock });
     }
-    steps.push({
-      label: `Forms (${label}) ${leg.reports_handled ?? leg.reports_filed}/${leg.reports_total} handled`
-        + ((leg.reports_awaiting_other || []).length ? ` · ${leg.reports_awaiting_other.length} awaiting the other iPad` : ''),
-      done: leg.reports_done,
-    });
   });
   steps.push({ label: 'Finish whole flight', done: trip.completed });
   const current = steps.findIndex((s) => !s.done);
@@ -1263,15 +1392,14 @@ function TripSteps({ trip }) {
   );
 }
 
-function TripAction({ trip, online, onStartSecond, onComplete, goToReports, goTo }) {
+function TripAction({ trip, online, onStartSecond, onComplete, goTo }) {
   const [first, second] = trip.legs;
-  const last = trip.legs[trip.legs.length - 1];
-  const need = !online ? ' (No signal: the step is saved on this iPad and uploads on Wi-Fi.)' : '';
+  const need = !online ? ' (No signal: the step is saved on this phone and uploads on Wi-Fi.)' : '';
 
   if (trip.step === 'DONE') {
     return <Banner tone="success" message="The whole flight is finished. Nothing on this trip can be edited any more." />;
   }
-  if (trip.step === 'FORMS_FIRST' || trip.step === 'STOCK_FIRST' || trip.step === 'START_SECOND') {
+  if (trip.step === 'STOCK_FIRST' || trip.step === 'START_SECOND') {
     return (
       <>
         <Button
@@ -1282,21 +1410,17 @@ function TripAction({ trip, online, onStartSecond, onComplete, goToReports, goTo
         />
         <Text style={[styles.mono, { marginTop: 6 }]}>
           {trip.can_start_second
-            ? `The forms and the remaining stock for ${route(first)} lock and stay with Management when you start.`
-            : trip.step === 'STOCK_FIRST'
-              ? `Confirm the remaining stock on this iPad after ${route(first)} on the Reports page first.`
-              : `Handle all ${first.reports_total} forms for ${route(first)} first `
-                + `(${first.reports_handled ?? first.reports_filed} handled): fill them in or mark them as submitted by the other iPad.`}
+            ? `Selling continues from what is left in the trolley after ${route(first)}.`
+            : `Submit the remaining stock after ${route(first)} on the Sync & Return Stock page first, or say another crew member did it.`}
           {need}
         </Text>
         {!trip.can_start_second && (
-          <Button title={trip.step === 'STOCK_FIRST' ? 'Open the remaining stock' : 'Open the forms'} tone="ghost" small style={{ marginTop: 8 }}
-            onPress={() => goToReports?.(first.id)} />
+          <Button title="Open Sync & Return Stock" tone="ghost" small style={{ marginTop: 8 }} onPress={() => goTo?.('sync')} />
         )}
       </>
     );
   }
-  if (['FORMS_LAST', 'STOCK_RETURN', 'COMPLETE'].includes(trip.step)) {
+  if (['STOCK_RETURN', 'COMPLETE'].includes(trip.step)) {
     return (
       <>
         <Button
@@ -1306,20 +1430,13 @@ function TripAction({ trip, online, onStartSecond, onComplete, goToReports, goTo
           disabled={!trip.can_complete}
         />
         <Text style={[styles.mono, { marginTop: 6 }]}>
-          {trip.step === 'FORMS_LAST'
-            ? `Handle all ${last.reports_total} forms for ${route(last)} first (${last.reports_handled ?? last.reports_filed} handled).`
-            : trip.step === 'STOCK_RETURN'
-              ? 'Submit this iPad\u2019s final stock return first (Sync page).'
-              : 'Everything is in. Finishing locks the whole trip.'}
+          {trip.step === 'STOCK_RETURN'
+            ? 'Submit the final stock return on the Sync & Return Stock page first, or say another crew member did it.'
+            : 'Everything is in. Finishing closes the trip on this phone. The cabin forms stay open on the Reports page.'}
           {need}
         </Text>
-        {trip.step === 'FORMS_LAST' && (
-          <Button title="Open the forms" tone="ghost" small style={{ marginTop: 8 }}
-            onPress={() => goToReports?.(last.id)} />
-        )}
         {trip.step === 'STOCK_RETURN' && (
-          <Button title="Open the final stock return" tone="ghost" small style={{ marginTop: 8 }}
-            onPress={() => goTo?.('sync')} />
+          <Button title="Open Sync & Return Stock" tone="ghost" small style={{ marginTop: 8 }} onPress={() => goTo?.('sync')} />
         )}
       </>
     );

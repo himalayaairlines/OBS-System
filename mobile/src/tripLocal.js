@@ -112,6 +112,11 @@ export function applyJournalToFlights(flights, journal) {
     out.my_completed_at = later(f.my_completed_at, trip.completed_at);
     if (leg.aircraft_type && !f.aircraft_type) { out.aircraft_type = leg.aircraft_type; out.aircraft = leg.aircraft || null; }
     if (leg.passengers && !f.passengers) out.passengers = leg.passengers;
+    // 7.18: a diversion entered on this phone shows before it has uploaded.
+    if (leg.diverted_to && f.destination !== leg.diverted_to && !f.original_destination) {
+      out.original_destination = f.destination;
+      out.destination = leg.diverted_to;
+    }
     return out;
   }).filter((f) => !f.my_completed_at);
 }
@@ -131,12 +136,11 @@ export function stepOf(p) {
   if (!first.finished) return 'SELL_FIRST';
   if (p.round_trip && !last.started) {
     if (!first.stock_count_done) return 'STOCK_FIRST';
-    if (!first.reports_done) return 'FORMS_FIRST';
     return 'START_SECOND';
   }
   if (p.round_trip && !last.finished) return 'SELL_SECOND';
   if (!p.my_stock_return_done) return 'STOCK_RETURN';
-  if (!last.reports_done) return 'FORMS_LAST';
+  // 7.18: the cabin forms are outside the flight flow (Reports page, any time).
   return 'COMPLETE';
 }
 
@@ -144,9 +148,9 @@ function finish(p) {
   const first = p.legs[0];
   const last = p.legs[p.legs.length - 1];
   p.step = stepOf(p);
-  p.can_start_second = p.round_trip && first.finished && first.reports_done && first.stock_count_done
+  p.can_start_second = p.round_trip && first.finished && first.stock_count_done
     && !last.started && !p.completed;
-  p.can_complete = p.legs.every((l) => l.finished && l.reports_done && (!l.stock_count_needed || l.stock_count_done))
+  p.can_complete = p.legs.every((l) => l.finished && (!l.stock_count_needed || l.stock_count_done))
     && p.my_stock_return_done && !p.completed;
   p.local = true;
   return p;
@@ -163,7 +167,7 @@ export function applyJournalToProgress(progress, journal) {
     const forms = local.forms || {};
     if (local.finished_at) leg.finished = true;
     if (local.started_at) leg.started = true;
-    if (local.stock_count_at) { leg.stock_count_done = true; leg.my_stock_count_done = true; }
+    if (local.stock_count_at || local.stock_by_other_at) { leg.stock_count_done = true; leg.my_stock_count_done = true; }
     if (local.forms_locked_at) leg.reports_locked = true;
     const handled = new Set(leg.reports_handled_types || []);
     const filed = new Set(leg.reports_filed_types || []);
@@ -175,7 +179,7 @@ export function applyJournalToProgress(progress, journal) {
     leg.reports_awaiting_other = [...handled].filter((t) => !filed.has(t));
     if (handled.size >= leg.reports_total) leg.reports_done = true;
   });
-  if (trip.stock_return_at) p.my_stock_return_done = true;
+  if (trip.stock_return_at || trip.return_by_other_at) p.my_stock_return_done = true;
   if (trip.completed_at) p.completed = true;
   return finish(p);
 }
@@ -210,13 +214,13 @@ export function buildLocalProgress(flights, flightId, journal, reportsTotal = DE
         reports_locked: !!local.forms_locked_at || !!f.my_forms_locked_at,
         devices: String(f.crew_account || '').split(',').filter(Boolean),
         stock_count_needed: index < legs.length - 1,
-        stock_count_done: !!local.stock_count_at,
-        my_stock_count_done: !!local.stock_count_at,
+        stock_count_done: !!(local.stock_count_at || local.stock_by_other_at),
+        my_stock_count_done: !!(local.stock_count_at || local.stock_by_other_at),
         stock_count_waiting_for: [],
       };
     }),
     stock_return: trip.stock_return_at ? 'WAITING' : 'NOT_SUBMITTED',
-    my_stock_return_done: !!trip.stock_return_at,
+    my_stock_return_done: !!(trip.stock_return_at || trip.return_by_other_at),
     completed: !!trip.completed_at,
     offline_built: true,
   };
@@ -229,28 +233,36 @@ export function applyJournalToSector(sector, journal, employeeId) {
   const leg = findLeg(journal, sector.flight_id);
   if (!leg) return sector;
   const forms = leg.forms || {};
+  const payloads = leg.payloads || {};
+  const localReport = (entry, status) => ({
+    ...(entry.report || {}),
+    status, local: true, payload: payloads[entry.report_type] || (entry.report || {}).payload || {},
+    submitted_by: status === 'SUBMITTED' ? employeeId : (entry.report || {}).submitted_by,
+    issue_label: (entry.report || {}).issue_label || 'Saved on this phone', rev_label: (entry.report || {}).rev_label || 'uploads on Wi-Fi',
+    report_date: (entry.report || {}).report_date || new Date().toISOString().slice(0, 10),
+  });
+  // 7.18: a form saved on the phone is a draft until the final submission;
+  // "Another crew member will fill these forms" covers the whole sector.
   const reports = (sector.reports || []).map((entry) => {
+    if (entry.status === 'SUBMITTED') return entry;
     const mark = forms[entry.report_type];
-    if (!mark || entry.status === 'SUBMITTED') return entry;
     if (mark === 'mine') {
-      return {
-        ...entry,
-        status: 'SUBMITTED',
-        report: entry.report || {
-          status: 'SUBMITTED', local: true, payload: (leg.payloads || {})[entry.report_type] || {},
-          submitted_by: employeeId, issue_label: 'Saved on this iPad', rev_label: 'uploads on Wi-Fi',
-          report_date: new Date().toISOString().slice(0, 10),
-        },
-      };
+      return { ...entry, status: 'SUBMITTED', report: localReport(entry, 'SUBMITTED') };
     }
-    return { ...entry, status: 'AWAITING_OTHER', deferred_by_me: true, deferred_by: [...(entry.deferred_by || []), employeeId] };
+    if (mark === 'draft') return { ...entry, status: 'DRAFT', report: localReport(entry, 'DRAFT') };
+    if (mark === 'other' || (leg.defer_all_at && entry.status !== 'DRAFT')) {
+      return { ...entry, status: 'AWAITING_OTHER', deferred_by_me: true,
+        deferred_by: Array.from(new Set([...(entry.deferred_by || []), employeeId])) };
+    }
+    return entry;
   });
   return {
     ...sector,
     reports,
-    locked: !!sector.locked || !!(leg && leg.forms_locked_at),
-    flight_status: leg && leg.finished_at && sector.flight_status === 'OPEN' ? 'FLOWN' : sector.flight_status,
-    my_finished: !!(leg && leg.finished_at) || sector.flight_status !== 'OPEN',
+    left_to_others: !!leg.defer_all_at || reports.some((e) => e.deferred_by_me),
+    flight_status: leg.finished_at && sector.flight_status === 'OPEN' ? 'FLOWN' : sector.flight_status,
+    my_finished: !!leg.finished_at || sector.flight_status !== 'OPEN',
+    drafts: reports.filter((e) => e.status === 'DRAFT').map((e) => e.report_type),
     outstanding: reports.filter((e) => e.status !== 'SUBMITTED' && e.status !== 'AWAITING_OTHER').map((e) => e.report_type),
     awaiting_other: reports.filter((e) => e.status === 'AWAITING_OTHER').map((e) => e.report_type),
   };
@@ -441,7 +453,7 @@ export function buildLocalSector(flight, forms, me) {
     sector: `${flight.origin}-${flight.destination}`, aircraft: flight.aircraft, aircraft_type: flight.aircraft_type,
     flight_status: legFinished(flight) ? 'FLOWN' : flight.status, merged_status: flight.status,
     trip_type: flight.trip_type, segment: flight.direction === 'RETURN' ? 2 : 1,
-    locked: !!flight.my_forms_locked_at, devices, offline_built: true,
+    locked: false, devices, offline_built: true,
     reports: (forms || []).map((form) => ({
       report_type: form.type, title: form.title, form_code: form.form_code, manual: form.manual, appendix: form.appendix,
       report: null, status: 'NOT_STARTED', deferred_by: [], deferred_by_me: false,

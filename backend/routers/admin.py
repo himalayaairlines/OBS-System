@@ -74,7 +74,8 @@ class UserUpdate(BaseModel):
 
 
 # Shared cabin devices: the administrator sets and keeps their password.
-SHARED_DEVICE_ROLES = ("crew", "crew_supervisor")
+# 7.18: a crew member's own login ("crew") is personal, so it is not one.
+SHARED_DEVICE_ROLES = ("crew_supervisor",)
 
 
 class TwoFactorIn(BaseModel):
@@ -464,6 +465,9 @@ def create_crew_member(data: CrewMemberIn, user: dict = Depends(requires("crew_m
         )
         connection.commit()
         row = connection.execute("SELECT * FROM crew_members WHERE crew_code=?", (code,)).fetchone()
+        # 7.18: their own login, user name = crew code, default password to change.
+        from crew_accounts import sync_crew_logins
+        sync_crew_logins(connection, row["id"])
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="That crew code already exists.")
     finally:
@@ -487,6 +491,8 @@ def update_crew_member(member_id: int, data: CrewMemberIn, user: dict = Depends(
         )
         connection.commit()
         updated = connection.execute("SELECT * FROM crew_members WHERE id=?", (member_id,)).fetchone()
+        from crew_accounts import sync_crew_logins
+        sync_crew_logins(connection, member_id)
     except sqlite3.IntegrityError:
         raise HTTPException(status_code=400, detail="That crew code already exists.")
     finally:
@@ -511,9 +517,16 @@ def delete_crew_member(member_id: int, user: dict = Depends(requires("crew_membe
             connection.execute("UPDATE crew_members SET active=0 WHERE id=?", (member_id,))
             message = "Crew member is in a group and has been deactivated instead of deleted."
         else:
+            # The login goes with them: it is disabled, not deleted, so the
+            # audit trail keeps a name behind every action it took.
+            connection.execute("UPDATE users SET active=0 WHERE crew_member_id=?", (member_id,))
+            connection.execute("UPDATE users SET crew_member_id=NULL WHERE crew_member_id=?", (member_id,))
             connection.execute("DELETE FROM crew_members WHERE id=?", (member_id,))
             message = "Crew member removed."
         connection.commit()
+        if in_group:
+            from crew_accounts import sync_crew_logins
+            sync_crew_logins(connection, member_id)
     finally:
         connection.close()
     log_action(user, "CREW ROSTER", "REMOVE_CREW", f"{message} ({row['crew_code']})",

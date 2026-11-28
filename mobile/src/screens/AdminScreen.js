@@ -19,8 +19,9 @@ import {
 import { Toggle, when } from './comms/shared';
 
 const ROLES = Object.keys(ROLE_LABELS);
-// Shared OBS devices sign in with a password set here and have no mailbox.
-const DEVICE_ROLES = ['crew', 'crew_supervisor'];
+// The legacy shared OBS iPads sign in with a password set here and have no
+// mailbox. 7.18: individual crew logins change their password at first login.
+const DEVICE_ROLES = ['crew_supervisor'];
 
 const STATUS = {
   ACTIVE: { label: 'Active', tone: 'success', color: COLORS.success },
@@ -125,7 +126,7 @@ function CrewRoster({ notify }) {
       <Card>
         <SectionTitle
           title={editingId ? 'Edit crew member' : 'Add a crew member'}
-          description="These names are what Inventory picks from when building groups of four."
+          description="Each crew member gets their own login automatically: the user name is the crew code and the first password is Him@9841, which must be changed at first login. Removing a crew member disables the login."
         />
         <View style={[styles.row, styles.gap8]}>
           <Field

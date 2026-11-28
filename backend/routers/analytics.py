@@ -384,6 +384,11 @@ def sector_commission(connection, flight_id: int) -> dict:
     if sector:
         for r in sector["sellers"]:
             combo_by_member[r["crew_member_id"]] = float(r["revenue"] or 0)
+    # 7.18: what each crew member sold on their own login (all normal sales).
+    own_sales = {r["sold_by_crew_member_id"]: (float(r["npr"] or 0), int(r["tx"] or 0)) for r in connection.execute(
+        """SELECT sold_by_crew_member_id, SUM(npr_amount) npr, COUNT(DISTINCT order_ref) tx FROM sales
+           WHERE flight_id=? AND sale_type='NORMAL' AND sold_by_crew_member_id IS NOT NULL
+           GROUP BY sold_by_crew_member_id""", (flight_id,))}
     members = []
     for m in roster:
         combo = combo_by_member.get(m["id"], 0.0)
@@ -391,6 +396,8 @@ def sector_commission(connection, flight_id: int) -> dict:
         members.append({
             "crew_member_id": m["id"], "crew_code": m["crew_code"], "name": m["name"], "position": m["position"],
             "share_npr": round(share, 2), "combo_sales_npr": round(combo, 2),
+            "own_sales_npr": round(own_sales.get(m["id"], (0.0, 0))[0], 2),
+            "own_transactions": own_sales.get(m["id"], (0.0, 0))[1],
             "combo_commission_npr": round(combo * COMMISSION_RATE, 2),
             "total_npr": round(share + combo * COMMISSION_RATE, 2),
         })
@@ -417,8 +424,26 @@ def crew_ranking(year: int | None = None, month: int | None = None, day: int | N
     connection = get_connection()
     try:
         entries, sectors = _commission_entries(connection, conditions, params)
+        # 7.18: every crew member sells on their own login, so each sale names
+        # its seller. This is the individual sales ranking (all normal sales,
+        # products and combos), separate from the pooled commission.
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sold = connection.execute(
+            f"""SELECT m.id, m.crew_code, m.name, m.position,
+                       ROUND(COALESCE(SUM(s.npr_amount),0),2) AS sales_npr,
+                       COALESCE(SUM(s.quantity),0) AS units,
+                       COUNT(DISTINCT s.order_ref) AS transactions,
+                       COUNT(DISTINCT s.flight_id) AS flights
+                FROM sales s JOIN flights f ON f.id = s.flight_id
+                JOIN crew_members m ON m.id = s.sold_by_crew_member_id
+                {where}{' AND ' if where else 'WHERE '}s.sale_type='NORMAL'
+                GROUP BY m.id ORDER BY sales_npr DESC, m.name""", params).fetchall()
     finally:
         connection.close()
+    sales_ranking = [{"rank": i, "crew_member_id": r["id"], "crew_code": r["crew_code"], "name": r["name"],
+                      "position": r["position"], "sales_npr": float(r["sales_npr"] or 0), "units": int(r["units"] or 0),
+                      "transactions": int(r["transactions"] or 0), "flights": int(r["flights"] or 0)}
+                     for i, r in enumerate(sold, start=1)]
 
     ranking = sorted(entries.values(), key=lambda e: (-e["commission_npr"], e["name"]))
     combo_ranking = sorted((e for e in entries.values() if e["combo_commission_npr"] > 0),
@@ -470,6 +495,7 @@ def crew_ranking(year: int | None = None, month: int | None = None, day: int | N
         "commission_model": COMMISSION_MODEL,
         "ranking": result,
         "combo_ranking": combo_result,
+        "sales_ranking": sales_ranking,
         "sectors": sorted(
             (_render_sector(s) for s in sectors.values()),
             key=lambda s: s["revenue_npr"], reverse=True,

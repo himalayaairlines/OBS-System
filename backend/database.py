@@ -12,6 +12,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("OBS_DB_PATH") or BASE_DIR / "obs.db")
 
 ROLES = (
+    "crew",
     "crew_supervisor",
     "inventory",
     "management",
@@ -19,10 +20,13 @@ ROLES = (
     "admin",
 )
 
-# The ordinary `crew` role was retired: a sector is worked from one iPad, so
-# there is a single cabin account and it carries supervisory authority.
-# Any legacy crew account is migrated to crew_supervisor on startup.
-RETIRED_ROLES = ("crew",)
+# 7.18: every cabin crew member has a login of their own (role "crew"); the
+# user name is their crew code. "crew_supervisor" is the earlier shared OBS
+# iPad account and keeps working the same way. Both are "cabin" roles.
+RETIRED_ROLES = ()
+CREW_ROLES = ("crew", "crew_supervisor")
+# The first password of every crew login; it must be changed at first sign-in.
+DEFAULT_CREW_PASSWORD = os.getenv("OBS_DEFAULT_CREW_PASSWORD", "Him@9841")
 
 # Permission keys drive both the API guards and the mobile navigation.
 # Every role can read its own in-app notifications; that needs no key.
@@ -41,7 +45,7 @@ RETIRED_ROLES = ("crew",)
 ROLE_PERMISSIONS = {
     # The OBS iPad account. Forms the duty group, sells, finishes the sector,
     # declares leftover stock and files the post-flight cabin reports.
-    "crew_supervisor": {"crew", "sync", "reconcile_submit", "flight_reports"},
+    "crew_supervisor": {"crew", "sync", "reconcile_submit", "flight_reports", "cash"},
     # `groups` is read-only visibility of the duty groups the crew formed.
     # Nobody on the ground builds them any more.
     # 7.17: one inventory role. Every inventory user loads trolleys, assigns
@@ -52,6 +56,9 @@ ROLE_PERMISSIONS = {
         "inventory", "warehouse", "warehouse_approve", "bundles",
         "groups", "stock_add", "reconcile_approve", "sync",
         "sales_view", "sales_edit", "alerts_handle", "price_edit",
+        # 7.18: read the cabin reports (no editing), the cash sheets
+        # (fill the floating cash, approve sheets).
+        "reports_view", "cash", "cash_approve",
     },
     # Management oversee and correct; they do not sell, so no crew sales screen.
     # `groups_manage` is the post-lock amendment of a duty group, with remarks.
@@ -60,10 +67,11 @@ ROLE_PERMISSIONS = {
         "stock_add", "dashboard", "sync", "logs", "rates", "rates_edit",
         "sales_view", "sales_edit", "reports", "warehouse_approve",
         "reconcile_approve", "reconcile_submit", "flight_reports", "reports_review", "alerts_handle",
-        "price_edit",
+        "price_edit", "reports_view", "sales_report", "cash", "cash_approve",
     },
-    # Finance set rates and read performance. No sales, commission or sync.
-    "finance": {"rates", "rates_edit", "dashboard", "reports"},
+    # Finance set the monthly rates and read the dashboard and the sales report.
+    # They see the cash sheets but do not fill them (7.18: "cash_view" only).
+    "finance": {"rates", "rates_edit", "dashboard", "reports", "sales_report", "cash_view"},
     # The administrator owns system configuration, including SMTP credentials.
     "admin": {"users", "crew_members", "smtp_view", "smtp_manage", "smtp_test", "alerts_handle",
               "comms_admin", "comms_templates",
@@ -80,6 +88,8 @@ ROLE_PERMISSIONS["admin"] = set().union(*ROLE_PERMISSIONS.values()) | {"sell_any
 # Accounts created before 7.17 are moved to "inventory" at start-up; the alias
 # keeps a token issued under the old role working until it expires.
 ROLE_PERMISSIONS["inventory_supervisor"] = ROLE_PERMISSIONS["inventory"]
+# 7.18: a crew member's own login does what the shared iPad account did.
+ROLE_PERMISSIONS["crew"] = set(ROLE_PERMISSIONS["crew_supervisor"])
 
 # --------------------------------------------------------------------------- #
 # Commission
@@ -97,9 +107,9 @@ COMMISSION_RATE = 0.10
 # combo is picked and earns that combo's commission personally.
 COMMISSION_MODEL = "POOLED"
 
-# How many OBS iPads work one sector (7.11): both are assigned by Inventory,
-# both sell offline, both confirm the remaining stock.
-DEVICES_PER_FLIGHT = 2
+# How many crew logins may work one sector (7.18: every crew member sells on
+# their own phone, so as many as the duty group can hold).
+DEVICES_PER_FLIGHT = 10
 
 # A duty group is the crew working one sector: between two and ten cabin crew
 # (7.9). DUTY_GROUP_SIZE is the usual size, kept for labels and old callers.
@@ -680,12 +690,6 @@ def _migrate_legacy(connection):
         connection.execute(
             "UPDATE reconciliations SET status='PENDING' WHERE status='AWAITING_DEVICES'"
         )
-    if "users" in tables:
-        # The ordinary crew role was retired; the account keeps working as the
-        # single cabin login rather than being locked out mid-operation.
-        connection.execute(
-            "UPDATE users SET role='crew_supervisor' WHERE role='crew'"
-        )
     if "duty_groups" in tables:
         _add_column(connection, "duty_groups", "amend_count", "INTEGER NOT NULL DEFAULT 0")
     _rebuild_reconciliation_items(connection)
@@ -973,6 +977,11 @@ def initialize_database():
         # 7.17: the inventory supervisor role is folded into "inventory".
         connection.execute("UPDATE users SET role='inventory' WHERE role='inventory_supervisor'")
         connection.commit()
+        # 7.18: a login for every crew member on the roster.
+        from crew_accounts import sync_crew_logins
+        sync_crew_logins(connection)
+        from routers.cash import initialize_cash
+        initialize_cash(connection)
 
         connection.commit()
     finally:

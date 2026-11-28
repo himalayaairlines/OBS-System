@@ -72,15 +72,31 @@ def _may_review(user) -> bool:
     return "reports_review" in permissions_for(user["role"])
 
 
+def _may_read(user) -> bool:
+    """7.18: Inventory reads the cabin reports too, without changing them."""
+    return bool(permissions_for(user["role"]) & {"flight_reports", "reports_review", "reports_view"})
+
+
+def _reader(user: dict = Depends(current_user)) -> dict:
+    if not _may_read(user):
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action.")
+    return user
+
+
+def _crew_reader(user) -> bool:
+    """A crew login: sees only the sectors it is rostered on."""
+    return not (_may_review(user) or "reports_view" in permissions_for(user["role"]))
+
+
 def _assert_device(connection, flight, user):
     """Only the iPad that worked the sector may file its reports."""
     if _may_review(user):
         return
     if not flight["crew_account"]:
-        raise HTTPException(status_code=400, detail="No OBS device is assigned to this flight.")
+        raise HTTPException(status_code=400, detail="No crew is rostered on this sector.")
     if user["employee_id"] not in str(flight["crew_account"]).split(","):
         raise HTTPException(
-            status_code=403, detail="This device did not work that sector.",
+            status_code=403, detail="You were not rostered on that sector.",
         )
 
 
@@ -152,12 +168,12 @@ LEFT JOIN duty_groups d ON d.id = r.duty_group_id
 # The forms themselves
 # --------------------------------------------------------------------------- #
 @router.get("/report-forms")
-def report_forms(user: dict = Depends(requires("flight_reports"))):
+def report_forms(user: dict = Depends(_reader)):
     """The definition of every form, so the client renders it from the schema.
     The crew get only the forms the administrator has switched on (7.13);
     Management get them all, so a form filed before it was switched off can
     still be read."""
-    if _may_review(user):
+    if not _crew_reader(user):
         return REPORT_FORMS
     connection = get_connection()
     try:
@@ -213,20 +229,18 @@ def list_reports(flight_id: int | None = None, date: str | None = None,
                  flight_number: str | None = None, report_type: str | None = None,
                  status: str | None = None, limit: int = 300,
                  page: int | None = PageParam, page_size: int = PageSizeParam,
-                 user: dict = Depends(requires("flight_reports"))):
-    """Filed reports. Management filter by date and flight; a device sees its own."""
+                 user: dict = Depends(_reader)):
+    """Filed reports. Management filter by date and flight; crew see their own sectors."""
     connection = get_connection()
     try:
         conditions, params = [], []
-        if not _may_review(user):
-            # A cabin account sees only the sectors its own iPad worked.
+        if _crew_reader(user):
+            # A crew login sees only the sectors it was rostered on.
             conditions.append(
                 """r.flight_id IN (SELECT flight_id FROM flight_assignments
                                    WHERE crew_account=?)"""
             )
             params.append(user["employee_id"])
-            # and only what it has not yet closed out, plus recent history
-            conditions.append("f.flight_date >= date('now','-7 day')")
         if flight_id:
             conditions.append("r.flight_id=?")
             params.append(flight_id)
@@ -259,14 +273,221 @@ def list_reports(flight_id: int | None = None, date: str | None = None,
         connection.close()
 
 
+# --------------------------------------------------------------------------- #
+# 7.18: the forms outside the flight flow
+# --------------------------------------------------------------------------- #
+def _leg_forms(connection, flight_id: int, enabled: list[str]) -> list[dict]:
+    """Each form of a sector with who did what: SUBMITTED, DRAFT,
+    AWAITING_OTHER ("another crew member will fill it") or PENDING."""
+    filed = {r["report_type"]: dict(r) for r in connection.execute(
+        "SELECT id, report_type, status, submitted_by, submitted_at, created_by, created_at, edited_by, edited_at, rev_no "
+        "FROM flight_reports WHERE flight_id=?", (flight_id,))}
+    deferred = {}
+    for r in connection.execute("SELECT report_type, device FROM flight_report_deferrals WHERE flight_id=?", (flight_id,)):
+        deferred.setdefault(r["report_type"], []).append(r["device"])
+    out = []
+    for report_type in [t for t in REPORT_TYPES if t in enabled or t in filed]:
+        form = form_for(report_type)
+        row = filed.get(report_type)
+        status = row["status"] if row else ("AWAITING_OTHER" if deferred.get(report_type) else "PENDING")
+        out.append({
+            "report_type": report_type, "title": form["title"], "form_code": form["form_code"],
+            "status": status, "report_id": row["id"] if row else None,
+            "submitted_by": row["submitted_by"] if row else None, "submitted_at": row["submitted_at"] if row else None,
+            "saved_by": (row["edited_by"] or row["created_by"]) if row else None,
+            "saved_at": (row["edited_at"] or row["created_at"]) if row else None,
+            "rev_no": row["rev_no"] if row else None,
+            "deferred_by": deferred.get(report_type, []),
+            "switched_off": report_type not in enabled,
+        })
+    return out
+
+
+@router.get("/flight-reports/my-sectors")
+def my_report_sectors(date: str | None = None, user: dict = Depends(requires("flight_reports"))):
+    """The sectors a crew member may file forms for: every sector they were
+    rostered on, any date (newest first), whether or not the flight is over."""
+    conditions = ["f.id IN (SELECT flight_id FROM flight_assignments WHERE crew_account=?)"]
+    params = [user["employee_id"]]
+    if date:
+        conditions.append("f.flight_date=?")
+        params.append(validate_date(date, "date"))
+    connection = get_connection()
+    try:
+        enabled = enabled_report_types(connection)
+        rows = connection.execute(
+            f"""SELECT f.id, f.flight_number, f.flight_date, f.origin, f.destination, f.direction, f.trip_type,
+                       f.linked_flight_id, f.status
+                FROM flights f WHERE {' AND '.join(conditions)}
+                ORDER BY f.flight_date DESC, f.flight_number, CASE f.direction WHEN 'RETURN' THEN 1 ELSE 0 END
+                LIMIT 200""", params).fetchall()
+        out = []
+        for r in rows:
+            forms = _leg_forms(connection, r["id"], enabled)
+            mine = [f for f in forms if user["employee_id"] in f["deferred_by"]]
+            out.append({**dict(r), "sector": f"{r['origin']}-{r['destination']}",
+                        "submitted": sum(1 for f in forms if f["status"] == "SUBMITTED"),
+                        "drafts": sum(1 for f in forms if f["status"] == "DRAFT"),
+                        "pending": sum(1 for f in forms if f["status"] in ("PENDING", "AWAITING_OTHER")),
+                        "total": len([f for f in forms if not f["switched_off"]]),
+                        "left_to_others": bool(mine)})
+        return out
+    finally:
+        connection.close()
+
+
+@router.get("/flight-reports/trips")
+def report_trips(date: str | None = None, date_to: str | None = None, flight_number: str | None = None,
+                 status: str | None = None, page: int | None = PageParam, page_size: int = PageSizeParam,
+                 user: dict = Depends(_reader)):
+    """Management / Inventory / Admin: the forms trip by trip
+    ("KTM-DXB-KTM (date)"), each leg with every form's state."""
+    if _crew_reader(user):
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action.")
+    conditions, params = ["(f.direction <> 'RETURN' OR f.linked_flight_id IS NULL)"], []
+    if date:
+        conditions.append("f.flight_date >= ?" if date_to else "f.flight_date = ?")
+        params.append(validate_date(date, "date"))
+    if date_to:
+        conditions.append("f.flight_date <= ?")
+        params.append(validate_date(date_to, "date"))
+    if flight_number:
+        conditions.append("(f.flight_number LIKE ? OR f.id IN (SELECT linked_flight_id FROM flights WHERE flight_number LIKE ?))")
+        needle = f"%{flight_number.strip().upper()[:12]}%"
+        params.extend([needle, needle])
+    connection = get_connection()
+    try:
+        enabled = enabled_report_types(connection)
+        roots = connection.execute(
+            f"SELECT * FROM flights f WHERE {' AND '.join(conditions)} ORDER BY f.flight_date DESC, f.flight_number",
+            params).fetchall()
+        trips = []
+        for root in roots:
+            legs = [dict(root)] + [dict(r) for r in connection.execute(
+                "SELECT * FROM flights WHERE linked_flight_id=? AND direction='RETURN' ORDER BY id", (root["id"],))]
+            route = "-".join([legs[0]["origin"]] + [l["destination"] for l in legs])
+            out_legs = []
+            for leg in legs:
+                forms = _leg_forms(connection, leg["id"], enabled)
+                out_legs.append({
+                    "id": leg["id"], "flight_number": leg["flight_number"], "flight_date": leg["flight_date"],
+                    "origin": leg["origin"], "destination": leg["destination"], "direction": leg["direction"],
+                    "original_destination": leg.get("original_destination"), "status": leg["status"],
+                    "sector": f"{leg['origin']}-{leg['destination']}", "forms": forms,
+                    "pending": sum(1 for f in forms if f["status"] != "SUBMITTED" and not f["switched_off"]),
+                })
+            pending = sum(l["pending"] for l in out_legs)
+            trips.append({"root_id": root["id"], "flight_date": root["flight_date"],
+                          "flight_numbers": " / ".join(dict.fromkeys(l["flight_number"] for l in legs)),
+                          "route": route, "label": f"{route} ({root['flight_date']})",
+                          "legs": out_legs, "pending": pending,
+                          "complete": pending == 0})
+        if status:
+            wanted = status.strip().upper()
+            trips = [t for t in trips if (wanted == "PENDING" and t["pending"]) or (wanted == "COMPLETE" and t["complete"])]
+        if page:
+            return paginate_list(trips, page, page_size)
+        return trips
+    finally:
+        connection.close()
+
+
+class SectorIn(BaseModel):
+    flight_id: int
+
+
+@router.post("/flight-reports/final-submit")
+def final_submit(data: SectorIn, user: dict = Depends(requires("flight_reports"))):
+    """The final submission of every form saved (as a draft) for a sector.
+    Afterwards the crew can no longer change them; it is in the audit log who
+    submitted them and when."""
+    connection = get_connection()
+    try:
+        flight = _flight(connection, data.flight_id)
+        _assert_device(connection, flight, user)
+        enabled = enabled_report_types(connection)
+        drafts = connection.execute(
+            "SELECT * FROM flight_reports WHERE flight_id=? AND status='DRAFT'", (data.flight_id,)).fetchall()
+        drafts = [d for d in drafts if d["report_type"] in enabled or _may_review(user)]
+        if not drafts:
+            already = connection.execute(
+                "SELECT COUNT(*) FROM flight_reports WHERE flight_id=? AND status='SUBMITTED'", (data.flight_id,)).fetchone()[0]
+            if already:
+                # A replay from a phone that lost its signal, or a colleague
+                # who submitted first: nothing is left to do, which is fine.
+                return {**reports_for_flight(data.flight_id, user), "already_submitted": True}
+            raise HTTPException(status_code=400, detail="There is no saved form to submit on this sector.")
+        now = now_iso()
+        titles = []
+        for d in drafts:
+            rev_no = int(d["rev_no"]) + (1 if int(d["unsubmit_count"] or 0) > 0 else 0)
+            connection.execute(
+                "UPDATE flight_reports SET status='SUBMITTED', submitted_by=?, submitted_at=?, rev_no=? "
+                "WHERE id=? AND status='DRAFT'", (user["employee_id"], now, rev_no, d["id"]))
+            connection.execute(
+                """INSERT INTO flight_report_revisions(report_id,rev_no,payload,action,changed_by,changed_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (d["id"], rev_no, d["payload"], "SUBMITTED" if rev_no == 0 else "RESUBMITTED", user["employee_id"], now))
+            titles.append(form_for(d["report_type"])["title"])
+        connection.commit()
+    finally:
+        connection.close()
+    log_action(user, "CABIN REPORT", "FINAL_SUBMIT",
+               f"Final submission for {flight['flight_number']} {flight['origin']}-{flight['destination']} "
+               f"{flight['flight_date']}: {', '.join(titles)}.", "flight", data.flight_id,
+               metadata={"forms": titles})
+    return reports_for_flight(data.flight_id, user)
+
+
+@router.post("/flight-reports/defer-all")
+def defer_all(data: SectorIn, user: dict = Depends(requires("flight_reports"))):
+    """"Another crew member will fill these forms": one press for the whole
+    sector. It only records that this crew member left the forms to a
+    colleague; it does not file anything."""
+    connection = get_connection()
+    try:
+        flight = _flight(connection, data.flight_id)
+        _assert_device(connection, flight, user)
+        enabled = enabled_report_types(connection)
+        done = {r["report_type"] for r in connection.execute(
+            "SELECT report_type FROM flight_reports WHERE flight_id=? AND status='SUBMITTED'", (data.flight_id,))}
+        now = now_iso()
+        left = [t for t in enabled if t not in done]
+        for report_type in left:
+            connection.execute(
+                "INSERT OR IGNORE INTO flight_report_deferrals(flight_id,report_type,device,created_at) VALUES (?,?,?,?)",
+                (data.flight_id, report_type, user["employee_id"], now))
+        connection.commit()
+    finally:
+        connection.close()
+    log_action(user, "CABIN REPORT", "LEAVE_TO_COLLEAGUE",
+               f"{user['employee_id']} left the forms of {flight['flight_number']} {flight['origin']}-{flight['destination']} "
+               f"{flight['flight_date']} to another crew member.", "flight", data.flight_id)
+    return reports_for_flight(data.flight_id, user)
+
+
+@router.delete("/flight-reports/defer-all")
+def undefer_all(flight_id: int, user: dict = Depends(requires("flight_reports"))):
+    connection = get_connection()
+    try:
+        flight = _flight(connection, flight_id)
+        _assert_device(connection, flight, user)
+        connection.execute("DELETE FROM flight_report_deferrals WHERE flight_id=? AND device=?",
+                           (flight_id, user["employee_id"]))
+        connection.commit()
+    finally:
+        connection.close()
+    return reports_for_flight(flight_id, user)
+
+
 @router.get("/flight-reports/{report_id}")
-def get_report(report_id: int, user: dict = Depends(requires("flight_reports"))):
+def get_report(report_id: int, user: dict = Depends(_reader)):
     connection = get_connection()
     try:
         row = connection.execute(f"{REPORT_SELECT} WHERE r.id=?", (report_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Report not found.")
-        if not _may_review(user):
+        if _crew_reader(user):
             _assert_device(connection, _flight(connection, row["flight_id"]), user)
         return _render(connection, row)
     finally:
@@ -274,7 +495,7 @@ def get_report(report_id: int, user: dict = Depends(requires("flight_reports")))
 
 
 @router.get("/flights/{flight_id}/reports")
-def reports_for_flight(flight_id: int, user: dict = Depends(requires("flight_reports"))):
+def reports_for_flight(flight_id: int, user: dict = Depends(_reader)):
     """Every form for a sector, filed or not, so the crew can see what is left.
 
     The outstanding list is what the application shows after a sector is
@@ -283,7 +504,7 @@ def reports_for_flight(flight_id: int, user: dict = Depends(requires("flight_rep
     connection = get_connection()
     try:
         flight = _flight(connection, flight_id)
-        if not _may_review(user):
+        if _crew_reader(user):
             _assert_device(connection, flight, user)
 
         existing = {
@@ -347,9 +568,11 @@ def reports_for_flight(flight_id: int, user: dict = Depends(requires("flight_rep
             "merged_status": flight["status"],
             "trip_type": flight["trip_type"],
             "segment": 2 if flight["direction"] == "RETURN" else 1,
-            "locked": bool(flight["reports_locked_at"] or flight["trip_completed_at"]
-                           or (not _may_review(user)
-                               and trip_flow.device_state(connection, flight_id, user["employee_id"])["forms_locked_at"])),
+            # 7.18: forms are outside the flight flow; each form closes to the
+            # crew on its own final submission, never because of the trip.
+            "locked": False,
+            "read_only": not _may_review(user) and "flight_reports" not in permissions_for(user["role"]),
+            "drafts": [e["report_type"] for e in entries if e["status"] == "DRAFT"],
             "devices": devices,
             "reports": entries,
             # Still to handle on this iPad: neither submitted nor marked as the other iPad's.
@@ -445,6 +668,11 @@ def file_report(data: ReportIn, user: dict = Depends(requires("flight_reports"))
                 return _render(connection, connection.execute(
                     f"{REPORT_SELECT} WHERE r.id=?", (existing["id"],)).fetchone())
 
+            if existing["status"] == "SUBMITTED" and not data.submit and not _may_review(user):
+                raise HTTPException(
+                    status_code=400,
+                    detail="This form has had its final submission and can no longer be changed. "
+                           "Ask Management if something needs correcting.")
             if existing["status"] == "SUBMITTED" and data.submit and data.client_ref \
                     and existing["submitted_by"] != user["employee_id"]:
                 # 7.12: both iPads filled this form in on board, with no way of
@@ -563,8 +791,10 @@ def unsubmit_report(report_id: int, user: dict = Depends(requires("flight_report
         if not row:
             raise HTTPException(status_code=404, detail="Report not found.")
         flight = _flight(connection, row["flight_id"])
-        _assert_device(connection, flight, user)
-        trip_flow.assert_reports_open(connection, flight["id"], _may_review(user), user["employee_id"])
+        if not _may_review(user):
+            # 7.18: after the final submission the crew cannot reopen a form.
+            raise HTTPException(status_code=403,
+                                detail="A form cannot be changed after its final submission. Ask Management.")
         if row["status"] != "SUBMITTED":
             raise HTTPException(status_code=400, detail="This report has not been filed yet.")
         if int(row["unsubmit_count"]) >= REPORT_UNSUBMIT_LIMIT:
@@ -627,10 +857,10 @@ def edit_report(report_id: int, data: ReportEdit,
             raise HTTPException(status_code=404, detail="Report not found.")
         reviewer = _may_review(user)
         if not reviewer:
-            _assert_device(connection, _flight(connection, row["flight_id"]), user)
-            trip_flow.assert_reports_open(connection, row["flight_id"], False, user["employee_id"])
-            if row["status"] != "SUBMITTED":
-                raise HTTPException(status_code=400, detail="Save the form first.")
+            # 7.18: the crew edit a draft by saving it again; once finally
+            # submitted only Management may correct it.
+            raise HTTPException(status_code=403,
+                                detail="A form cannot be changed after its final submission. Ask Management.")
         payload = _clean_payload(row["report_type"], data.payload)
         rev_no = int(row["rev_no"]) + 1
         now = now_iso()
@@ -670,7 +900,7 @@ def edit_report(report_id: int, data: ReportEdit,
 
 
 @router.get("/flight-reports/{report_id}/pdf")
-def report_pdf(report_id: int, user: dict = Depends(requires("flight_reports"))):
+def report_pdf(report_id: int, user: dict = Depends(_reader)):
     """The report laid out like the paper form, for printing or e-mailing."""
     from report_pdf import build_pdf
     connection = get_connection()
@@ -678,7 +908,7 @@ def report_pdf(report_id: int, user: dict = Depends(requires("flight_reports")))
         row = connection.execute(f"{REPORT_SELECT} WHERE r.id=?", (report_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Report not found.")
-        if not _may_review(user):
+        if _crew_reader(user):
             _assert_device(connection, _flight(connection, row["flight_id"]), user)
         report = _render(connection, row)
     finally:
@@ -690,7 +920,7 @@ def report_pdf(report_id: int, user: dict = Depends(requires("flight_reports")))
 
 
 @router.get("/flight-reports/{report_id}/revisions")
-def report_revisions(report_id: int, user: dict = Depends(requires("reports_review"))):
+def report_revisions(report_id: int, user: dict = Depends(_reader)):
     """Every version of a report, so a correction can be read against the original."""
     connection = get_connection()
     try:

@@ -42,6 +42,9 @@ from report_forms import REPORT_TYPES, enabled_report_types
 from sector_stock import sector_count_submitted
 
 FLIGHT_COLUMNS = (
+    # 7.18: a diverted sector keeps where it was meant to go.
+    ("original_destination", "TEXT"),
+    ("diverted_at", "TEXT"),
     ("started_at", "TEXT"),
     ("started_by", "TEXT"),
     ("reports_locked_at", "TEXT"),
@@ -49,7 +52,10 @@ FLIGHT_COLUMNS = (
     ("trip_completed_by", "TEXT"),
 )
 
-DEVICE_STATE_COLUMNS = ("finished_at", "started_at", "forms_locked_at", "completed_at")
+DEVICE_STATE_COLUMNS = ("finished_at", "started_at", "forms_locked_at", "completed_at",
+                        # 7.18: "another crew member submitted it" for the
+                        # sector stock count (leg row) / final return (root row).
+                        "stock_by_other_at", "return_by_other_at")
 
 
 def initialize_trip_flow(connection, add_column, columns_of):
@@ -73,6 +79,23 @@ def initialize_trip_flow(connection, add_column, columns_of):
                forms_locked_at TEXT,
                completed_at TEXT,
                UNIQUE(flight_id, device))""")
+    existing_state = {r[1] for r in connection.execute("PRAGMA table_info(trip_device_state)")}
+    for column in ("stock_by_other_at", "return_by_other_at"):
+        if column not in existing_state:
+            connection.execute(f"ALTER TABLE trip_device_state ADD COLUMN {column} TEXT")
+    # 7.18: diversions entered by the crew (the sector's destination changes).
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS flight_diversions (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               flight_id INTEGER NOT NULL REFERENCES flights(id) ON DELETE CASCADE,
+               planned_destination TEXT NOT NULL,
+               diverted_to TEXT NOT NULL,
+               reason TEXT NOT NULL,
+               diverted_at TEXT,
+               remarks TEXT NOT NULL,
+               entered_by TEXT NOT NULL,
+               entered_at TEXT NOT NULL,
+               client_ref TEXT UNIQUE)""")
     # 7.15: a value the second iPad uploaded that differs from what the first
     # iPad already set (PAX load, aircraft). The first value is kept; the
     # difference is shown to Management until someone settles it, with remarks.
@@ -298,7 +321,7 @@ def progress(connection, flight_id: int, device: str | None = None) -> dict:
                 "started": leg["direction"] != "RETURN" or bool(s.get("started_at")) or bool(leg["started_at"] and not states),
                 "finished": leg_finished(leg) or bool(s.get("finished_at")),
                 "finished_at": s.get("finished_at") or (leg["finished_at"] if leg_finished(leg) else None),
-                "stock_count_done": d in counted or "*" in counted,
+                "stock_count_done": d in counted or "*" in counted or bool(s.get("stock_by_other_at")),
                 "reports_done": d_handled >= total,
                 "forms_locked": bool(s.get("forms_locked_at") or leg["reports_locked_at"]),
                 "completed": bool(s.get("completed_at")) or bool(root.get("trip_completed_at")),
@@ -306,14 +329,14 @@ def progress(connection, flight_id: int, device: str | None = None) -> dict:
         if device:
             started = leg_started_for(connection, leg, device)
             finished = leg_finished_for(connection, leg, device)
-            stock_done = device in counted or "*" in counted
-            locked = bool(leg["reports_locked_at"] or leg["trip_completed_at"]
-                          or states.get(device, {}).get("forms_locked_at"))
+            stock_done = (device in counted or "*" in counted
+                          or bool(states.get(device, {}).get("stock_by_other_at")))
+            locked = False
         else:
             started = leg_started(leg)
             finished = leg_finished(leg)
             stock_done = sector_count_submitted(connection, leg["id"])
-            locked = bool(leg["reports_locked_at"])
+            locked = False
         out.append({
             "id": leg["id"], "flight_number": leg["flight_number"], "flight_date": leg["flight_date"],
             "origin": leg["origin"], "destination": leg["destination"], "direction": leg["direction"],
@@ -338,17 +361,19 @@ def progress(connection, flight_id: int, device: str | None = None) -> dict:
     stock = stock_return_status(connection, root["id"])
     stock_devices = stock_return_devices(connection, root["id"])
     if device:
-        stock_done = device in stock_devices or "*" in stock_devices or stock == "APPROVED"
+        stock_done = (device in stock_devices or "*" in stock_devices or stock in ("PENDING", "APPROVED")
+                      or bool(device_state(connection, root["id"], device)["return_by_other_at"]))
     else:
         stock_done = stock in ("PENDING", "APPROVED")
     first, last = out[0], out[-1]
 
-    can_start_second = (round_trip and first["finished"] and first["reports_done"]
+    # 7.18: the cabin forms are outside the flight flow (filled any time on
+    # the Reports page), so they no longer hold up a step.
+    can_start_second = (round_trip and first["finished"]
                         and first["stock_count_done"] and not last["started"] and not completed)
     all_finished = all(l["finished"] for l in out)
-    all_reports = all(l["reports_done"] for l in out)
     all_counts = all(l["stock_count_done"] for l in out if l["stock_count_needed"])
-    can_complete = all_finished and all_reports and all_counts and stock_done and not completed
+    can_complete = all_finished and all_counts and stock_done and not completed
 
     # 7.11 order: sell -> finish -> remaining stock -> (commission) -> forms -> next.
     if completed:
@@ -358,16 +383,12 @@ def progress(connection, flight_id: int, device: str | None = None) -> dict:
     elif round_trip and not last["started"]:
         if not first["stock_count_done"]:
             step = "STOCK_FIRST"
-        elif not first["reports_done"]:
-            step = "FORMS_FIRST"
         else:
             step = "START_SECOND"
     elif round_trip and not last["finished"]:
         step = "SELL_SECOND"
     elif not stock_done:
         step = "STOCK_RETURN"
-    elif not last["reports_done"]:
-        step = "FORMS_LAST"
     else:
         step = "COMPLETE"
 
@@ -378,7 +399,7 @@ def progress(connection, flight_id: int, device: str | None = None) -> dict:
         "device": device,
         "stock_return": stock, "stock_return_devices": stock_devices,
         "stock_return_waiting_for": [] if (stock_done or device) else [d for d in last["devices"] if d not in stock_devices],
-        "my_stock_return_done": (device in stock_devices or "*" in stock_devices) if device else None,
+        "my_stock_return_done": stock_done if device else None,
         "completed": completed,
         "completed_devices": completed_devices,
         "completed_at": root.get("trip_completed_at"), "completed_by": root.get("trip_completed_by"),
@@ -387,18 +408,8 @@ def progress(connection, flight_id: int, device: str | None = None) -> dict:
 
 
 def assert_reports_open(connection, flight_id: int, may_review: bool, device: str | None = None):
-    """The iPad may change a sector's forms only until they are locked: for
-    this iPad once it moved on (started the next flight or finished the whole
-    flight), and for everyone once the sector is closed to all iPads."""
-    if may_review:
-        return
-    row = connection.execute(
-        "SELECT reports_locked_at, trip_completed_at FROM flights WHERE id=?", (flight_id,)).fetchone()
-    locked = bool(row and (row["reports_locked_at"] or row["trip_completed_at"]))
-    if not locked and device:
-        locked = bool(device_state(connection, flight_id, device)["forms_locked_at"])
-    if locked:
-        raise HTTPException(
-            status_code=400,
-            detail="These forms are locked: the next flight was started or the whole flight was finished. "
-                   "Ask Management if something still needs changing.")
+    """7.18: the cabin forms are outside the flight flow. The crew may fill
+    them in at any time, before the flight or long after it; a form is closed
+    to the crew only once it has had its final submission (checked where the
+    form is saved). Nothing about the trip locks them any more."""
+    return

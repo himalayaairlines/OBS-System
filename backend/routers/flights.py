@@ -8,12 +8,14 @@ Ownership of each field:
   * Management -> may amend a locked duty group, with remarks
 """
 
+import re
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from database import (
+    CREW_ROLES,
     AIRCRAFT_TYPES, DEVICES_PER_FLIGHT, DUTY_GROUP_AMEND_LIMIT, DUTY_GROUP_MAX, DUTY_GROUP_MIN, DUTY_GROUP_SIZE, get_connection,
 )
 from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
@@ -122,15 +124,10 @@ def _crew_visible_rows(connection, account):
         (account,),
     )
     rows = _with_device_state(connection, rows, account)
-    # A finished trip ("Finish whole flight" on this iPad) leaves the iPad altogether.
-    pending = [r for r in rows if not r["my_completed_at"]]
-    if not pending:
-        return []
-    def root_id(r):
-        return r["linked_flight_id"] if r["direction"] == "RETURN" and r["linked_flight_id"] else r["id"]
-    current = min(pending, key=lambda r: (r["flight_date"], root_id(r)))
-    keep = {r["id"] for r in pending if root_id(r) == root_id(current)}
-    return [r for r in rows if r["id"] in keep]
+    # A finished trip ("Finish whole flight" on this login) leaves the phone.
+    # 7.18: every trip the crew member is rostered on and has not finished is
+    # listed; they choose the sector they are working.
+    return [r for r in rows if not r["my_completed_at"]]
 
 
 @router.get("/flights")
@@ -138,7 +135,7 @@ def list_flights(mine_only: bool = False, user: dict = Depends(current_user)):
     """A cabin iPad sees only the flights it is assigned to unless told otherwise."""
     connection = get_connection()
     try:
-        if user["role"] == "crew_supervisor":
+        if user["role"] in CREW_ROLES:
             # The device sees only the legs it is assigned to, and only while
             # they are still live. Closed flights and other crews' flights stay
             # off the device entirely.
@@ -343,11 +340,11 @@ def _assert_device_assigned(connection, flight, user):
         "SELECT crew_account FROM flight_assignments WHERE flight_id=?", (flight["id"],))]
     if not accounts:
         raise HTTPException(
-            status_code=400, detail="No OBS device is assigned to this flight yet."
+            status_code=400, detail="No crew is rostered on this sector yet. Ask Inventory to assign the crew."
         )
     if user["employee_id"] not in accounts:
         raise HTTPException(
-            status_code=403, detail="This device is not assigned to that flight."
+            status_code=403, detail="You are not rostered on that sector."
         )
 
 
@@ -487,7 +484,7 @@ def trip_progress(flight_id: int, user: dict = Depends(current_user)):
         flight = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
         if not flight:
             raise HTTPException(status_code=404, detail="Flight not found.")
-        if user["role"] == "crew_supervisor":
+        if user["role"] in CREW_ROLES:
             _assert_device_assigned(connection, flight, user)
             return trip_flow.progress(connection, flight_id, device=user["employee_id"])
         return trip_flow.progress(connection, flight_id)
@@ -519,13 +516,8 @@ def start_second_flight(flight_id: int, user: dict = Depends(requires("crew"))):
         if not first["stock_count_done"]:
             raise HTTPException(
                 status_code=400,
-                detail=f"Confirm the remaining stock after {first['origin']}-{first['destination']} on this iPad "
-                       "before the second flight starts.")
-        if not first["reports_done"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Save all {first['reports_total']} forms for {first['origin']}-{first['destination']} "
-                       f"first ({first['reports_handled']} handled so far), or mark the rest as submitted by the other iPad.")
+                detail=f"Submit the remaining stock after {first['origin']}-{first['destination']} "
+                       "(or say another crew member submitted it) before the second flight starts.")
         now = now_iso()
         if is_device:
             trip_flow.set_device_state(connection, second["id"], device, "started_at", now)
@@ -545,8 +537,7 @@ def start_second_flight(flight_id: int, user: dict = Depends(requires("crew"))):
         connection.close()
     log_action(user, "FLIGHT", "START_SECOND_FLIGHT",
                f"Started {second['flight_number']} {second['origin']}-{second['destination']}"
-               + (f" on iPad {device}" if device else "") + "; "
-               f"forms for {first['origin']}-{first['destination']} locked on it.", "flight", second["id"])
+               + (f" ({device})" if device else "") + ".", "flight", second["id"])
     return result
 
 
@@ -571,13 +562,11 @@ def complete_trip(flight_id: int, user: dict = Depends(requires("crew"))):
                 missing.append(f"finish {leg['origin']}-{leg['destination']}")
             elif leg["stock_count_needed"] and not leg["stock_count_done"]:
                 missing.append(f"confirm the remaining stock after {leg['origin']}-{leg['destination']}")
-            elif not leg["reports_done"]:
-                missing.append(f"save the forms for {leg['origin']}-{leg['destination']}")
         if is_device:
             if not state["my_stock_return_done"]:
-                missing.append("submit the stock return (Sync page)")
+                missing.append("submit the final stock return (Sync & Return Stock page)")
         elif state["stock_return"] not in ("PENDING", "APPROVED"):
-            missing.append("submit the stock return (Sync page)")
+            missing.append("submit the final stock return (Sync & Return Stock page)")
         if missing:
             raise HTTPException(status_code=400, detail="Before finishing the whole flight: " + "; ".join(missing) + ".")
         now = now_iso()
@@ -610,6 +599,117 @@ def complete_trip(flight_id: int, user: dict = Depends(requires("crew"))):
     return result
 
 
+@router.post("/flights/{flight_id}/stock-return-by-other")
+def stock_return_by_other(flight_id: int, user: dict = Depends(requires("crew"))):
+    """7.18: another crew member submitted the trip's final stock return; this
+    phone moves on to "Finish whole flight". The return itself is unchanged."""
+    connection = get_connection()
+    try:
+        legs = trip_flow.trip_legs(connection, flight_id)
+        root, last = legs[0], legs[-1]
+        _assert_device_assigned(connection, last, user)
+        if not _is_device(connection, last, user):
+            raise HTTPException(status_code=400, detail="Only a crew member on the trip can say a colleague submitted it.")
+        state = trip_flow.progress(connection, flight_id, device=user["employee_id"])
+        if not all(l["finished"] for l in state["legs"]):
+            raise HTTPException(status_code=400, detail="Finish every sector of the trip first.")
+        trip_flow.set_device_state(connection, root["id"], user["employee_id"], "return_by_other_at", now_iso())
+        connection.commit()
+        result = trip_flow.progress(connection, flight_id, device=user["employee_id"])
+    finally:
+        connection.close()
+    log_action(user, "RECONCILIATION", "RETURN_BY_OTHER",
+               f"{user['employee_id']}: the final stock return for {root['flight_number']} {root['flight_date']} "
+               "was submitted by another crew member.", "flight", root["id"])
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# Diversion (7.18)
+# --------------------------------------------------------------------------- #
+class DiversionIn(BaseModel):
+    diverted_to: str = Field(min_length=3, max_length=3)
+    reason: str = Field(min_length=2, max_length=200)
+    diverted_at: str | None = Field(default=None, max_length=40)
+    remarks: str = Field(min_length=2, max_length=500)
+    client_ref: str | None = Field(default=None, max_length=64)
+
+
+def _diversions(connection, flight_id):
+    return [dict(r) for r in connection.execute(
+        "SELECT * FROM flight_diversions WHERE flight_id=? ORDER BY id", (flight_id,))]
+
+
+@router.get("/flights/{flight_id}/diversions")
+def list_diversions(flight_id: int, user: dict = Depends(current_user)):
+    connection = get_connection()
+    try:
+        flight = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if not flight:
+            raise HTTPException(status_code=404, detail="Flight not found.")
+        if user["role"] in CREW_ROLES:
+            _assert_device_assigned(connection, flight, user)
+        return _diversions(connection, flight_id)
+    finally:
+        connection.close()
+
+
+@router.post("/flights/{flight_id}/diversion")
+def record_diversion(flight_id: int, data: DiversionIn, user: dict = Depends(current_user)):
+    """The aircraft landed somewhere else. The sector's destination becomes the
+    diversion airport; where it was meant to go is kept. Remarks are mandatory
+    and everything is in the audit log. Works from the offline queue: a replay
+    with the same client_ref is answered with the saved record."""
+    perms = permissions_for(user["role"])
+    if not perms & {"crew", "sales_edit"}:
+        raise HTTPException(status_code=403, detail="You do not have permission to perform this action.")
+    airport = data.diverted_to.strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", airport):
+        raise HTTPException(status_code=400, detail="Enter the three-letter airport code, e.g. BKK.")
+    reason, remarks = data.reason.strip(), data.remarks.strip()
+    if not reason or not remarks:
+        raise HTTPException(status_code=400, detail="The reason and the remarks are both required.")
+    connection = get_connection()
+    try:
+        flight = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if not flight:
+            raise HTTPException(status_code=404, detail="Flight not found.")
+        _assert_device_assigned(connection, flight, user)
+        if data.client_ref:
+            done = connection.execute("SELECT * FROM flight_diversions WHERE client_ref=?", (data.client_ref,)).fetchone()
+            if done:
+                return {"flight_id": flight_id, "diversion": dict(done), "diversions": _diversions(connection, flight_id)}
+        if flight["status"] == "CLOSED":
+            raise HTTPException(status_code=400, detail="This sector is closed and reconciled.")
+        if airport == flight["origin"]:
+            raise HTTPException(status_code=400, detail="The diversion airport cannot be the departure airport.")
+        if airport == flight["destination"]:
+            raise HTTPException(status_code=400, detail=f"The sector already ends at {airport}.")
+        planned = flight["original_destination"] or flight["destination"]
+        now = now_iso()
+        cur = connection.execute(
+            """INSERT INTO flight_diversions(flight_id,planned_destination,diverted_to,reason,diverted_at,remarks,
+                   entered_by,entered_at,client_ref) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (flight_id, planned, airport, reason, (data.diverted_at or "").strip() or None, remarks,
+             user["employee_id"], now, data.client_ref))
+        connection.execute(
+            "UPDATE flights SET original_destination=COALESCE(original_destination, destination), destination=?, "
+            "diverted_at=? WHERE id=?", (airport, now, flight_id))
+        connection.commit()
+        record = dict(connection.execute("SELECT * FROM flight_diversions WHERE id=?", (cur.lastrowid,)).fetchone())
+        diversions = _diversions(connection, flight_id)
+    except sqlite3.IntegrityError:
+        connection.rollback()
+        raise HTTPException(status_code=409, detail="This diversion has already been recorded.")
+    finally:
+        connection.close()
+    log_action(user, "FLIGHT", "DIVERSION",
+               f"{flight['flight_number']} {flight['flight_date']} {flight['origin']}-{planned} diverted to {airport}. "
+               f"Reason: {reason}. Remarks: {remarks}", "flight", flight_id, status="WARNING",
+               metadata={"planned": planned, "diverted_to": airport, "reason": reason})
+    return {"flight_id": flight_id, "diversion": record, "diversions": diversions}
+
+
 # --------------------------------------------------------------------------- #
 # Remaining stock after a sector (7.9)
 # --------------------------------------------------------------------------- #
@@ -621,6 +721,8 @@ class SectorStockLine(BaseModel):
 class SectorStockIn(BaseModel):
     lines: list[SectorStockLine] = []
     remarks: str | None = Field(default=None, max_length=500)
+    # 7.18: "another crew member submitted it" — moves this phone on only.
+    by_other: bool = False
 
 
 _STOCK_READERS = {"crew", "sales_view", "reports_review", "inventory", "reconcile_approve", "security_view"}
@@ -653,7 +755,7 @@ def flight_commission(flight_id: int, user: dict = Depends(current_user)):
         flight = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
         if not flight:
             raise HTTPException(status_code=404, detail="Flight not found.")
-        if user["role"] == "crew_supervisor":
+        if user["role"] in CREW_ROLES:
             _assert_device_assigned(connection, flight, user)
         elif not permissions_for(user["role"]) & {"logs", "sales_view", "dashboard"}:
             raise HTTPException(status_code=403, detail="You do not have permission to perform this action.")
@@ -664,7 +766,14 @@ def flight_commission(flight_id: int, user: dict = Depends(current_user)):
 
 @router.post("/flights/{flight_id}/sector-stock")
 def submit_sector_stock(flight_id: int, data: SectorStockIn, user: dict = Depends(requires("reconcile_submit"))):
-    """The crew confirm the remaining stock once the sector is finished and its forms are saved."""
+    """The remaining stock after a sector that is not the last one.
+
+    7.18: there is one trolley and one count of it. Whichever crew member
+    counts it submits it; the others press "Another crew member submitted it"
+    (`by_other`), which only moves their own phone to the next step. If a
+    second, different count arrives (two phones counted while offline), the
+    first stands and the second is shown to Management as a difference.
+    """
     connection = get_connection()
     try:
         row = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
@@ -677,15 +786,47 @@ def submit_sector_stock(flight_id: int, data: SectorStockIn, user: dict = Depend
         if not leg["finished"]:
             raise HTTPException(status_code=400, detail="Finish this sector before confirming the remaining stock.")
         if not leg["stock_count_needed"]:
-            raise HTTPException(status_code=400, detail="This is the last sector: submit the final stock return on the Sync page instead.")
-        if leg["reports_locked"] or state["completed"]:
-            raise HTTPException(status_code=400, detail="This sector is locked; the remaining stock can no longer be changed here.")
+            raise HTTPException(status_code=400, detail="This is the last sector: submit the final stock return on the Sync & Return Stock page instead.")
+        if state["completed"]:
+            raise HTTPException(status_code=400, detail="This trip is finished; the remaining stock can no longer be changed here.")
+        following = state["legs"][[l["id"] for l in state["legs"]].index(flight_id) + 1]
+        if following["started"] and not data.by_other:
+            raise HTTPException(status_code=400, detail="The next flight has started, so this count can no longer be changed "
+                                                        "here. Inventory can correct it.")
+        now = now_iso()
         legs = trip_flow.trip_legs(connection, flight_id)
-        is_device = device_user is not None
-        result = sector_stock.save_sector_count(
-            connection, legs, flight_id, {l.product_id: l.declared_remaining for l in data.lines},
-            (data.remarks or "").strip() or None, user["employee_id"], now_iso(),
-            device=user["employee_id"] if is_device else "*")
+        if data.by_other:
+            if not device_user:
+                raise HTTPException(status_code=400, detail="Only a crew member on the sector can say a colleague submitted it.")
+            trip_flow.set_device_state(connection, flight_id, device_user, "stock_by_other_at", now)
+            connection.commit()
+            result = sector_stock.sector_count(connection, legs, flight_id)
+            result["my_submitted"] = True
+            result["by_other"] = True
+            return result
+        lines = {l.product_id: l.declared_remaining for l in data.lines}
+        remarks = (data.remarks or "").strip() or None
+        # 7.18: a crew member's own login counts the whole trolley ("*"). The
+        # shared iPad accounts of 7.11 each counted their own part.
+        shared_count = device_user is None or user["role"] == "crew"
+        existing = connection.execute(
+            "SELECT * FROM sector_stock_counts WHERE flight_id=? AND device='*'", (flight_id,)).fetchone()
+        if shared_count and existing and device_user and existing["submitted_by"] != user["employee_id"]:
+            current = sector_stock.sector_count(connection, legs, flight_id)
+            theirs = {i["product_id"]: i["declared_remaining"] for i in current["items"]}
+            mine = {pid: lines.get(pid, theirs[pid] if not lines else 0) for pid in theirs}
+            if mine != theirs:
+                trip_flow.record_conflict(
+                    connection, flight_id, user["employee_id"], "stock_count",
+                    _stock_text(current["items"], theirs), existing["submitted_by"],
+                    _stock_text(current["items"], mine), now)
+                connection.commit()
+                current["conflict"] = True
+            current["my_submitted"] = True
+            return current
+        result = sector_stock.save_sector_count(connection, legs, flight_id, lines, remarks,
+                                                user["employee_id"], now,
+                                                device="*" if shared_count else user["employee_id"])
         result["my_submitted"] = True
     finally:
         connection.close()
@@ -699,6 +840,13 @@ def submit_sector_stock(flight_id: int, data: SectorStockIn, user: dict = Depend
                metadata={"total_declared": result["total_declared"], "total_expected": result["total_expected"],
                          "variance": result["total_variance"], "remarks": result["remarks"]})
     return result
+
+
+def _stock_text(items, values):
+    """'Coke 2, Water 5' for the lines that are not zero, for the differences list."""
+    names = {i["product_id"]: i["product_name"] for i in items}
+    parts = [f"{names.get(pid, pid)} {qty}" for pid, qty in values.items() if qty]
+    return ", ".join(parts) or "nothing left"
 
 
 @router.get("/sector-stock-counts")
@@ -748,14 +896,40 @@ def crew_roster(user: dict = Depends(current_user)):
 
 @router.get("/crew-accounts")
 def crew_accounts(user: dict = Depends(requires("groups"))):
-    """Active OBS iPad accounts, for the assignment picker."""
+    """Active crew logins (7.18: one per crew member, user name = crew code),
+    for Inventory's sector assignment."""
     connection = get_connection()
     try:
         rows = connection.execute(
-            """SELECT employee_id, name, role FROM users
-               WHERE active=1 AND role='crew_supervisor'
-               ORDER BY employee_id"""
+            """SELECT u.employee_id, u.name, u.role, m.position
+               FROM users u LEFT JOIN crew_members m ON m.id = u.crew_member_id
+               WHERE u.active=1 AND u.role IN ('crew','crew_supervisor')
+               ORDER BY CASE m.position WHEN 'Purser' THEN 0 WHEN 'Senior Cabin Crew' THEN 1
+                                        WHEN 'Cabin Crew' THEN 2 ELSE 3 END, u.name"""
         ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        connection.close()
+
+
+@router.get("/flights/{flight_id}/assigned-crew")
+def assigned_crew(flight_id: int, user: dict = Depends(current_user)):
+    """The crew Inventory rostered on a sector, as roster entries, so the
+    duty group can start from them (7.18)."""
+    connection = get_connection()
+    try:
+        flight = connection.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
+        if not flight:
+            raise HTTPException(status_code=404, detail="Flight not found.")
+        if user["role"] in CREW_ROLES:
+            _assert_device_assigned(connection, flight, user)
+        rows = connection.execute(
+            """SELECT a.crew_account, m.id, m.crew_code, m.name, m.position
+               FROM flight_assignments a
+               LEFT JOIN users u ON u.employee_id = a.crew_account
+               LEFT JOIN crew_members m ON m.id = u.crew_member_id
+                                        OR (u.crew_member_id IS NULL AND UPPER(m.crew_code) = UPPER(a.crew_account))
+               WHERE a.flight_id=? ORDER BY a.id""", (flight_id,)).fetchall()
         return [dict(r) for r in rows]
     finally:
         connection.close()
@@ -868,10 +1042,20 @@ def create_duty_group(flight_id: int, data: DutyGroupIn, user: dict = Depends(re
             # An offline queue replaying its own creation is not an error.
             if data.client_ref and existing.get("client_ref") == data.client_ref:
                 return existing
-            raise HTTPException(
-                status_code=400,
-                detail="A duty group has already been formed for this sector.",
-            )
+            # 7.18: another crew member's phone entered the names first. Theirs
+            # stands; a different list from this phone is shown to Management
+            # as a difference rather than lost or refused.
+            mine = sorted(set(data.member_ids))
+            theirs = sorted(m["id"] for m in existing["members"])
+            if mine != theirs:
+                names = {r["id"]: r["name"] for r in connection.execute(
+                    f"SELECT id, name FROM crew_members WHERE id IN ({','.join('?' * len(mine)) or 'NULL'})", mine)}
+                trip_flow.record_conflict(
+                    connection, flight_id, user["employee_id"], "duty_group",
+                    ", ".join(m["name"] for m in existing["members"]), existing.get("created_by"),
+                    ", ".join(names.get(i, f"#{i}") for i in mine), now_iso())
+                connection.commit()
+            return {**existing, "already_formed": True}
 
         _validate_members(connection, data.member_ids)
         label = (f"{flight['flight_number']} / {flight['flight_date']} / "
@@ -991,9 +1175,12 @@ def amend_duty_group(flight_id: int, data: DutyGroupAmend, user: dict = Depends(
 # Trips — a round trip presented as one route with two legs
 # --------------------------------------------------------------------------- #
 class TripAssign(BaseModel):
-    """Which OBS iPads work this trip (7.11: two). Crew names are chosen on board."""
+    """Which crew logins work this trip (7.18: every crew member on their own
+    phone, up to DEVICES_PER_FLIGHT). `crew_account`/`crew_account_2` are the
+    7.11 two-iPad form and still accepted."""
 
-    crew_account: str
+    crew_accounts: list[str] = []
+    crew_account: str | None = None
     crew_account_2: str | None = None
 
 
@@ -1054,7 +1241,7 @@ def list_trips(page: int | None = PageParam, page_size: int = PageSizeParam,
     connection = get_connection()
     try:
         # Trips are assembled from legs in Python, so they are paged after grouping.
-        if user["role"] == "crew_supervisor":
+        if user["role"] in CREW_ROLES:
             trips = _trip_rows(
                 connection,
                 """WHERE a.crew_account=?
@@ -1092,9 +1279,25 @@ def assign_trip(root_id: int, data: TripAssign, user: dict = Depends(requires("g
     finally:
         connection.close()
 
-    accounts = [a.strip().upper() for a in (data.crew_account, data.crew_account_2 or "") if a and a.strip()]
+    accounts = [a.strip().upper() for a in [*data.crew_accounts, data.crew_account or "", data.crew_account_2 or ""]
+                if a and a.strip()]
+    if not accounts:
+        raise HTTPException(status_code=400, detail="Pick at least one crew member.")
     if len(set(accounts)) != len(accounts):
-        raise HTTPException(status_code=400, detail="Pick two different iPad accounts.")
+        raise HTTPException(status_code=400, detail="The same crew member was picked twice.")
+    if len(accounts) > DEVICES_PER_FLIGHT:
+        raise HTTPException(status_code=400, detail=f"A sector takes at most {DEVICES_PER_FLIGHT} crew.")
+    for leg in legs:
+        if leg["status"] != "OPEN":
+            raise HTTPException(status_code=400, detail="This trip has already been flown, so its crew cannot be changed.")
+    connection = get_connection()
+    try:
+        for account in accounts:
+            row = connection.execute("SELECT role FROM users WHERE employee_id=? AND active=1", (account,)).fetchone()
+            if not row or row["role"] not in CREW_ROLES:
+                raise HTTPException(status_code=400, detail=f"{account} is not an active crew login.")
+    finally:
+        connection.close()
     # Replace whatever was rostered before, on every leg of the trip.
     connection = get_connection()
     try:
@@ -1165,9 +1368,9 @@ def assign_group(data: AssignmentIn, user: dict = Depends(requires("groups"))):
         row = connection.execute(
             "SELECT role FROM users WHERE employee_id=? AND active=1", (account,)
         ).fetchone()
-        if not row or row["role"] != "crew_supervisor":
+        if not row or row["role"] not in CREW_ROLES:
             raise HTTPException(
-                status_code=400, detail=f"{account} is not an active OBS device account.",
+                status_code=400, detail=f"{account} is not an active crew login.",
             )
 
         # 7.11: an iPad may be rostered to several trips on one day. It sees
@@ -1179,7 +1382,7 @@ def assign_group(data: AssignmentIn, user: dict = Depends(requires("groups"))):
         if count >= DEVICES_PER_FLIGHT:
             raise HTTPException(
                 status_code=400,
-                detail=f"This sector already has {DEVICES_PER_FLIGHT} iPads. Remove one first.",
+                detail=f"This sector already has {DEVICES_PER_FLIGHT} crew. Remove one first.",
             )
         connection.execute(
             """INSERT INTO flight_assignments

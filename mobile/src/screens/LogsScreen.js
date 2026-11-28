@@ -25,7 +25,9 @@ export default function LogsScreen({ user }) {
   const canOversee = perms.includes('logs');
   const canSeeSales = perms.includes('sales_view');
   const canEdit = perms.includes('sales_edit');
-  const [tab, setTab] = useState(canOversee ? 'ranking' : 'sales');
+  // 7.18: Finance sees the sales report only.
+  const canReport = canOversee || perms.includes('sales_report');
+  const [tab, setTab] = useState(canOversee ? 'ranking' : (canReport && !canSeeSales) ? 'report' : 'sales');
   const [filter, setFilter] = useState({ year: new Date().getFullYear(), month: '', day: '', destination: '' });
   const [picker, setPicker] = useState(null);
   const [message, setMessage] = useState(null);
@@ -84,9 +86,9 @@ export default function LogsScreen({ user }) {
   const [report, setReport] = useState(null);
   const [reportError, setReportError] = useState(null);
   useEffect(() => {
-    if (tab !== 'report' || !canOversee) return;
+    if (tab !== 'report' || !canReport) return;
     api(`/reports/sales-report?${query()}`).then((r) => { setReport(r); setReportError(null); }).catch((e) => setReportError(e.message));
-  }, [tab, canOversee, query]);
+  }, [tab, canReport, query]);
 
   async function exportTab() {
     const target = EXPORTS[tab];
@@ -106,7 +108,10 @@ export default function LogsScreen({ user }) {
   }
 
   const load = useCallback(async () => {
-    if (!canOversee) return;
+    if (!canOversee) {
+      if (canReport) api(`/dashboard?${query()}`).then((d) => setDestinations(d.destinations || [])).catch(() => {});
+      return;
+    }
     try {
       const [r, t, m, d] = await Promise.all([
         api(`/crew-ranking?${query()}&all_crew=true`),
@@ -120,7 +125,7 @@ export default function LogsScreen({ user }) {
     } catch (error) {
       setMessage({ tone: 'danger', text: error.message });
     }
-  }, [query, canOversee]);
+  }, [query, canOversee, canReport]);
 
   const loadSales = useCallback(async () => {
     if (!canSeeSales) return;
@@ -169,8 +174,8 @@ export default function LogsScreen({ user }) {
     + (sale.trip_type === 'ROUND_TRIP' ? ` \u00b7 ${sale.segment === 2 ? 'second' : 'first'} segment (${String(sale.direction || '').toLowerCase()})` : '');
 
   const tabs = [
+    ...(canReport ? [{ key: 'report', label: 'Sales report' }] : []),
     ...(canOversee ? [
-      { key: 'report', label: 'Sales report' },
       { key: 'ranking', label: 'Crew ranking' },
       { key: 'products', label: 'Top products' },
       { key: 'logs', label: 'Audit log' },
@@ -192,7 +197,7 @@ export default function LogsScreen({ user }) {
   return (
     <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
       <PageHeader
-        title={canOversee ? 'Performance & Sales Logs' : 'Onboard Sales'}
+        title={canReport ? 'Performance & Sales Logs' : 'Onboard Sales'}
         description={canOversee
           ? 'Commission ranking, best sellers and the full activity trail.'
           : 'Every sale recorded on board. Correct a mis-keyed line with remarks.'}
@@ -213,7 +218,7 @@ export default function LogsScreen({ user }) {
         style={{ marginBottom: 14, alignSelf: 'flex-end' }}
       />
 
-      {canOversee && tab !== 'sales' && (
+      {canReport && tab !== 'sales' && (
       <Card tight>
         <View style={styles.wrap}>
           <Select label="Year" valueLabel={String(filter.year)} onPress={() => setPicker('year')} style={{ flex: 1, minWidth: 100, marginBottom: 0 }} />
@@ -319,6 +324,37 @@ export default function LogsScreen({ user }) {
                 )}
               />
             ) : <Text style={styles.empty}>No combo sold in this period.</Text>}
+          </Card>
+
+          <Card>
+            <SectionTitle
+              title="Sales ranking"
+              description="Who sold the most, by the value of the sales each crew member recorded on their own login (normal and combo)."
+            />
+            {(ranking.sales_ranking || []).length ? (
+              <DataTable
+                breakpoint={760}
+                rows={ranking.sales_ranking.slice(0, 25)}
+                rowKey={(e) => String(e.crew_member_id)}
+                columns={[
+                  { key: 'rank', label: '#', flex: 0.4, render: (e) => String(e.rank) },
+                  { key: 'name', label: 'Crew member', flex: 2.2, render: (e) => <CrewLink entry={e} onPress={() => setHistoryFor({ id: e.crew_member_id, name: e.name })} /> },
+                  { key: 'sectors', label: 'Sectors', flex: 0.8, align: 'right', render: (e) => String(e.flights) },
+                  { key: 'tx', label: 'Sales', flex: 0.8, align: 'right', render: (e) => String(e.transactions) },
+                  { key: 'units', label: 'Units', flex: 0.8, align: 'right', render: (e) => String(e.units) },
+                  { key: 'value', label: 'Sales value', flex: 1.3, align: 'right', render: (e) => <Text style={{ fontSize: 14, fontWeight: '600', color: COLORS.text }}>{npr(e.sales_npr)}</Text> },
+                ]}
+                renderStacked={(e) => (
+                  <View style={styles.rowBetween}>
+                    <View style={[styles.row, { gap: 6, flex: 1 }]}>
+                      <Text style={{ fontSize: 14, fontWeight: '600' }}>{e.rank}.</Text>
+                      <CrewLink entry={e} onPress={() => setHistoryFor({ id: e.crew_member_id, name: e.name })} />
+                    </View>
+                    <Text style={{ fontSize: 14, fontWeight: '600' }}>{npr(e.sales_npr)}</Text>
+                  </View>
+                )}
+              />
+            ) : <Text style={styles.empty}>No sale recorded under a crew login in this period.</Text>}
           </Card>
 
           <Card>

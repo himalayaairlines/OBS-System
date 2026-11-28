@@ -6,7 +6,7 @@ export const API_BASE =
 
 // The oldest backend this app can talk to. Bump both this and API_VERSION in
 // backend/main.py whenever endpoints are added.
-export const REQUIRED_API_VERSION = '7.5';
+export const REQUIRED_API_VERSION = '7.18';
 
 export const KEYS = {
   session: 'obs.session',

@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 import trip_flow
-from database import get_connection
+from database import CREW_ROLES, get_connection
 from paging import PageParam, PageSizeParam, paginate_list, paginate_sql
 from routers.warehouse import move_stock
 from security import (
@@ -319,7 +319,7 @@ def list_reconciliations(status: str | None = None,
         if status:
             conditions.append("r.status=?")
             params.append(status.strip().upper())
-        if "logs" not in permissions_for(user["role"]) and user["role"] == "crew_supervisor":
+        if "logs" not in permissions_for(user["role"]) and user["role"] in CREW_ROLES:
             conditions.append(
                 """r.flight_id IN (SELECT flight_id FROM flight_assignments
                                    WHERE crew_account=?)"""
@@ -356,7 +356,7 @@ def my_pending_return(user: dict = Depends(requires("sync"))):
         ).fetchall()
 
         roots = {trip_root(connection, row["flight_id"]) for row in rows}
-        if user["role"] == "crew_supervisor":
+        if user["role"] in CREW_ROLES:
             # Only the trip this iPad is working now (7.11): the earliest trip of
             # the day not yet finished with "Finish whole flight". Older trips
             # and the next one on the roster stay off the page.
@@ -494,9 +494,33 @@ def submit_reconciliation(
             )
         is_device = user["employee_id"] in devices
         device = user["employee_id"] if is_device else "*"
+        same_submitter = False
+        if is_device and user["role"] == "crew":
+            # 7.18: one trolley, one count. Whichever crew member counts it
+            # submits the return for the trip ("*"). A second, different count
+            # from another phone is kept as a difference for Management; the
+            # first stands. The same person may correct theirs until approval.
+            device = "*"
+            if header and header["status"] in ("PENDING", "WAITING"):
+                if header["submitted_by"] == user["employee_id"]:
+                    same_submitter = True
+                else:
+                    current = _recon(connection, recon_id=header["id"])
+                    theirs = {i["product_id"]: int(i["declared_remaining"]) for i in current["items"]}
+                    typed = {line.product_id: line.declared_remaining for line in data.lines}
+                    mine = {pid: int(typed.get(pid, theirs[pid] if not typed else 0)) for pid in theirs}
+                    if mine != theirs:
+                        names = {i["product_id"]: i["product_name"] for i in current["items"]}
+                        text = lambda v: ", ".join(f"{names[p]} {q}" for p, q in v.items() if q) or "nothing left"  # noqa: E731
+                        trip_flow.record_conflict(connection, root_id, user["employee_id"], "stock_return",
+                                                  text(theirs), header["submitted_by"], text(mine), now_iso())
+                        connection.commit()
+                        current["conflict"] = True
+                    current["my_submitted"] = True
+                    return current
         # Once every iPad has declared it waits for the Inventory user;
         # the crew count again only if it is sent back.
-        if header and header["status"] == "PENDING" \
+        if header and header["status"] == "PENDING" and not same_submitter \
                 and "reconcile_approve" not in permissions_for(user["role"]):
             raise HTTPException(
                 status_code=400,

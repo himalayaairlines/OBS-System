@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from database import DB_PATH, ROLE_PERMISSIONS, initialize_database
 from routers import (
-    admin, analytics, auth, catalog, communication, flight_reports, flights, history, notifications,
+    admin, analytics, auth, cash, catalog, communication, flight_reports, flights, history, notifications,
     obs, qr_menu, rates, register, reports, sales, security_admin, settings_smtp, stock_alert_settings, warehouse,
 )
 import security
@@ -24,12 +24,17 @@ import comms_worker
 
 # Bumped whenever endpoints are added. The app compares it on login and warns
 # if it is talking to an older server, which otherwise shows up as bare 404s.
-API_VERSION = "7.5"
+API_VERSION = "7.18"
 
+# The interactive API documentation describes every route to whoever asks, so
+# it is off unless OBS_ENABLE_DOCS=1 (development).
+_docs = os.getenv("OBS_ENABLE_DOCS", "0") == "1"
 app = FastAPI(
     title="Himalaya Airlines OBS Revenue Management System",
     version=API_VERSION,
     description="Onboard sales, warehouse inventory, crew commission and reporting.",
+    docs_url="/docs" if _docs else None, redoc_url="/redoc" if _docs else None,
+    openapi_url="/openapi.json" if _docs else None,
 )
 
 # Expo dev servers move ports frequently, so the origin list is configurable.
@@ -70,6 +75,44 @@ class ClientContext:
 
 app.add_middleware(ClientContext)
 
+
+class SecurityHeaders:
+    """Headers that stop the API being framed, sniffed or cached by a browser.
+    API answers carry people's data, so they are never stored by a cache."""
+
+    HEADERS = [
+        (b"x-content-type-options", b"nosniff"),
+        (b"x-frame-options", b"DENY"),
+        (b"referrer-policy", b"no-referrer"),
+        (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
+        (b"cross-origin-opener-policy", b"same-origin"),
+    ]
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        public = scope.get("path", "").startswith("/public/")
+
+        async def wrapped(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                present = {k.lower() for k, _ in headers}
+                for key, value in self.HEADERS:
+                    if key not in present:
+                        headers.append((key, value))
+                if not public and b"cache-control" not in present:
+                    headers.append((b"cache-control", b"no-store"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        return await self.app(scope, receive, wrapped)
+
+
+app.add_middleware(SecurityHeaders)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s %(message)s",
@@ -104,7 +147,7 @@ initialize_database()
 
 for module in (auth, admin, flights, catalog, warehouse, obs, register, sales, rates,
                analytics, reports, flight_reports, settings_smtp, communication, stock_alert_settings,
-               notifications, security_admin, qr_menu, history):
+               notifications, security_admin, qr_menu, history, cash):
     app.include_router(module.router)
 
 
@@ -151,7 +194,7 @@ def root():
         "system": "Himalaya Airlines OBS Revenue Management System",
         "version": API_VERSION,
         "status": "running",
-        "docs": "/docs",
+        "docs": "/docs" if _docs else None,
     }
 
 

@@ -600,7 +600,7 @@ def build_sales_report(year, month, day, destination, user) -> dict:
 
 @router.get("/reports/sales-report")
 def sales_report_json(year: int | None = None, month: int | None = None, day: int | None = None,
-                      destination: str | None = None, user: dict = Depends(requires("logs"))):
+                      destination: str | None = None, user: dict = Depends(requires("sales_report"))):
     return build_sales_report(year, month, day, destination, user)
 
 
@@ -609,7 +609,7 @@ def sales_report_xlsx(year: int | None = None, month: int | None = None, day: in
                       destination: str | None = None, token: str | None = None,
                       authorization: str | None = Header(default=None)):
     from openpyxl.styles import Border, Side
-    user = _report_user(token, authorization, permission="logs")
+    user = _report_user(token, authorization, permission="sales_report")
     rep = build_sales_report(year, month, day, destination, user)
     s = rep["summary"]
     wb = Workbook()

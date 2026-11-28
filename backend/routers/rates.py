@@ -199,3 +199,108 @@ def retire_rate(rate_id: int, user: dict = Depends(requires("rates_edit"))):
                f"Retired the {row['currency_code']} band starting {row['effective_from']}.",
                "exchange_rate", rate_id)
     return {"status": "success"}
+
+
+# --------------------------------------------------------------------------- #
+# Monthly rates (7.18): the rates are fixed for a calendar month.
+# --------------------------------------------------------------------------- #
+def _month_bounds(month: str) -> tuple[str, str]:
+    import calendar
+    import re as _re
+    if not month or not _re.fullmatch(r"\d{4}-\d{2}", month.strip()):
+        raise HTTPException(status_code=400, detail="Choose the month as YYYY-MM, e.g. 2026-11.")
+    year, mon = (int(x) for x in month.strip().split("-"))
+    if not 1 <= mon <= 12 or not 2000 <= year <= 2100:
+        raise HTTPException(status_code=400, detail="That month is not valid.")
+    last = calendar.monthrange(year, mon)[1]
+    return f"{year:04d}-{mon:02d}-01", f"{year:04d}-{mon:02d}-{last:02d}"
+
+
+def _previous_month(month: str) -> str:
+    year, mon = (int(x) for x in month.split("-"))
+    return f"{year - 1:04d}-12" if mon == 1 else f"{year:04d}-{mon - 1:02d}"
+
+
+def _month_rates(month: str) -> list[dict]:
+    first, last = _month_bounds(month)
+    connection = get_connection()
+    try:
+        out = []
+        for code, (name, default_unit) in CURRENCIES.items():
+            if code == "NPR":
+                continue
+            row = connection.execute(
+                """SELECT * FROM exchange_rates WHERE currency_code=? AND active=1
+                     AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)
+                   ORDER BY effective_from DESC, id DESC LIMIT 1""", (code, first, first)).fetchone()
+            unit = float(row["unit"] or default_unit) if row else float(default_unit)
+            out.append({
+                "currency_code": code, "currency_name": name, "unit": unit,
+                "rate_to_npr": float(row["rate_to_npr"]) if row else None,
+                "per_unit_npr": round(float(row["rate_to_npr"]) / unit, 6) if row else None,
+                "effective_from": row["effective_from"] if row else None,
+                "effective_to": row["effective_to"] if row else None,
+                "set_for_month": bool(row and row["effective_from"] == first and row["effective_to"] == last),
+                "updated_by": row["updated_by"] if row else None,
+            })
+        return out
+    finally:
+        connection.close()
+
+
+@router.get("/exchange-rates/month")
+def month_rates(month: str, user: dict = Depends(requires("rates"))):
+    first, last = _month_bounds(month)
+    return {"month": month, "from": first, "to": last, "rates": _month_rates(month),
+            "previous_month": _previous_month(month)}
+
+
+class MonthRate(BaseModel):
+    currency_code: str
+    unit: float = Field(gt=0, default=1)
+    rate_to_npr: float = Field(gt=0, le=1_000_000)
+
+
+class MonthRatesIn(BaseModel):
+    month: str
+    rates: list[MonthRate]
+
+
+@router.post("/exchange-rates/month")
+def save_month_rates(data: MonthRatesIn, user: dict = Depends(requires("rates_edit"))):
+    """Set the rates for a whole month (1st to last day) in one go."""
+    first, last = _month_bounds(data.month)
+    saved = []
+    for rate in data.rates:
+        code = rate.currency_code.strip().upper()
+        if code not in CURRENCIES or code == "NPR":
+            raise HTTPException(status_code=400, detail=f"{code} is not a currency the system takes.")
+        save_rate(RateIn(currency_code=code, unit=rate.unit, rate_to_npr=rate.rate_to_npr,
+                         effective_from=first, effective_to=last), user)
+        saved.append(code)
+    return {"month": data.month, "saved": saved, "rates": _month_rates(data.month)}
+
+
+class CopyIn(BaseModel):
+    month: str
+    overwrite: bool = False
+
+
+@router.post("/exchange-rates/month/copy")
+def copy_previous_month(data: CopyIn, user: dict = Depends(requires("rates_edit"))):
+    """Copy the previous month's rates into this month. Currencies already set
+    for this month are kept unless `overwrite`."""
+    _month_bounds(data.month)
+    previous = {r["currency_code"]: r for r in _month_rates(_previous_month(data.month)) if r["rate_to_npr"]}
+    if not previous:
+        raise HTTPException(status_code=400, detail="The previous month has no rates to copy.")
+    current = {r["currency_code"]: r for r in _month_rates(data.month)}
+    to_copy = [MonthRate(currency_code=c, unit=r["unit"], rate_to_npr=r["rate_to_npr"])
+               for c, r in previous.items() if data.overwrite or not current.get(c, {}).get("set_for_month")]
+    if not to_copy:
+        return {"month": data.month, "saved": [], "rates": list(current.values()),
+                "detail": "Every currency is already set for this month."}
+    result = save_month_rates(MonthRatesIn(month=data.month, rates=to_copy), user)
+    log_action(user, "EXCHANGE RATE", "COPY_MONTH",
+               f"Copied {len(to_copy)} rate(s) from {_previous_month(data.month)} into {data.month}.")
+    return result

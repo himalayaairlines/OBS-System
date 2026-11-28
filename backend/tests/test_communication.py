@@ -726,7 +726,7 @@ class RegressionTests(Base):
         status, users = call("GET", "/users", "ADMIN001")
         self.assertIn("email", users[0])
         status, health = call("GET", "/health")
-        self.assertEqual(health["version"], "7.5")
+        self.assertEqual(health["version"], "7.18")
 
     def test_stock_movements_unchanged(self):
         before = q("SELECT quantity FROM main_inventory WHERE product_id=?", (self.p1,))[0]["quantity"]

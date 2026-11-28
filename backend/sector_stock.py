@@ -135,6 +135,10 @@ def sector_count(connection, legs: list[dict], leg_id: int) -> dict:
     devices = devices_for(connection, leg_id)
     headers = {r["device"]: dict(r) for r in connection.execute(
         "SELECT * FROM sector_stock_counts WHERE flight_id=?", (leg_id,)).fetchall()}
+    # 7.18: one count of the trolley for the sector ("*"), by whichever crew
+    # member did it. It replaces any per-device parts (7.11) when present.
+    if "*" in headers:
+        headers = {"*": headers["*"]}
     # declared per product = the sum of what each iPad that has confirmed typed in.
     saved = {}          # product_id -> summed declared
     per_device = {}     # product_id -> {device: declared}
@@ -143,7 +147,7 @@ def sector_count(connection, legs: list[dict], leg_id: int) -> dict:
             saved[r["product_id"]] = saved.get(r["product_id"], 0) + int(r["declared_remaining"])
             per_device.setdefault(r["product_id"], {})[device] = int(r["declared_remaining"])
     submitted_devices = [d for d in devices if d in headers] + [d for d in headers if d not in devices]
-    all_in = bool(devices) and all(d in headers for d in devices)
+    all_in = "*" in headers or (bool(devices) and all(d in headers for d in devices))
 
     items = []
     for row in connection.execute(
@@ -168,7 +172,7 @@ def sector_count(connection, legs: list[dict], leg_id: int) -> dict:
         "flight_number": leg["flight_number"], "origin": leg["origin"], "destination": leg["destination"],
         "flight_date": leg["flight_date"],
         "devices": devices, "submitted_devices": submitted_devices,
-        "waiting_for": [d for d in devices if d not in headers],
+        "waiting_for": [] if all_in else [d for d in devices if d not in headers],
         "submitted": all_in, "submitted_by": last["submitted_by"] if last else None,
         "submitted_at": last["submitted_at"] if last else None,
         "remarks": "; ".join(f"{d}: {h['remarks']}" for d, h in headers.items() if h.get("remarks")) or None,

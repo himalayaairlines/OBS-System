@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Platform, ScrollView, View } from 'react-native';
+import { Platform, Pressable, ScrollView, View } from 'react-native';
 import { Text, TextInput } from '../text';
 
 import * as FileSystem from 'expo-file-system/legacy';
@@ -19,7 +19,7 @@ const TABS = [
   { key: 'flights', label: 'Flights' },
   { key: 'products', label: 'Products' },
   { key: 'load', label: 'Load' },
-  { key: 'groups', label: 'Crew & devices' },
+  { key: 'groups', label: 'Crew assignment' },
   { key: 'bundles', label: 'Bundles' },
   { key: 'register', label: 'Daily register' },
 ];
@@ -35,7 +35,7 @@ export default function InventoryScreen({ user }) {
     <ScrollView style={styles.screen} contentContainerStyle={styles.scroll}>
       <PageHeader
         title="Inventory Operations"
-        description="Create flights, load the trolley from main inventory, and assign the OBS iPad."
+        description="Create flights, load the trolley from main inventory, and assign the crew to each sector."
       />
       <View style={[styles.wrap, { marginBottom: 14 }]}>
         {tabs.map((item) => (
@@ -351,11 +351,14 @@ function LoadTab({ notify }) {
 
 /* --------------------------- crew & devices ---------------------------- */
 function GroupsTab({ notify, user }) {
+  const MAX_CREW = 10;
   const [trips, setTrips] = useState([]);
   const [accounts, setAccounts] = useState([]);
   const [dutyGroups, setDutyGroups] = useState([]);
-  const [assign, setAssign] = useState({ root_id: null, crew_account: '', crew_account_2: '' });
+  const [assign, setAssign] = useState({ root_id: null, crew: [] });
+  const [search, setSearch] = useState('');
   const [picker, setPicker] = useState(null);
+  const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -372,31 +375,44 @@ function GroupsTab({ notify, user }) {
 
   useEffect(() => { load(); }, [load]);
 
+  function toggleCrew(id) {
+    if (assign.crew.includes(id)) return setAssign({ ...assign, crew: assign.crew.filter((c) => c !== id) });
+    if (assign.crew.length >= MAX_CREW) {
+      return notify({ tone: 'warning', text: `At most ${MAX_CREW} crew can be assigned to one trip.` });
+    }
+    setAssign({ ...assign, crew: [...assign.crew, id] });
+  }
+
   async function saveAssignment() {
+    setBusy(true);
     try {
       const result = await api(`/trips/${assign.root_id}/assign`, {
         method: 'POST',
-        body: { crew_account: assign.crew_account, crew_account_2: assign.crew_account_2 || null },
+        body: { crew_accounts: assign.crew },
       });
       notify({
         tone: 'success',
-        text: `${result.route} assigned to ${(result.devices || [assign.crew_account]).join(' and ')}. The crew enter their own `
-          + 'names on the iPad at the start of each sector.',
+        text: `${result.route} assigned to ${(result.devices || assign.crew).join(', ')}. Each crew member logs in on `
+          + 'their own phone with their crew code and chooses the sector; the stock comes with it.',
       });
       load();
     } catch (error) {
       notify({ tone: 'danger', text: error.message });
     }
+    setBusy(false);
   }
 
   const assignTrip = trips.find((t) => t.root_id === assign.root_id);
+  const needle = search.trim().toLowerCase();
+  const listed = accounts.filter((a) => !needle || `${a.employee_id} ${a.name} ${a.position || ''}`.toLowerCase().includes(needle));
+  const nameOf = (id) => accounts.find((a) => a.employee_id === id)?.name || '';
 
   return (
     <>
       <Card>
         <SectionTitle
-          title="Assign the OBS iPads to a trip"
-          description="Two iPads work the whole trip, both sectors; both sell and both confirm the remaining stock. Who sells is decided on board."
+          title="Assign crew to a sector"
+          description="Choose the trip (date and sector), then the crew who fly it. Each crew member sells on their own phone, offline; it syncs on landing."
         />
         <Select
           label="Trip"
@@ -414,33 +430,45 @@ function GroupsTab({ notify, user }) {
                 {assignTrip.route}
               </Text>
               <Text style={styles.mono}>{assignTrip.flight_date} · {assignTrip.flight_numbers}</Text>
+              {!!assignTrip.device_status && !!Object.keys(assignTrip.device_status).length && (
+                <View style={[styles.wrap, { marginTop: 6 }]}>
+                  {Object.entries(assignTrip.device_status).map(([device, state]) => (
+                    <Pill key={device} label={`${device}: ${state}`} tone="muted" />
+                  ))}
+                </View>
+              )}
             </View>
 
-            <Select
-              label="OBS iPad 1"
-              valueLabel={assign.crew_account
-                ? `${assign.crew_account} — ${accounts.find((a) => a.employee_id === assign.crew_account)?.name || ''}`
-                : null}
-              placeholder="Select the first device"
-              onPress={() => setPicker('crew_account')}
-            />
-            <Select
-              label="OBS iPad 2"
-              valueLabel={assign.crew_account_2
-                ? `${assign.crew_account_2} — ${accounts.find((a) => a.employee_id === assign.crew_account_2)?.name || ''}`
-                : null}
-              placeholder="Select the second device"
-              onPress={() => setPicker('crew_account_2')}
-            />
+            <Text style={[styles.mono, { marginBottom: 4 }]}>
+              Selected ({assign.crew.length}/{MAX_CREW}): {assign.crew.length
+                ? assign.crew.map((c) => `${c} ${nameOf(c)}`.trim()).join(', ') : 'nobody yet'}
+            </Text>
+            <Field label="Find crew" value={search} onChangeText={setSearch} placeholder="Crew code or name" />
+            {listed.map((a) => {
+              const on = assign.crew.includes(a.employee_id);
+              return (
+                <Pressable key={a.employee_id} onPress={() => toggleCrew(a.employee_id)}
+                  style={[styles.listRow, styles.rowBetween, { paddingVertical: 8 }]}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontSize: 14, fontWeight: on ? '700' : '500', color: COLORS.text }}>
+                      {on ? '\u2611 ' : '\u2610 '}{a.employee_id} · {a.name}
+                    </Text>
+                    <Text style={styles.mono}>{a.position || (a.role === 'crew_supervisor' ? 'Shared OBS iPad' : 'Crew')}</Text>
+                  </View>
+                  {on && <Pill label="ASSIGNED" tone="success" />}
+                </Pressable>
+              );
+            })}
+            {!listed.length && <Text style={styles.empty}>No crew login matches. Crew logins are created from the crew list in Admin.</Text>}
 
             <Button
-              title={assign.crew_account_2 ? 'Assign both devices to trip' : 'Assign device to trip'}
+              title={busy ? 'Saving…' : `Assign ${assign.crew.length || ''} crew to this trip`.replace('  ', ' ')}
               onPress={saveAssignment}
-              disabled={!assign.crew_account || (!!assign.crew_account_2 && assign.crew_account_2 === assign.crew_account)}
+              disabled={busy || !assign.crew.length}
+              style={{ marginTop: 8 }}
             />
             <Text style={[styles.mono, { marginTop: 6 }]}>
-              An iPad may be rostered to more than one trip on a day; it sees the next trip once the
-              current one is finished with “Finish whole flight”. Crew names are picked on the iPad.
+              The assignment covers every sector of the trip. A crew member may be rostered on more than one trip on a day.
             </Text>
           </>
         )}
@@ -490,26 +518,16 @@ function GroupsTab({ notify, user }) {
           value: t.root_id,
           label: t.route,
           sub: `${t.flight_date} · ${t.flight_numbers}`
-            + (t.devices?.length ? ` · ${t.devices.join(' + ')}` : ''),
+            + (t.devices?.length ? ` · ${t.devices.join(', ')}` : ''),
         }))}
         selectedValue={assign.root_id}
         onSelect={(value) => {
           const trip = trips.find((t) => t.root_id === value);
           const devices = String(trip?.outbound?.crew_account || '').split(',').filter(Boolean);
-          setAssign({ root_id: value, crew_account: devices[0] || '', crew_account_2: devices[1] || '' });
+          setAssign({ root_id: value, crew: devices });
+          setSearch('');
           setPicker(null);
         }}
-        onClose={() => setPicker(null)}
-      />
-      <OptionModal
-        visible={picker === 'crew_account' || picker === 'crew_account_2'}
-        title={picker === 'crew_account_2' ? 'OBS iPad 2' : 'OBS iPad 1'}
-        options={[
-          ...(picker === 'crew_account_2' ? [{ value: '', label: 'No second device', sub: 'One iPad works this trip' }] : []),
-          ...accounts.map((a) => ({ value: a.employee_id, label: a.employee_id, sub: a.name })),
-        ]}
-        selectedValue={assign[picker] || ''}
-        onSelect={(value) => { setAssign({ ...assign, [picker]: value }); setPicker(null); }}
         onClose={() => setPicker(null)}
       />
     </>
